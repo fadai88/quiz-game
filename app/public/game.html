@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trivia Game</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .non-copyable {
+            user-select: none;
+        }
+        .correct {
+            background-color: #90EE90 !important;
+            transition: background-color 0.3s ease;
+        }
+        .incorrect {
+            background-color: #FFB6C1 !important;
+            transition: background-color 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Brainy Battle Quiz</h1>
+        <button onclick="toggleTheme()">Toggle Theme</button>
+        <nav>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="leaderboard.html">Leaderboard</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <div class="container" id="gameContainer">
+        <h1>Trivia Game</h1>
+        <div id="balanceDisplay"></div>
+        <div id="countdownTimer"></div>
+        <div id="gameArea">
+            <select id="betAmount">
+                <option value="3">$3 Game</option>
+                <option value="10">$10 Game</option>
+                <option value="15">$15 Game</option>
+                <option value="20">$20 Game</option>
+                <option value="30">$30 Game</option>
+            </select>
+            <button id="joinGameBtn">Join Game</button>
+            <div id="waitingMessage"></div>
+            <div id="players"></div>
+            <div id="question" class="non-copyable"></div>
+            <div id="options"></div>
+            <button id="submitAnswer" style="display:none;">Submit Answer</button>
+            <button onclick="showLeaderboard()">Show Leaderboard</button>
+            <button id="inviteFriendsBtn">Invite Friends</button>
+        </div>
+        <div id="leaderboardContainer">
+            <h2>Leaderboard</h2>
+            <table id="leaderboardTable">
+                <thead>
+                    <tr>
+                        <th>Rank</th>
+                        <th>Username</th>
+                        <th>Correct Answers</th>
+                        <th>Games Played</th>
+                        <th>Total Points</th>
+                    </tr>
+                </thead>
+                <tbody id="leaderboardBody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div id="notification" style="display: none; background-color: #f0f0f0; padding: 10px; margin: 10px 0;"></div>
+    <audio id="joinSound" src="assets/button-7.mp3" preload="auto"></audio>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js"></script>
+    <script>
+        const socket = io();
+        let currentRoomId = null;
+        let questionStartTime;
+        let questionTimer;
+        let correctAnswer;
+        let loggedInUser = null;
+
+        const joinGameBtn = document.getElementById('joinGameBtn');
+        const waitingMessage = document.getElementById('waitingMessage');
+        const playersDiv = document.getElementById('players');
+        const questionDiv = document.getElementById('question');
+        const optionsDiv = document.getElementById('options');
+        const submitAnswerBtn = document.getElementById('submitAnswer');
+        const countdownTimer = document.getElementById('countdownTimer');
+        const leaderboardContainer = document.getElementById('leaderboardContainer');
+        const leaderboardBody = document.getElementById('leaderboardBody');
+
+        let countdownInterval;
+        let virtualBalance = 0;
+
+        // Function to get URL parameters
+        function getUrlParameter(name) {
+            name = name.replace(/[\[]/, '\\[').replace(/[\]]/, '\\]');
+            var regex = new RegExp('[\\?&]' + name + '=([^&#]*)');
+            var results = regex.exec(location.search);
+            return results === null ? '' : decodeURIComponent(results[1].replace(/\+/g, ' '));
+        };
+
+        // Get username from URL parameter
+        loggedInUser = getUrlParameter('username');
+        if (!loggedInUser) {
+            alert('No user logged in. Redirecting to login page.');
+            window.location.href = 'index.html';
+        }
+
+        function updateBalance() {
+            fetch(`/api/balance/${loggedInUser}`)
+                .then(response => response.json())
+                .then(data => {
+                    virtualBalance = data.balance;
+                    document.getElementById('balanceDisplay').textContent = `Balance: $${virtualBalance.toFixed(2)}`;
+                })
+                .catch(error => console.error('Error fetching balance:', error));
+        }
+
+        updateBalance(); // Call this when the page loads
+
+        joinGameBtn.addEventListener('click', () => {
+            const walletAddress = localStorage.getItem('walletAddress');
+            const betAmount = parseInt(document.getElementById('betAmount').value);
+            
+            if (!walletAddress || !loggedInUser) {
+                alert('Please connect your wallet and log in first');
+                return;
+            }
+
+            if (virtualBalance < betAmount) {
+                alert(`Insufficient balance. You need $${betAmount} to join the game.`);
+                return;
+            }
+
+            socket.emit('joinGame', loggedInUser, betAmount, walletAddress);
+            joinGameBtn.style.display = 'none';
+            waitingMessage.textContent = 'Waiting for another player... (Game will start in single player mode after 30 seconds)';
+        });
+
+        socket.on('balanceUpdate', (newBalance) => {
+            virtualBalance = newBalance;
+            document.getElementById('balanceDisplay').textContent = `Balance: $${virtualBalance.toFixed(2)}`;
+        });
+
+        socket.on('joinGameFailure', (message) => {
+            alert(message);
+            joinGameBtn.style.display = 'block';
+            waitingMessage.textContent = '';
+        });
+
+        submitAnswerBtn.addEventListener('click', () => {
+            const selectedOption = document.querySelector('input[name="answer"]:checked');
+            if (selectedOption) {
+                const responseTime = moment().diff(moment(questionStartTime), 'milliseconds');
+                const selectedAnswer = parseInt(selectedOption.value);
+                socket.emit('submitAnswer', { roomId: currentRoomId, answer: selectedAnswer, responseTime, username: loggedInUser });
+                submitAnswerBtn.disabled = true;
+                waitingMessage.textContent = 'Waiting for other player to answer...';
+                
+                if (selectedAnswer === correctAnswer) {
+                    selectedOption.parentElement.classList.add('correct');
+                } else {
+                    selectedOption.parentElement.classList.add('incorrect');
+                    document.querySelector(`input[value="${correctAnswer}"]`).parentElement.classList.add('correct');
+                }
+            } else {
+                alert('Please select an answer!');
+            }
+        });
+
+        socket.on('gameJoined', (roomId) => {
+            currentRoomId = roomId;
+            console.log(`Joined room ${roomId}`);
+            waitingMessage.textContent = 'Waiting for another player... (Game will start in single player mode after 30 seconds)';
+        });
+
+        socket.on('playerJoined', (username) => {
+            waitingMessage.textContent = `${username} joined. Game is starting...`;
+        });
+
+        socket.on('gameStart', ({ players, questionCount, singlePlayerMode }) => {
+            waitingMessage.textContent = singlePlayerMode ? 
+                'No other players found. Starting single player mode...' : 
+                'Game started!';
+            updatePlayers(players);
+        });
+
+        socket.on('nextQuestion', ({ question, options, questionNumber, totalQuestions, questionStartTime: qStartTime, correctAnswerIndex }) => {
+            questionStartTime = parseInt(qStartTime);
+            correctAnswer = correctAnswerIndex;
+            displayQuestion(question, options, questionNumber, totalQuestions);
+            submitAnswerBtn.disabled = false;
+            submitAnswerBtn.style.display = 'block';
+            waitingMessage.textContent = '';
+            
+            if (questionTimer) {
+                clearTimeout(questionTimer);
+            }
+            
+            questionTimer = setTimeout(() => {
+                submitAnswerBtn.disabled = true;
+                waitingMessage.textContent = 'Time\'s up!';
+            }, 7000);
+            
+            startCountdown(questionStartTime);
+        });
+
+        socket.on('scoreUpdate', (players) => {
+            updatePlayers(players);
+            if (questionTimer) {
+                clearTimeout(questionTimer);
+            }
+        });
+
+        socket.on('gameOver', (data) => {
+            console.log('Received game over data:', data);
+            const { players, winner, betAmount, winnerBalance, singlePlayerMode } = data;
+            
+            questionDiv.textContent = 'Game Over!';
+            submitAnswerBtn.style.display = 'none';
+            
+            if (singlePlayerMode) {
+                const player = players[0];
+                if (winner) {
+                    waitingMessage.textContent = `Congratulations! You won with ${player.score} correct answers! You won $${(betAmount * 1.8).toFixed(2)}!`;
+                    virtualBalance = winnerBalance;
+                } else {
+                    waitingMessage.textContent = `Game Over! You got ${player.score} correct answers. You need at least 5 correct answers to win.`;
+                }
+            } else {
+                players.sort((a, b) => b.score - a.score || a.totalResponseTime - b.totalResponseTime);
+
+                if (winner) {
+                    const winnerPlayer = players.find(p => p.username === winner);
+                    waitingMessage.textContent = `The winner is ${winner} with a score of ${winnerPlayer.score}!`;
+                    
+                    if (winner === loggedInUser) {
+                        const winnings = betAmount ? parseFloat(betAmount) * 1.8 : 0;
+                        waitingMessage.textContent += ` You won $${winnings.toFixed(2)}!`;
+                        virtualBalance = winnerBalance;
+                    } else {
+                        waitingMessage.textContent += ` Better luck next time! Thanks for playing!`;
+                    }
+                } else {
+                    if (players[0].score === players[1].score) {
+                        if (players[0].totalResponseTime < players[1].totalResponseTime) {
+                            waitingMessage.textContent = `It's a draw based on score! ${players[0].username} wins due to faster total response time (${players[0].totalResponseTime}ms vs ${players[1].totalResponseTime}ms).`;
+                        } else if (players[0].totalResponseTime > players[1].totalResponseTime) {
+                            waitingMessage.textContent = `It's a draw based on score! ${players[1].username} wins due to faster total response time (${players[1].totalResponseTime}ms vs ${players[0].totalResponseTime}ms).`;
+                        } else {
+                            waitingMessage.textContent = "It's a perfect draw! Both players had the same score and response time.";
+                        }
+                        
+                        const tiebreakWinner = players[0].totalResponseTime <= players[1].totalResponseTime ? players[0].username : players[1].username;
+                        if (tiebreakWinner === loggedInUser) {
+                            const winnings = betAmount ? parseFloat(betAmount) * 1.8 : 0;
+                            waitingMessage.textContent += ` You won $${winnings.toFixed(2)}!`;
+                            virtualBalance = winnerBalance;
+                        } else {
+                            waitingMessage.textContent += ` Better luck next time!`;
+                        }
+                    }
+                }
+            }
+
+            setTimeout(() => {
+                document.getElementById('balanceDisplay').textContent = `Balance: $${virtualBalance.toFixed(2)}`;
+                
+                const scoresHtml = singlePlayerMode ?
+                    `<p>${players[0].username}: ${players[0].score} (Total response time: ${players[0].totalResponseTime}ms)</p>` :
+                    players.map(p => 
+                        `<p>${p.username}: ${p.score} (Total response time: ${p.totalResponseTime}ms)</p>`
+                    ).join('');
+                
+                playersDiv.innerHTML = '<h2>Final Scores:</h2>' + scoresHtml;
+                joinGameBtn.style.display = 'inline-block';
+                
+                optionsDiv.innerHTML = '';
+            }, 3000);
+        });
+
+        socket.on('playerLeft', (username) => {
+            alert(`${username} left the game. The game will end.`);
+            resetGame();
+        });
+
+        socket.on('updateScores', (players) => {
+            updatePlayers(players);
+        });
+
+        function displayQuestion(question, options, questionNumber, totalQuestions) {
+            questionDiv.innerHTML = `<h2>Question ${questionNumber} of ${totalQuestions}</h2><p>${question}</p>`;
+            optionsDiv.innerHTML = options.map((option, index) => `
+                <div>
+                    <input type="radio" id="option${index}" name="answer" value="${index}">
+                    <label for="option${index}">${option}</label>
+                </div>
+            `).join('');
+        }
+
+        function startCountdown(qStartTime) {
+            const duration = 7;
+
+            clearInterval(countdownInterval);
+
+            countdownInterval = setInterval(() => {
+                const timeRemaining = duration - moment().diff(moment(qStartTime), 'seconds');
+                countdownTimer.textContent = `Time remaining: ${timeRemaining} seconds`;
+
+                if (timeRemaining <= 0) {
+                    clearInterval(countdownInterval);
+                    countdownTimer.textContent = "Time's up!";
+                    submitAnswerBtn.disabled = true;
+                }
+            }, 1000);
+
+            countdownTimer.style.display = 'block';
+        }
+
+        function updatePlayers(players) {
+            playersDiv.innerHTML = '<h2>Players:</h2>' + players.map(p => 
+                `<p>${p.username}: ${p.score} (Total response time: ${p.totalResponseTime || 0}ms)</p>`
+            ).join('');
+        }
+
+        function resetGame() {
+            currentRoomId = null;
+            playersDiv.innerHTML = '';
+            questionDiv.innerHTML = '';
+            optionsDiv.innerHTML = '';
+            submitAnswerBtn.style.display = 'none';
+            waitingMessage.textContent = '';
+            joinGameBtn.style.display = 'block';
+            clearInterval(countdownInterval);
+            countdownTimer.style.display = 'none';
+        }
+
+        function toggleTheme() {
+            document.body.classList.toggle('dark-theme');
+        }
+
+        function showLeaderboard() {
+            socket.emit('getLeaderboard');
+            leaderboardContainer.style.display = 'block';
+        }
+
+        socket.on('leaderboardData', (leaderboard) => {
+            leaderboardBody.innerHTML = '';
+            leaderboard.forEach((user, index) => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${index + 1}</td>
+                    <td>${user.username}</td>
+                    <td>${user.correctAnswers}</td>
+                    <td>${user.gamesPlayed}</td>
+                    <td>${user.totalPoints}</td>
+                `;
+                leaderboardBody.appendChild(row);
+            });
+        });
+
+        socket.on('leaderboardError', (message) => {
+            alert(`Error fetching leaderboard: ${message}`);
+        });
+
+        document.getElementById('inviteFriendsBtn').addEventListener('click', () => {
+            const roomId = currentRoomId;
+            const inviteLink = `${window.location.origin}/join?roomId=${roomId}`;
+            prompt("Share this link with your friends:", inviteLink);
+        });
+
+        const joinSound = document.getElementById('joinSound');
+        const notification = document.getElementById('notification');
+
+        socket.on('playerJoined', (username) => {
+            notification.textContent = `${username} has joined the lobby!`;
+            notification.style.display = 'block';
+            joinSound.play();
+            setTimeout(() => {
+                notification.style.display = 'none';
+            }, 3000);
+        });
+
+        questionDiv.addEventListener('contextmenu', (event) => {
+            event.preventDefault();
+        });
+
+        socket.on('answerResult', (data) => {
+            const { username, isCorrect, correctAnswer } = data;
+            if (username === loggedInUser) {
+                const selectedOption = document.querySelector('input[name="answer"]:checked');
+                if (selectedOption) {
+                    selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
+                }
+            }
+        });
+
+        socket.on('playerAnswered', (username) => {
+            waitingMessage.textContent = `${username} has submitted their answer`;
+        });
+
+        socket.on('roundComplete', (data) => {
+            const { correctAnswer, playerResults } = data;
+            const options = document.querySelectorAll('#options input');
+            
+            // Show correct answer
+            options[correctAnswer].parentElement.classList.add('correct');
+            
+            // Only show the current player's incorrect answer if they were wrong
+            const playerResult = playerResults.find(result => result.username === loggedInUser);
+            if (playerResult && !playerResult.isCorrect) {
+                options[playerResult.answer].parentElement.classList.add('incorrect');
+            }
+        });
+
+        // Check wallet connection on page load
+        window.addEventListener('load', () => {
+            const walletAddress = localStorage.getItem('walletAddress');
+            if (walletAddress) {
+                document.getElementById('walletStatus').textContent = 
+                    `Connected: ${walletAddress.slice(0,4)}...${walletAddress.slice(-4)}`;
+            } else {
+                alert('Please connect your wallet first');
+                // Optionally redirect to home page
+                // window.location.href = 'index.html';
+            }
+        });
+    </script>
+</body>
+</html>

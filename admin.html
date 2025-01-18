@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quiz Admin</title>
+</head>
+<body>
+    <h1>Quiz Admin</h1>
+    <form id="addQuestionForm">
+        <input type="text" id="question" placeholder="Question" required>
+        <input type="text" id="option1" placeholder="Option 1" required>
+        <input type="text" id="option2" placeholder="Option 2" required>
+        <input type="text" id="option3" placeholder="Option 3" required>
+        <input type="text" id="option4" placeholder="Option 4" required>
+        <input type="number" id="correctAnswer" placeholder="Correct Answer (0-3)" required min="0" max="3">
+        <button type="submit">Add Question</button>
+    </form>
+    <div id="questionList"></div>
+
+    <script>
+        const API_URL = 'http://localhost:5000/api';
+
+        document.getElementById('addQuestionForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const question = document.getElementById('question').value;
+            const options = [
+                document.getElementById('option1').value,
+                document.getElementById('option2').value,
+                document.getElementById('option3').value,
+                document.getElementById('option4').value
+            ];
+            const correctAnswer = parseInt(document.getElementById('correctAnswer').value);
+
+            try {
+                const response = await fetch(`${API_URL}/questions`, {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${localStorage.getItem('token')}`
+                    },
+                    body: JSON.stringify({ question, options, correctAnswer })
+                });
+                const data = await response.json();
+                alert(data.message);
+                e.target.reset();
+                loadQuestions();
+            } catch (error) {
+                console.error('Error:', error);
+            }
+        });
+
+        async function loadQuestions() {
+            try {
+                const response = await fetch(`${API_URL}/questions`, {
+                    headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
+                });
+                const questions = await response.json();
+                const questionList = document.getElementById('questionList');
+                questionList.innerHTML = questions.map(q => `
+                    <div>
+                        <p>${q.question}</p>
+                        <button onclick="deleteQuestion('${q._id}')">Delete</button>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Error:', error);
+            }
+        }
+
+        async function deleteQuestion(id) {
+            try {
+                const response = await fetch(`${API_URL}/questions/${id}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` }
+                });
+                const data = await response.json();
+                alert(data.message);
+                loadQuestions();
+            } catch (error) {
+                console.error('Error:', error);
+            }
+        }
+
+        loadQuestions();
+    </script>
+</body>
+</html>

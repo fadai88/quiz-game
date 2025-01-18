@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Register - Trivia Game</title>
+    <script src="https://www.google.com/recaptcha/api.js?render=6LeDS1IqAAAAAMx338dPnRkVkj75ggf6Yq4OYu8i"></script> <!-- Add this line -->
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header>
+        <h1>Register</h1>
+        <nav>
+            <a href="index.html">Home</a>
+            <a href="leaderboard.html">Leaderboard</a>
+        </nav>
+    </header>
+    <main>
+        <form id="registrationForm">
+            <input type="text" id="regUsername" placeholder="Username" required>
+            <input type="email" id="regEmail" placeholder="Email" required>
+            <input type="password" id="regPassword" placeholder="Password" required>
+            <button type="submit">Register</button>
+            <p>Already have an account? <a href="login.html">Login</a></p>
+        </form>
+        <div id="registrationMessage"></div>
+    </main>
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+
+        document.getElementById('registrationForm').addEventListener('submit', (event) => {
+            event.preventDefault();
+            const username = document.getElementById('regUsername').value;
+            const email = document.getElementById('regEmail').value;
+            const password = document.getElementById('regPassword').value;
+
+            // Generate reCAPTCHA token
+            grecaptcha.execute('6LeDS1IqAAAAAMx338dPnRkVkj75ggf6Yq4OYu8i', { action: 'register' }).then((token) => {
+                console.log('Generated token:', token); // Check if token is generated
+                socket.emit('register', { username, email, password, token }); // Send token
+            });
+        });
+
+        socket.on('registrationSuccess', () => {
+            document.getElementById('registrationMessage').textContent = 'Registration successful! Please check your email to verify your account.';
+        });
+
+        socket.on('registrationFailure', (message) => {
+            document.getElementById('registrationMessage').textContent = `Registration failed: ${message}`;
+        });
+    </script>
+</body>
+</html>

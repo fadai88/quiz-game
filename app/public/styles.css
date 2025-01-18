@@ -1,0 +1,102 @@
+:root {
+    --bg-color: #e0f7fa; /* Light cyan background */
+    --text-color: #004d40; /* Dark teal text */
+    --container-bg: #ffffff; /* White container */
+    --button-bg: #00796b; /* Teal button */
+    --button-hover: #004d40; /* Darker teal on hover */
+    --button-disabled: #b2dfdb; /* Light teal for disabled buttons */
+}
+
+body {
+    font-family: 'Arial', sans-serif;
+    line-height: 1.6;
+    margin: 0;
+    padding: 20px;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    transition: background-color 0.3s, color 0.3s;
+}
+
+.container {
+    max-width: 600px;
+    margin: auto;
+    background: var(--container-bg);
+    padding: 20px;
+    border-radius: 10px; /* Rounded corners */
+    box-shadow: 0 4px 20px rgba(0,0,0,0.2); /* Softer shadow */
+    transition: background-color 0.3s;
+}
+
+h1, h2 {
+    color: var(--text-color);
+    text-align: center; /* Centered headings */
+}
+
+button {
+    background-color: var(--button-bg);
+    color: white;
+    padding: 12px 20px; /* Increased padding */
+    border: none;
+    border-radius: 5px; /* Slightly rounded buttons */
+    cursor: pointer;
+    transition: background-color 0.3s, transform 0.2s; /* Added transform for hover effect */
+}
+
+button:hover {
+    background-color: var(--button-hover);
+    transform: scale(1.05); /* Slightly enlarge on hover */
+}
+
+#countdownTimer {
+    font-size: 1.5rem; /* Larger font size */
+    font-weight: bold;
+    margin-bottom: 1rem;
+    text-align: center; /* Centered timer */
+}
+
+.form-container {
+    display: none;
+    max-width: 400px;
+    margin: auto;
+    background: var(--container-bg);
+    padding: 20px;
+    border-radius: 10px; /* Rounded corners */
+    box-shadow: 0 4px 20px rgba(0,0,0,0.2); /* Softer shadow */
+}
+
+#leaderboardTable th {
+    background-color: #b2ebf2; /* Light teal for header */
+    font-weight: bold;
+}
+
+#leaderboardTable tr:nth-child(even) {
+    background-color: #e0f2f1; /* Light green for even rows */
+}
+
+#leaderboardTable tr:hover {
+    background-color: #b2dfdb; /* Light teal on hover */
+}
+
+@keyframes correct {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.1); background-color: #4CAF50; } /* Green */
+    100% { transform: scale(1); }
+}
+
+@keyframes incorrect {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.1); background-color: #f44336; } /* Red */
+    100% { transform: scale(1); }
+}
+
+.correct {
+    animation: correct 0.5s ease-in-out;
+}
+
+.incorrect {
+    animation: incorrect 0.5s ease-in-out;
+}
+
+.non-copyable {
+    user-select: none; /* Prevent text selection */
+}
