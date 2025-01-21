@@ -12,6 +12,7 @@
     "@solana/wallet-adapter-base": "^0.9.23",
     "@solana/web3.js": "^1.98.0",
     "bcrypt": "^5.1.1",
+    "bs58": "^6.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
@@ -21,6 +22,7 @@
     "nodemailer": "^6.9.16",
     "socket.io": "^4.8.1",
     "sqlite3": "^5.1.7",
+    "tweetnacl": "^1.0.3",
     "uuid": "^11.0.5"
   },
   "devDependencies": {

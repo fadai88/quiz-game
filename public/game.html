@@ -76,6 +76,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js"></script>
     <script>
         const socket = io();
+        let connectedWallet = null;
         let currentRoomId = null;
         let questionStartTime;
         let questionTimer;
@@ -95,23 +96,21 @@
         let countdownInterval;
         let virtualBalance = 0;
 
-        // Function to get URL parameters
         function getUrlParameter(name) {
-            name = name.replace(/[\[]/, '\\[').replace(/[\]]/, '\\]');
             var regex = new RegExp('[\\?&]' + name + '=([^&#]*)');
             var results = regex.exec(location.search);
             return results === null ? '' : decodeURIComponent(results[1].replace(/\+/g, ' '));
         };
 
-        // Get username from URL parameter
-        loggedInUser = getUrlParameter('username');
-        if (!loggedInUser) {
-            alert('No user logged in. Redirecting to login page.');
-            window.location.href = 'index.html';
+        // Get wallet from URL parameter or localStorage
+        connectedWallet = getUrlParameter('wallet') || localStorage.getItem('walletAddress');
+        if (!connectedWallet) {
+            alert('No wallet connected. Redirecting to login page.');
+            window.location.href = 'login.html';
         }
 
         function updateBalance() {
-            fetch(`/api/balance/${loggedInUser}`)
+            fetch(`/api/balance/${connectedWallet}`)
                 .then(response => response.json())
                 .then(data => {
                     virtualBalance = data.balance;
@@ -123,11 +122,10 @@
         updateBalance(); // Call this when the page loads
 
         joinGameBtn.addEventListener('click', () => {
-            const walletAddress = localStorage.getItem('walletAddress');
             const betAmount = parseInt(document.getElementById('betAmount').value);
             
-            if (!walletAddress || !loggedInUser) {
-                alert('Please connect your wallet and log in first');
+            if (!connectedWallet) {
+                alert('Please connect your wallet first');
                 return;
             }
 
@@ -136,9 +134,9 @@
                 return;
             }
 
-            socket.emit('joinGame', loggedInUser, betAmount, walletAddress);
+            socket.emit('joinGame', connectedWallet, betAmount, connectedWallet);
             joinGameBtn.style.display = 'none';
-            waitingMessage.textContent = 'Waiting for another player... (Game will start in single player mode after 30 seconds)';
+            waitingMessage.textContent = 'Waiting for another player...';
         });
 
         socket.on('balanceUpdate', (newBalance) => {
@@ -157,7 +155,7 @@
             if (selectedOption) {
                 const responseTime = moment().diff(moment(questionStartTime), 'milliseconds');
                 const selectedAnswer = parseInt(selectedOption.value);
-                socket.emit('submitAnswer', { roomId: currentRoomId, answer: selectedAnswer, responseTime, username: loggedInUser });
+                socket.emit('submitAnswer', { roomId: currentRoomId, answer: selectedAnswer, responseTime, username: connectedWallet });
                 submitAnswerBtn.disabled = true;
                 waitingMessage.textContent = 'Waiting for other player to answer...';
                 
@@ -238,7 +236,7 @@
                     const winnerPlayer = players.find(p => p.username === winner);
                     waitingMessage.textContent = `The winner is ${winner} with a score of ${winnerPlayer.score}!`;
                     
-                    if (winner === loggedInUser) {
+                    if (winner === connectedWallet) {
                         const winnings = betAmount ? parseFloat(betAmount) * 1.8 : 0;
                         waitingMessage.textContent += ` You won $${winnings.toFixed(2)}!`;
                         virtualBalance = winnerBalance;
@@ -256,7 +254,7 @@
                         }
                         
                         const tiebreakWinner = players[0].totalResponseTime <= players[1].totalResponseTime ? players[0].username : players[1].username;
-                        if (tiebreakWinner === loggedInUser) {
+                        if (tiebreakWinner === connectedWallet) {
                             const winnings = betAmount ? parseFloat(betAmount) * 1.8 : 0;
                             waitingMessage.textContent += ` You won $${winnings.toFixed(2)}!`;
                             virtualBalance = winnerBalance;
@@ -391,7 +389,7 @@
 
         socket.on('answerResult', (data) => {
             const { username, isCorrect, correctAnswer } = data;
-            if (username === loggedInUser) {
+            if (username === connectedWallet) {
                 const selectedOption = document.querySelector('input[name="answer"]:checked');
                 if (selectedOption) {
                     selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
@@ -411,7 +409,7 @@
             options[correctAnswer].parentElement.classList.add('correct');
             
             // Only show the current player's incorrect answer if they were wrong
-            const playerResult = playerResults.find(result => result.username === loggedInUser);
+            const playerResult = playerResults.find(result => result.username === connectedWallet);
             if (playerResult && !playerResult.isCorrect) {
                 options[playerResult.answer].parentElement.classList.add('incorrect');
             }

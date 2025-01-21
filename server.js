@@ -12,6 +12,8 @@ const User = require('./models/User');
 const axios = require('axios'); // Add this line at the top with other imports
 const { Connection, PublicKey, SystemProgram } = require('@solana/web3.js');
 const { Program } = require('@project-serum/anchor');
+const bs58 = require('bs58');
+const nacl = require('tweetnacl');
 
 const app = express();
 const server = http.createServer(app);
@@ -63,88 +65,93 @@ if (process.env.PROGRAM_ID) {
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
 
-    socket.on('register', async ({ username, email, password, token }) => {
-        console.log('Received token:', token); // Log the received token
-        const recaptchaResponse = await verifyRecaptcha(token);
-        if (!recaptchaResponse.success) {
-            console.error('reCAPTCHA verification failed:', recaptchaResponse); // Log the failure
-            return socket.emit('registrationFailure', 'reCAPTCHA verification failed.');
-        }
+    socket.on('walletLogin', async ({ walletAddress, signature, message }) => {
         try {
-            const verificationToken = crypto.randomBytes(32).toString('hex'); // Generate token
-            const user = new User({ username, email, password, verificationToken, isVerified: false }); // Save user with verificationToken
-            await user.save();
+            console.log('Wallet login attempt:', { walletAddress, message });
+            
+            // Create public key from wallet address
+            const publicKey = new PublicKey(walletAddress);
+            
+            // Convert base64 signature back to Uint8Array
+            const signatureBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
+            const messageBytes = new TextEncoder().encode(message);
+            
+            // Verify using nacl
+            const verified = nacl.sign.detached.verify(
+                messageBytes,
+                signatureBytes,
+                publicKey.toBytes()
+            );
 
-            // Send verification email
-            const verificationUrl = `${process.env.BASE_URL}/verify-email?token=${verificationToken}`;
-            await transporter.sendMail({
-                to: email,
-                subject: 'Email Verification',
-                html: `Please verify your email by clicking <a href="${verificationUrl}">here</a>`,
+            if (!verified) {
+                console.log('Signature verification failed');
+                return socket.emit('loginFailure', 'Invalid signature');
+            }
+
+            // Find or create user with only walletAddress
+            let user = await User.findOne({ walletAddress });
+            if (!user) {
+                console.log('Creating new user for wallet:', walletAddress);
+                user = await User.create({ walletAddress });
+            }
+
+            console.log('Login successful for wallet:', walletAddress);
+            socket.emit('loginSuccess', {
+                walletAddress: user.walletAddress,
+                virtualBalance: user.virtualBalance
             });
-
-            console.log(`User registered: ${username}, pending verification`); // Log registration
-            socket.emit('registrationSuccess');
         } catch (error) {
-            socket.emit('registrationFailure', error.message);
+            console.error('Login error:', error);
+            socket.emit('loginFailure', error.message);
         }
     });
 
-    socket.on('login', async ({ username, password, token }) => {
-        const recaptchaResponse = await verifyRecaptcha(token);
-        if (!recaptchaResponse.success) {
-            console.error('reCAPTCHA verification failed:', recaptchaResponse); // Log the failure
-            return socket.emit('loginFailure', 'reCAPTCHA verification failed.');
-        }
+    socket.on('walletReconnect', async (walletAddress) => {
         try {
-            const user = await User.findOne({ username });
-            if (user && await user.matchPassword(password)) {
-                if (!user.isVerified) {
-                    socket.emit('loginFailure', 'Please verify your email before logging in.');
-                    return;
-                }
-                socket.emit('loginSuccess', username);
+            const user = await User.findOne({ walletAddress });
+            if (user) {
+                socket.emit('loginSuccess', {
+                    walletAddress: user.walletAddress,
+                    virtualBalance: user.virtualBalance
+                });
             } else {
-                socket.emit('loginFailure', 'Invalid username or password');
+                socket.emit('loginFailure', 'Wallet not found');
             }
         } catch (error) {
             socket.emit('loginFailure', error.message);
         }
     });
 
-    socket.on('joinGame', async (username, betAmount, walletAddress) => {
-        // Add debugging logs
-        console.log('Join game attempt:', { username, betAmount, walletAddress });
+    socket.on('joinGame', async (walletAddress, betAmount) => {
+        console.log('Join game attempt:', { walletAddress, betAmount });
 
-        if (!username || !walletAddress) {
-            console.log('Join game failed - missing data:', { username, walletAddress });
-            socket.emit('joinGameFailure', 'You must be logged in and connect your wallet to join the game.');
+        if (!walletAddress) {
+            console.log('Join game failed - missing wallet');
+            socket.emit('joinGameFailure', 'You must connect your wallet to join the game.');
             return;
         }
 
         try {
-            const user = await User.findOne({ username });
+            const user = await User.findOne({ walletAddress });
             if (!user) {
-                console.log('User not found:', username);
+                console.log('User not found:', walletAddress);
                 socket.emit('joinGameFailure', 'User not found.');
                 return;
             }
-            if (!user.isVerified) {
-                socket.emit('joinGameFailure', 'Please verify your email before joining the game.');
-                return;
-            }
+
             if (user.virtualBalance < betAmount) {
                 socket.emit('joinGameFailure', `Insufficient virtual balance. You need $${betAmount} to join the game.`);
                 return;
             }
+
             const updatedUser = await User.findOneAndUpdate(
-                { username }, 
+                { walletAddress }, 
                 { $inc: { gamesPlayed: 1, virtualBalance: -betAmount } },
                 { new: true }
             );
             socket.emit('balanceUpdate', updatedUser.virtualBalance);
 
-            console.log(`${username} (${socket.id}) is trying to join a game`);
+            console.log(`${walletAddress} (${socket.id}) is trying to join a game`);
             let roomId;
             let joinedExistingRoom = false;
 
@@ -164,70 +171,36 @@ io.on('connection', (socket) => {
                     currentQuestionIndex: 0,
                     answersReceived: 0,
                     betAmount: betAmount,
-                    waitingTimeout: setTimeout(async () => {  // Add timeout for single player mode
+                    waitingTimeout: setTimeout(async () => {
                         const room = gameRooms.get(roomId);
                         if (room && room.players.length === 1) {
-                            console.log(`Starting single player mode for ${username} in room ${roomId}`);
+                            console.log(`Starting single player mode for ${walletAddress} in room ${roomId}`);
                             await startSinglePlayerGame(roomId);
                         }
-                    }, 30000)  // 30 seconds wait time
+                    }, 30000)
                 });
                 console.log(`Created new room: ${roomId}`);
             }
 
             const room = gameRooms.get(roomId);
-            room.players.push({ id: socket.id, username, score: 0 });
+            room.players.push({ id: socket.id, username: walletAddress, score: 0 });
 
-            // Comment out Solana integration for now
-            /*
-            if (!joinedExistingRoom) {
-                await program.rpc.initializeGame(
-                    new BN(betAmount),
-                    roomId,
-                    {
-                        accounts: {
-                            creator: new PublicKey(walletAddress),
-                            game: gameAccount,
-                            systemProgram: SystemProgram.programId,
-                        },
-                    }
-                );
-            } else {
-                await program.rpc.joinGame(
-                    roomId,
-                    {
-                        accounts: {
-                            game: gameAccount,
-                            player: new PublicKey(walletAddress),
-                            playerTokenAccount: playerTokenAccount,
-                            gameVault: gameVault,
-                            tokenProgram: TOKEN_PROGRAM_ID,
-                        },
-                    }
-                );
-            }
-            */
-
-            // The rest of your game logic
             socket.join(roomId);
             socket.emit('gameJoined', roomId);
 
-            console.log(`Player ${username} (${socket.id}) joined room ${roomId}`);
+            console.log(`Player ${walletAddress} (${socket.id}) joined room ${roomId}`);
             console.log(`Room ${roomId} now has ${room.players.length} player(s)`);
 
             if (room.players.length === 2) {
-                clearTimeout(room.waitingTimeout);  // Clear timeout when second player joins
+                clearTimeout(room.waitingTimeout);
                 console.log(`Starting game in room ${roomId}`);
                 startGame(roomId);
             } else if (joinedExistingRoom) {
-                console.log(`Notifying other player in room ${roomId} that ${username} joined`);
-                socket.to(roomId).emit('playerJoined', username);
+                console.log(`Notifying other player in room ${roomId} that ${walletAddress} joined`);
+                socket.to(roomId).emit('playerJoined', walletAddress);
             }
 
-            // Notify all players in the lobby
-            socket.broadcast.emit('playerJoined', username);
-
-            // Send the room ID back to the player
+            socket.broadcast.emit('playerJoined', walletAddress);
             socket.emit('roomId', roomId);
         } catch (error) {
             console.error('Error joining game:', error);
@@ -343,9 +316,9 @@ app.post('/login', async (req, res) => {
     }
 });
 
-app.get('/api/balance/:username', async (req, res) => {
+app.get('/api/balance/:wallet', async (req, res) => {
     try {
-        const user = await User.findOne({ username: req.params.username });
+        const user = await User.findOne({ walletAddress: req.params.wallet });
         if (user) {
             res.json({ balance: user.virtualBalance });
         } else {
@@ -356,10 +329,10 @@ app.get('/api/balance/:username', async (req, res) => {
     }
 });
 
-app.post('/api/topup/:username', async (req, res) => {
+app.post('/api/topup/:wallet', async (req, res) => {
     try {
         const user = await User.findOneAndUpdate(
-            { username: req.params.username },
+            { walletAddress: req.params.wallet },
             { $inc: { virtualBalance: 10 } },
             { new: true }
         );
@@ -491,10 +464,14 @@ function completeQuestion(roomId) {
         // Update winner's balance if there is a winner
         if (winner) {
             User.findOneAndUpdate(
-                { username: winner },
+                { walletAddress: winner },
                 { $inc: { virtualBalance: room.betAmount * 1.8 } },
                 { new: true }
             ).then(updatedUser => {
+                if (!updatedUser) {
+                    console.error('Winner not found:', winner);
+                    return;
+                }
                 io.to(roomId).emit('gameOver', {
                     players: room.players.map(p => ({ 
                         username: p.username, 
@@ -508,6 +485,17 @@ function completeQuestion(roomId) {
                 });
             }).catch(error => {
                 console.error('Error updating winner balance:', error);
+                // Still emit gameOver even if balance update fails
+                io.to(roomId).emit('gameOver', {
+                    players: room.players.map(p => ({ 
+                        username: p.username, 
+                        score: p.score, 
+                        totalResponseTime: p.totalResponseTime || 0
+                    })),
+                    winner: winner,
+                    betAmount: room.betAmount,
+                    singlePlayerMode: isSinglePlayer
+                });
             });
         } else {
             io.to(roomId).emit('gameOver', {
