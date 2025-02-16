@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Trivia Game</title>
     <link rel="stylesheet" href="styles.css">
+    <script src="https://bundle.run/buffer@6.0.3"></script>
+    <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@solana/spl-token@0.3.8/lib/index.iife.min.js"></script>
     <style>
         .non-copyable {
             user-select: none;
@@ -18,11 +21,37 @@
             transition: background-color 0.3s ease;
         }
     </style>
+    <script>
+        const splToken = window.SplToken;
+        
+        // Initialize Buffer from polyfill
+        window.Buffer = buffer.Buffer;
+        
+        const TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+        const ASSOCIATED_TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+        const USDC_DECIMALS = 6;
+
+        const config = {
+            USDC_MINT: new solanaWeb3.PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
+            TREASURY_WALLET: new solanaWeb3.PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
+            HOUSE_FEE_PERCENT: 2.5,
+            MIN_BET_AMOUNT: 1,
+            MAX_BET_AMOUNT: 100
+        };
+
+        const connection = new solanaWeb3.Connection(
+            'https://api.devnet.solana.com',
+            'confirmed'
+        );
+
+    </script>
 </head>
 <body>
     <header>
         <h1>Brainy Battle Quiz</h1>
         <button onclick="toggleTheme()">Toggle Theme</button>
+        <button id="connectWalletBtn" onclick="connectWallet()">Connect Wallet</button>
+        <div id="walletStatus"></div>
         <nav>
             <ul>
                 <li><a href="index.html">Home</a></li>
@@ -37,13 +66,13 @@
         <div id="countdownTimer"></div>
         <div id="gameArea">
             <select id="betAmount">
-                <option value="3">$3 Game</option>
-                <option value="10">$10 Game</option>
-                <option value="15">$15 Game</option>
-                <option value="20">$20 Game</option>
-                <option value="30">$30 Game</option>
+                <option value="3">3 USDC Game</option>
+                <option value="10">10 USDC Game</option>
+                <option value="15">15 USDC Game</option>
+                <option value="20">20 USDC Game</option>
+                <option value="30">30 USDC Game</option>
             </select>
-            <button id="joinGameBtn">Join Game</button>
+            <button id="joinGameBtn" type="button">Join Game</button>
             <div id="waitingMessage"></div>
             <div id="players"></div>
             <div id="question" class="non-copyable"></div>
@@ -82,6 +111,7 @@
         let questionTimer;
         let correctAnswer;
         let loggedInUser = null;
+        let phantomProvider = null;
 
         const joinGameBtn = document.getElementById('joinGameBtn');
         const waitingMessage = document.getElementById('waitingMessage');
@@ -103,40 +133,354 @@
         };
 
         // Get wallet from URL parameter or localStorage
-        connectedWallet = getUrlParameter('wallet') || localStorage.getItem('walletAddress');
+        const sessionData = localStorage.getItem('sessionData');
+        connectedWallet = getUrlParameter('wallet') || (sessionData ? JSON.parse(sessionData).walletAddress : null);
+
         if (!connectedWallet) {
+            console.log('No wallet found in session or URL');
             alert('No wallet connected. Redirecting to login page.');
             window.location.href = 'login.html';
+        } else {
+            console.log('Wallet connected:', connectedWallet);
+            // Initialize the game with the connected wallet
+            updateBalance();
         }
 
-        function updateBalance() {
-            fetch(`/api/balance/${connectedWallet}`)
-                .then(response => response.json())
-                .then(data => {
+        async function updateBalance() {
+            try {
+                const response = await fetch(`/api/balance/${connectedWallet}`);
+                const data = await response.json();
+                if (data.balance !== undefined) {
                     virtualBalance = data.balance;
-                    document.getElementById('balanceDisplay').textContent = `Balance: $${virtualBalance.toFixed(2)}`;
-                })
-                .catch(error => console.error('Error fetching balance:', error));
+                    document.getElementById('balanceDisplay').textContent = 
+                        `Balance: $${virtualBalance.toFixed(2)}`;
+                    
+                    // Update session data with new balance
+                    const sessionData = JSON.parse(localStorage.getItem('sessionData'));
+                    sessionData.virtualBalance = virtualBalance;
+                    localStorage.setItem('sessionData', JSON.stringify(sessionData));
+                }
+            } catch (error) {
+                console.error('Error fetching balance:', error);
+            }
         }
 
-        updateBalance(); // Call this when the page loads
+        async function connectWallet() {
+            try {
+                // Check if Phantom is installed
+                if (window.solana && window.solana.isPhantom) {
+                    phantomProvider = window.solana;
+                } else {
+                    alert('Phantom wallet is not installed. Please install it from https://phantom.app/');
+                    window.open('https://phantom.app/', '_blank');
+                    return;
+                }
 
-        joinGameBtn.addEventListener('click', () => {
-            const betAmount = parseInt(document.getElementById('betAmount').value);
-            
-            if (!connectedWallet) {
-                alert('Please connect your wallet first');
-                return;
+                // Connect to wallet
+                const response = await phantomProvider.connect();
+                connectedWallet = response.publicKey.toString();
+                console.log('Connected to wallet:', connectedWallet);
+
+                // Save wallet connection
+                localStorage.setItem('walletAddress', connectedWallet);
+
+                // Update UI to show connected state
+                updateWalletStatus();
+                updateBalance();
+                
+                return connectedWallet;
+            } catch (err) {
+                console.error('Error connecting to wallet:', err);
+                alert('Failed to connect wallet: ' + err.message);
+            }
+        }
+
+        function updateWalletStatus() {
+            if (connectedWallet) {
+                // Update UI to show connected wallet
+                const shortAddress = `${connectedWallet.slice(0, 4)}...${connectedWallet.slice(-4)}`;
+                document.getElementById('walletStatus').textContent = `Connected: ${shortAddress}`;
+            }
+        }
+
+        // Check wallet connection on page load
+        window.addEventListener('load', async () => {
+            try {
+                if (!window.solana || !window.solana.isPhantom) {
+                    throw new Error('Phantom wallet not installed');
+                }
+
+                const sessionDataStr = localStorage.getItem('sessionData');
+                if (!sessionDataStr) {
+                    throw new Error('No session found');
+                }
+
+                const sessionData = JSON.parse(sessionDataStr);
+                
+                if (Date.now() - sessionData.timestamp > 24 * 60 * 60 * 1000) {
+                    throw new Error('Session expired');
+                }
+
+                let publicKey;
+                if (window.solana.isConnected) {
+                    publicKey = window.solana.publicKey.toString();
+                } else {
+                    const resp = await window.solana.connect({ onlyIfTrusted: true });
+                    publicKey = resp.publicKey.toString();
+                }
+
+                if (publicKey !== sessionData.walletAddress) {
+                    throw new Error('Wallet mismatch');
+                }
+
+                connectedWallet = publicKey;
+                console.log('Session restored:', connectedWallet);
+                
+                document.getElementById('walletStatus').textContent = 
+                    `Connected: ${connectedWallet.slice(0,4)}...${connectedWallet.slice(-4)}`;
+                
+                socket.emit('walletReconnect', connectedWallet);
+                updateBalance();
+
+            } catch (error) {
+                console.error('Session validation failed:', error);
+                localStorage.removeItem('sessionData');
+                window.location.href = 'login.html';
+            }
+        });
+
+        window.solana?.on('disconnect', () => {
+            console.log('Wallet disconnected');
+            localStorage.removeItem('sessionData');
+            window.location.href = 'login.html';
+        });
+
+        // Add helper functions at the top of your script section
+        async function findAssociatedTokenAddress(walletAddress, tokenMintAddress) {
+            return (await solanaWeb3.PublicKey.findProgramAddress(
+                [
+                    walletAddress.toBuffer(),
+                    TOKEN_PROGRAM_ID.toBuffer(),
+                    tokenMintAddress.toBuffer(),
+                ],
+                ASSOCIATED_TOKEN_PROGRAM_ID
+            ))[0];
+        }
+
+        function updateUIForJoining() {
+            joinGameBtn.disabled = true;
+            joinGameBtn.textContent = 'Processing...';
+            waitingMessage.textContent = 'Processing USDC payment...';
+        }
+
+        function resetJoinUI() {
+            joinGameBtn.disabled = false;
+            joinGameBtn.textContent = 'Join Game';
+            waitingMessage.textContent = '';
+        }
+
+        class USDCManager {
+            constructor(connection) {
+                this.connection = connection;
+                this.usdcMint = config.USDC_MINT;
             }
 
-            if (virtualBalance < betAmount) {
-                alert(`Insufficient balance. You need $${betAmount} to join the game.`);
-                return;
+            async findAssociatedTokenAddress(walletAddress, tokenMintAddress) {
+                return (await solanaWeb3.PublicKey.findProgramAddress(
+                    [
+                        walletAddress.toBuffer(),
+                        TOKEN_PROGRAM_ID.toBuffer(),
+                        tokenMintAddress.toBuffer(),
+                    ],
+                    ASSOCIATED_TOKEN_PROGRAM_ID
+                ))[0];
             }
 
-            socket.emit('joinGame', connectedWallet, betAmount, connectedWallet);
-            joinGameBtn.style.display = 'none';
-            waitingMessage.textContent = 'Waiting for another player...';
+            async getOrCreateAssociatedTokenAccount(walletPublicKey) {
+                try {
+                    const tokenAccount = await this.findAssociatedTokenAddress(
+                        walletPublicKey,
+                        this.usdcMint
+                    );
+
+                    try {
+                        // Check if account exists
+                        const accountInfo = await this.connection.getAccountInfo(tokenAccount);
+                        if (accountInfo) {
+                            return { tokenAccount, transaction: null };
+                        }
+                    } catch (error) {
+                        console.log('Error checking account:', error);
+                    }
+
+                    // Create new account if it doesn't exist
+                    console.log('Creating new associated token account...');
+                    const transaction = new solanaWeb3.Transaction().add(
+                        this.createAssociatedTokenAccountInstruction(
+                            walletPublicKey,
+                            tokenAccount,
+                            walletPublicKey,
+                            this.usdcMint
+                        )
+                    );
+
+                    transaction.recentBlockhash = (await this.connection.getRecentBlockhash()).blockhash;
+                    transaction.feePayer = walletPublicKey;
+
+                    return { tokenAccount, transaction };
+                } catch (error) {
+                    console.error('Error in getOrCreateAssociatedTokenAccount:', error);
+                    throw error;
+                }
+            }
+
+            createAssociatedTokenAccountInstruction(
+                payer,
+                associatedToken,
+                owner,
+                mint
+            ) {
+                const keys = [
+                    { pubkey: payer, isSigner: true, isWritable: true },
+                    { pubkey: associatedToken, isSigner: false, isWritable: true },
+                    { pubkey: owner, isSigner: false, isWritable: false },
+                    { pubkey: mint, isSigner: false, isWritable: false },
+                    { pubkey: solanaWeb3.SystemProgram.programId, isSigner: false, isWritable: false },
+                    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+                    { pubkey: solanaWeb3.SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+                ];
+
+                return new solanaWeb3.TransactionInstruction({
+                    keys,
+                    programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+                    data: Buffer.from([])
+                });
+            }
+
+            async getUSDCBalance(walletAddress) {
+                try {
+                    const walletPublicKey = new solanaWeb3.PublicKey(walletAddress);
+                    const { tokenAccount, transaction } = await this.getOrCreateAssociatedTokenAccount(walletPublicKey);
+
+                    if (transaction) {
+                        return {
+                            balance: 0,
+                            needsTokenAccount: true,
+                            createAccountTransaction: transaction
+                        };
+                    }
+
+                    const accountInfo = await this.connection.getAccountInfo(tokenAccount);
+                    const balance = accountInfo ? accountInfo.lamports / Math.pow(10, 6) : 0;
+
+                    return {
+                        balance,
+                        needsTokenAccount: false
+                    };
+                } catch (error) {
+                    console.error('Error getting USDC balance:', error);
+                    throw error;
+                }
+            }
+
+            async createTransferTransaction(walletAddress, betAmount) {
+                try {
+                    if (betAmount < config.MIN_BET_AMOUNT || betAmount > config.MAX_BET_AMOUNT) {
+                        throw new Error(`Bet amount must be between ${config.MIN_BET_AMOUNT} and ${config.MAX_BET_AMOUNT} USDC`);
+                    }
+
+                    const fromWallet = new solanaWeb3.PublicKey(walletAddress);
+                    
+                    // Get token accounts
+                    const { tokenAccount: fromTokenAccount, transaction: createFromAcctTx } = 
+                        await this.getOrCreateAssociatedTokenAccount(fromWallet);
+                    const { tokenAccount: toTokenAccount, transaction: createToAcctTx } = 
+                        await this.getOrCreateAssociatedTokenAccount(config.TREASURY_WALLET);
+
+                    // Create transfer instruction
+                    const transferInstruction = new solanaWeb3.TransactionInstruction({
+                        keys: [
+                            { pubkey: fromTokenAccount, isSigner: false, isWritable: true },
+                            { pubkey: toTokenAccount, isSigner: false, isWritable: true },
+                            { pubkey: fromWallet, isSigner: true, isWritable: false },
+                        ],
+                        programId: TOKEN_PROGRAM_ID,
+                        data: Buffer.from([3, ...new Uint8Array(8).fill(betAmount * 1000000)])
+                    });
+
+                    // Create transaction and add all necessary instructions
+                    const transaction = new solanaWeb3.Transaction();
+                    if (createFromAcctTx) transaction.add(createFromAcctTx);
+                    if (createToAcctTx) transaction.add(createToAcctTx);
+                    transaction.add(transferInstruction);
+
+                    const { blockhash } = await this.connection.getRecentBlockhash();
+                    transaction.recentBlockhash = blockhash;
+                    transaction.feePayer = fromWallet;
+
+                    return transaction;
+                } catch (error) {
+                    console.error('Error creating transfer transaction:', error);
+                    throw error;
+                }
+            }
+        }
+
+        // Initialize USDC manager after connection is created
+        const usdcManager = new USDCManager(connection);
+
+        // Update the USDC payment section in the joinGameBtn event listener
+        joinGameBtn.addEventListener('click', async () => {
+            try {
+                if (!connectedWallet || !window.solana?.isConnected) {
+                    alert('Please connect your wallet first');
+                    return;
+                }
+
+                const betAmount = parseInt(document.getElementById('betAmount').value);
+                updateUIForJoining();
+
+                // Check USDC balance and create token account if needed
+                const balanceResult = await usdcManager.getUSDCBalance(connectedWallet);
+                
+                if (balanceResult.needsTokenAccount) {
+                    console.log('Creating token account...');
+                    const signed = await window.solana.signTransaction(balanceResult.createAccountTransaction);
+                    const signature = await connection.sendRawTransaction(signed.serialize());
+                    await connection.confirmTransaction(signature);
+                }
+
+                if (balanceResult.balance < betAmount) {
+                    throw new Error(`Insufficient USDC balance. You have ${balanceResult.balance} USDC`);
+                }
+
+                // Create and send bet transaction
+                console.log('Creating bet transaction...');
+                const transaction = await usdcManager.createTransferTransaction(connectedWallet, betAmount);
+                console.log('Requesting transaction signature...');
+                const signed = await window.solana.signTransaction(transaction);
+                console.log('Sending transaction...');
+                const txSignature = await connection.sendRawTransaction(signed.serialize());
+                console.log('Confirming transaction...');
+                await connection.confirmTransaction(txSignature);
+
+                console.log('USDC transfer successful:', txSignature);
+
+                // Join game
+                socket.emit('joinGame', {
+                    walletAddress: connectedWallet,
+                    betAmount,
+                    transactionSignature: txSignature
+                });
+
+                joinGameBtn.style.display = 'none';
+                waitingMessage.textContent = 'Waiting for another player...';
+
+            } catch (error) {
+                console.error('Join game error:', error);
+                resetJoinUI();
+                alert('Failed to join game: ' + error.message);
+            }
         });
 
         socket.on('balanceUpdate', (newBalance) => {
@@ -144,10 +488,16 @@
             document.getElementById('balanceDisplay').textContent = `Balance: $${virtualBalance.toFixed(2)}`;
         });
 
-        socket.on('joinGameFailure', (message) => {
-            alert(message);
-            joinGameBtn.style.display = 'block';
-            waitingMessage.textContent = '';
+        socket.on('joinGameSuccess', (data) => {
+            console.log('Successfully joined game:', data);
+            joinGameBtn.style.display = 'none';
+            waitingMessage.textContent = 'Waiting for another player...';
+        });
+
+        socket.on('joinGameFailure', (error) => {
+            console.error('Failed to join game:', error);
+            resetJoinUI();
+            alert('Failed to join game: ' + error);
         });
 
         submitAnswerBtn.addEventListener('click', () => {
@@ -412,19 +762,6 @@
             const playerResult = playerResults.find(result => result.username === connectedWallet);
             if (playerResult && !playerResult.isCorrect) {
                 options[playerResult.answer].parentElement.classList.add('incorrect');
-            }
-        });
-
-        // Check wallet connection on page load
-        window.addEventListener('load', () => {
-            const walletAddress = localStorage.getItem('walletAddress');
-            if (walletAddress) {
-                document.getElementById('walletStatus').textContent = 
-                    `Connected: ${walletAddress.slice(0,4)}...${walletAddress.slice(-4)}`;
-            } else {
-                alert('Please connect your wallet first');
-                // Optionally redirect to home page
-                // window.location.href = 'index.html';
             }
         });
     </script>

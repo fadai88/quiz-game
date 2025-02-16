@@ -78,12 +78,29 @@
         socket.on('loginSuccess', (data) => {
             console.log('Login success:', data);
             connectedWallet = data.walletAddress;
+            
+            // Store complete session data
+            const sessionData = {
+                walletAddress: data.walletAddress,
+                virtualBalance: data.virtualBalance,
+                timestamp: Date.now(),
+                isConnected: true
+            };
+            
+            // Save session data
+            localStorage.setItem('sessionData', JSON.stringify(sessionData));
+            
+            // Update UI
             document.getElementById('walletSection').style.display = 'none';
             document.getElementById('userInfo').style.display = 'block';
             document.getElementById('walletDisplay').textContent = 
                 `${connectedWallet.slice(0,4)}...${connectedWallet.slice(-4)}`;
             document.getElementById('balanceDisplay').textContent = data.virtualBalance;
-            localStorage.setItem('walletAddress', connectedWallet);
+        });
+
+        // Update the playGameBtn click handler
+        document.getElementById('playGameBtn').addEventListener('click', () => {
+            window.location.href = 'game.html';
         });
 
         socket.on('loginFailure', (message) => {

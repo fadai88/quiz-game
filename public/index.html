@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Brainy Battle Quiz - Home</title>
+    <title>Brainy Battle Quiz</title>
     <link rel="stylesheet" href="styles.css">
     <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
     <script src="https://unpkg.com/@project-serum/anchor@latest/dist/browser/anchor.min.js"></script>
@@ -12,19 +12,17 @@
     <header>
         <h1>Welcome to Brainy Battle Quiz</h1>
         <button onclick="toggleTheme()">Toggle Theme</button>
-        <button id="connectWallet">Connect Wallet</button>
+        <button id="connectWalletBtn">Connect Wallet</button>
         <nav>
             <ul>
-                <li><a href="login.html">Login/Register</a></li>
-                <li><a href="leaderboard.html">Leaderboard</a></li>
+                <li><a href="login.html">Login</a></li>
+                <li><a href="Leaderboard">Leaderboard</a></li>
             </ul>
         </nav>
     </header>
 
     <main>
         <h2>Test Your Knowledge and Win Prizes!</h2>
-        <p>Join our exciting trivia game and compete against other players. Register now to start playing!</p>
-        <a href="login.html" class="cta-button">Get Started</a>
     </main>
 
     <script>
@@ -39,7 +37,7 @@
             const savedWallet = localStorage.getItem('walletAddress');
             if (savedWallet) {
                 wallet = savedWallet;
-                document.getElementById('connectWallet').textContent = 
+                document.getElementById('connectWalletBtn').textContent = 
                     `Connected: ${wallet.slice(0,4)}...${wallet.slice(-4)}`;
             }
         });
@@ -55,7 +53,7 @@
                 wallet = resp.publicKey.toString();
                 // Save wallet address to localStorage
                 localStorage.setItem('walletAddress', wallet);
-                document.getElementById('connectWallet').textContent = 
+                document.getElementById('connectWalletBtn').textContent = 
                     `Connected: ${wallet.slice(0,4)}...${wallet.slice(-4)}`;
             } catch (err) {
                 console.error('Error connecting wallet:', err);
@@ -63,7 +61,7 @@
             }
         }
 
-        document.getElementById('connectWallet')
+        document.getElementById('connectWalletBtn')
             .addEventListener('click', connectWallet);
     </script>
 </body>

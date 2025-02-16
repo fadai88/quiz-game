@@ -10,10 +10,11 @@ const nodemailer = require('nodemailer'); // Import Nodemailer
 const crypto = require('crypto'); // For generating verification tokens
 const User = require('./models/User');
 const axios = require('axios'); // Add this line at the top with other imports
-const { Connection, PublicKey, SystemProgram } = require('@solana/web3.js');
+const { Connection, PublicKey, SystemProgram, Token, TOKEN_PROGRAM_ID } = require('@solana/web3.js');
 const { Program } = require('@project-serum/anchor');
 const bs58 = require('bs58');
 const nacl = require('tweetnacl');
+const { Token: SPLToken } = require('@solana/spl-token');
 
 const app = express();
 const server = http.createServer(app);
@@ -61,6 +62,54 @@ if (process.env.PROGRAM_ID) {
     // Use SystemProgram.programId instead of string
     programId = SystemProgram.programId;
 }
+
+// Add the verification function
+const verifyUSDCTransaction = async (transactionSignature, expectedAmount, senderAddress, recipientAddress) => {
+    try {
+        const connection = new Connection(process.env.SOLANA_RPC_URL, 'confirmed');
+        
+        // Get transaction details
+        const transaction = await connection.getTransaction(transactionSignature);
+        if (!transaction) {
+            console.error('Transaction not found');
+            return false;
+        }
+
+        // Find the token transfer instruction
+        const transferInstruction = transaction.transaction.message.instructions.find(
+            ix => ix.programId.equals(TOKEN_PROGRAM_ID)
+        );
+
+        if (!transferInstruction) {
+            console.error('No token transfer instruction found');
+            return false;
+        }
+
+        // Decode the transfer instruction
+        const decodedInstruction = SPLToken.decodeTransferInstruction(transferInstruction);
+        
+        // Get amount in USDC (convert from raw amount)
+        const amount = decodedInstruction.amount.toNumber() / Math.pow(10, 6);
+
+        // Verify amount and addresses
+        const amountMatches = Math.abs(amount - expectedAmount) < 0.01; // Allow small rounding differences
+        const senderMatches = decodedInstruction.source.equals(new PublicKey(senderAddress));
+        const recipientMatches = decodedInstruction.destination.equals(new PublicKey(recipientAddress));
+
+        console.log('Transaction verification:', {
+            amountMatches,
+            senderMatches,
+            recipientMatches,
+            expectedAmount,
+            actualAmount: amount
+        });
+
+        return amountMatches && senderMatches && recipientMatches;
+    } catch (error) {
+        console.error('Error verifying USDC transaction:', error);
+        return false;
+    }
+};
 
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
@@ -122,39 +171,26 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('joinGame', async (walletAddress, betAmount) => {
-        console.log('Join game attempt:', { walletAddress, betAmount });
-
-        if (!walletAddress) {
-            console.log('Join game failed - missing wallet');
-            socket.emit('joinGameFailure', 'You must connect your wallet to join the game.');
-            return;
-        }
-
+    socket.on('joinGame', async (data) => {
         try {
-            const user = await User.findOne({ walletAddress });
-            if (!user) {
-                console.log('User not found:', walletAddress);
-                socket.emit('joinGameFailure', 'User not found.');
-                return;
+            const { walletAddress, betAmount, transactionSignature } = data;
+            console.log('Join game request:', { walletAddress, betAmount, transactionSignature });
+
+            // Verify the transaction
+            const transaction = await connection.getTransaction(transactionSignature);
+            if (!transaction) {
+                throw new Error('Transaction not found');
             }
 
-            if (user.virtualBalance < betAmount) {
-                socket.emit('joinGameFailure', `Insufficient virtual balance. You need $${betAmount} to join the game.`);
-                return;
+            if (transaction.meta.err) {
+                throw new Error('Transaction failed');
             }
 
-            const updatedUser = await User.findOneAndUpdate(
-                { walletAddress }, 
-                { $inc: { gamesPlayed: 1, virtualBalance: -betAmount } },
-                { new: true }
-            );
-            socket.emit('balanceUpdate', updatedUser.virtualBalance);
-
-            console.log(`${walletAddress} (${socket.id}) is trying to join a game`);
+            // Find or create game room
             let roomId;
             let joinedExistingRoom = false;
 
+            // Look for an existing room with same bet amount
             for (const [id, room] of gameRooms.entries()) {
                 if (room.players.length < 2 && room.betAmount === betAmount) {
                     roomId = id;
@@ -163,48 +199,48 @@ io.on('connection', (socket) => {
                 }
             }
 
+            // Create new room if none found
             if (!roomId) {
                 roomId = generateRoomId();
-                gameRooms.set(roomId, { 
-                    players: [], 
-                    questions: [], 
+                gameRooms.set(roomId, {
+                    players: [],
+                    questions: [],
                     currentQuestionIndex: 0,
                     answersReceived: 0,
                     betAmount: betAmount,
                     waitingTimeout: setTimeout(async () => {
                         const room = gameRooms.get(roomId);
                         if (room && room.players.length === 1) {
-                            console.log(`Starting single player mode for ${walletAddress} in room ${roomId}`);
                             await startSinglePlayerGame(roomId);
                         }
                     }, 30000)
                 });
-                console.log(`Created new room: ${roomId}`);
             }
 
+            // Add player to room
             const room = gameRooms.get(roomId);
-            room.players.push({ id: socket.id, username: walletAddress, score: 0 });
+            room.players.push({
+                id: socket.id,
+                username: walletAddress,
+                score: 0,
+                totalResponseTime: 0
+            });
 
+            // Join socket room
             socket.join(roomId);
             socket.emit('gameJoined', roomId);
 
-            console.log(`Player ${walletAddress} (${socket.id}) joined room ${roomId}`);
-            console.log(`Room ${roomId} now has ${room.players.length} player(s)`);
-
+            // Start game if room is full
             if (room.players.length === 2) {
                 clearTimeout(room.waitingTimeout);
-                console.log(`Starting game in room ${roomId}`);
                 startGame(roomId);
             } else if (joinedExistingRoom) {
-                console.log(`Notifying other player in room ${roomId} that ${walletAddress} joined`);
                 socket.to(roomId).emit('playerJoined', walletAddress);
             }
 
-            socket.broadcast.emit('playerJoined', walletAddress);
-            socket.emit('roomId', roomId);
         } catch (error) {
-            console.error('Error joining game:', error);
-            socket.emit('joinGameFailure', 'Failed to join game. Please try again.');
+            console.error('Join game error:', error);
+            socket.emit('joinGameFailure', error.message);
         }
     });
 
@@ -534,11 +570,6 @@ function generateRoomId() {
     return Math.random().toString(36).substring(7);
 }
 
-app.get('/join', (req, res) => {
-    const roomId = req.query.roomId;
-    // Logic to add the player to the specified room
-    // ...
-});
 
 // Email verification endpoint
 app.get('/verify-email', async (req, res) => {
@@ -619,21 +650,34 @@ async function startSinglePlayerGame(roomId) {
     }
 }
 
+// Add helper functions if they don't exist
+function findAvailableRoom(betAmount) {
+    for (const [roomId, room] of gameRooms.entries()) {
+        if (room.players.length < 2 && room.betAmount === betAmount) {
+            return roomId;
+        }
+    }
+    return null;
+}
 
+function createGameRoom(roomId, betAmount) {
+    gameRooms.set(roomId, {
+        players: [],
+        betAmount,
+        questions: [],
+        currentQuestionIndex: 0,
+        answersReceived: 0
+    });
+}
 
+function addPlayerToRoom(roomId, socketId, walletAddress) {
+    const room = gameRooms.get(roomId);
+    if (room) {
+        room.players.push({
+            id: socketId,
+            walletAddress,
+            score: 0
+        });
+    }
+}
 
-/*
-Great! Yes, using the System Program ID (11111111111111111111111111111111) as a placeholder is a good way to start development.
-Now that your server is running, here is what you might want to do next:
-Test your basic MongoDB functionality (quiz questions, user registration, etc.)
-When you're ready to implement the actual Solana integration:
-Create your own Solana program (smart contract)
-Deploy it to devnet
-Replace the dummy program ID with your actual program ID
-Implement the token (USDC/USDT) integration
-Would you like me to help you with any of these next steps? For example:
-Testing the existing quiz functionality
-Creating and deploying a Solana program
-Setting up token integration
-Let me know what you'd like to focus on next!
-*/
