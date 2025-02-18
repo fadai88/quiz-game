@@ -104,6 +104,25 @@
     <script src="/socket.io/socket.io.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js"></script>
     <script>
+        const AccountLayout = {
+            decode(buffer) {
+                const accountInfo = {
+                    mint: new solanaWeb3.PublicKey(buffer.slice(0, 32)),
+                    owner: new solanaWeb3.PublicKey(buffer.slice(32, 64)),
+                    amount: buffer.slice(64, 72).readBigUInt64LE(0),
+                    delegateOption: buffer[72],
+                    delegate: new solanaWeb3.PublicKey(buffer.slice(73, 105)),
+                    state: buffer[105],
+                    isNativeOption: buffer[106],
+                    isNative: buffer.slice(107, 115),
+                    delegatedAmount: buffer.slice(115, 123),
+                    closeAuthorityOption: buffer[123],
+                    closeAuthority: new solanaWeb3.PublicKey(buffer.slice(124, 156))
+                };
+                return accountInfo;
+            }
+        };
+
         const socket = io();
         let connectedWallet = null;
         let currentRoomId = null;
@@ -370,8 +389,24 @@
                         };
                     }
 
-                    const accountInfo = await this.connection.getAccountInfo(tokenAccount);
-                    const balance = accountInfo ? accountInfo.lamports / Math.pow(10, 6) : 0;
+                    // Get all token accounts owned by the wallet
+                    const tokenAccounts = await this.connection.getTokenAccountsByOwner(
+                        walletPublicKey,
+                        {
+                            mint: this.usdcMint
+                        }
+                    );
+
+                    // Find the token account with a balance
+                    let balance = 0;
+                    for (const { account } of tokenAccounts.value) {
+                        const accountData = account.data;
+                        const accountInfo = AccountLayout.decode(accountData);
+                        balance = Number(accountInfo.amount) / Math.pow(10, 6);
+                        if (balance > 0) break;
+                    }
+
+                    console.log('Found USDC balance:', balance);
 
                     return {
                         balance,
@@ -391,32 +426,61 @@
 
                     const fromWallet = new solanaWeb3.PublicKey(walletAddress);
                     
-                    // Get token accounts
-                    const { tokenAccount: fromTokenAccount, transaction: createFromAcctTx } = 
-                        await this.getOrCreateAssociatedTokenAccount(fromWallet);
-                    const { tokenAccount: toTokenAccount, transaction: createToAcctTx } = 
-                        await this.getOrCreateAssociatedTokenAccount(config.TREASURY_WALLET);
+                    // Get token accounts for user and treasury
+                    const fromTokenAccount = await this.findAssociatedTokenAddress(
+                        fromWallet,
+                        this.usdcMint
+                    );
+
+                    const toTokenAccount = await this.findAssociatedTokenAddress(
+                        config.TREASURY_WALLET,
+                        this.usdcMint
+                    );
+
+                    // Amount in token decimals
+                    const amount = betAmount * Math.pow(10, 6);
 
                     // Create transfer instruction
+                    const keys = [
+                        { pubkey: fromTokenAccount, isSigner: false, isWritable: true },
+                        { pubkey: toTokenAccount, isSigner: false, isWritable: true },
+                        { pubkey: fromWallet, isSigner: true, isWritable: false },
+                        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }
+                    ];
+
+                    const dataLayout = {
+                        transfer: 3,  // Command index for Transfer
+                        amount: amount
+                    };
+
+                    const data = Buffer.alloc(9);
+                    data.writeUInt8(dataLayout.transfer, 0);
+                    data.writeBigUInt64LE(BigInt(dataLayout.amount), 1);
+
                     const transferInstruction = new solanaWeb3.TransactionInstruction({
-                        keys: [
-                            { pubkey: fromTokenAccount, isSigner: false, isWritable: true },
-                            { pubkey: toTokenAccount, isSigner: false, isWritable: true },
-                            { pubkey: fromWallet, isSigner: true, isWritable: false },
-                        ],
+                        keys,
                         programId: TOKEN_PROGRAM_ID,
-                        data: Buffer.from([3, ...new Uint8Array(8).fill(betAmount * 1000000)])
+                        data
                     });
 
-                    // Create transaction and add all necessary instructions
+                    // Create transaction
                     const transaction = new solanaWeb3.Transaction();
-                    if (createFromAcctTx) transaction.add(createFromAcctTx);
-                    if (createToAcctTx) transaction.add(createToAcctTx);
+                    
+                    // Get recent blockhash
+                    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+                    transaction.recentBlockhash = blockhash;
+                    transaction.lastValidBlockHeight = lastValidBlockHeight;
+                    transaction.feePayer = fromWallet;
+                    
+                    // Add instruction
                     transaction.add(transferInstruction);
 
-                    const { blockhash } = await this.connection.getRecentBlockhash();
-                    transaction.recentBlockhash = blockhash;
-                    transaction.feePayer = fromWallet;
+                    console.log('Created transfer transaction:', {
+                        from: fromTokenAccount.toString(),
+                        to: toTokenAccount.toString(),
+                        amount: amount,
+                        feePayer: fromWallet.toString()
+                    });
 
                     return transaction;
                 } catch (error) {
@@ -438,35 +502,41 @@
                 }
 
                 const betAmount = parseInt(document.getElementById('betAmount').value);
+                console.log('Attempting to bet:', betAmount, 'USDC');
+                
                 updateUIForJoining();
 
-                // Check USDC balance and create token account if needed
+                console.log('Checking USDC balance...');
                 const balanceResult = await usdcManager.getUSDCBalance(connectedWallet);
-                
-                if (balanceResult.needsTokenAccount) {
-                    console.log('Creating token account...');
-                    const signed = await window.solana.signTransaction(balanceResult.createAccountTransaction);
-                    const signature = await connection.sendRawTransaction(signed.serialize());
-                    await connection.confirmTransaction(signature);
-                }
+                console.log('Current USDC balance:', balanceResult.balance);
 
-                if (balanceResult.balance < betAmount) {
-                    throw new Error(`Insufficient USDC balance. You have ${balanceResult.balance} USDC`);
-                }
-
-                // Create and send bet transaction
-                console.log('Creating bet transaction...');
+                console.log('Creating transfer transaction...');
                 const transaction = await usdcManager.createTransferTransaction(connectedWallet, betAmount);
-                console.log('Requesting transaction signature...');
+                
+                console.log('Requesting signature...');
                 const signed = await window.solana.signTransaction(transaction);
+                
                 console.log('Sending transaction...');
                 const txSignature = await connection.sendRawTransaction(signed.serialize());
-                console.log('Confirming transaction...');
-                await connection.confirmTransaction(txSignature);
+                
+                console.log('Waiting for transaction confirmation...');
+                // Wait for confirmation with specific commitment
+                const confirmation = await connection.confirmTransaction({
+                    signature: txSignature,
+                    blockhash: transaction.recentBlockhash,
+                    lastValidBlockHeight: transaction.lastValidBlockHeight
+                }, 'confirmed');
 
-                console.log('USDC transfer successful:', txSignature);
+                if (confirmation.value?.err) {
+                    throw new Error(`Transaction failed: ${confirmation.value.err}`);
+                }
 
-                // Join game
+                // Add a small delay to ensure transaction is fully processed
+                await new Promise(resolve => setTimeout(resolve, 2000));
+
+                console.log('Transaction confirmed:', txSignature);
+
+                // Join game with confirmed transaction
                 socket.emit('joinGame', {
                     walletAddress: connectedWallet,
                     betAmount,

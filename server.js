@@ -50,8 +50,19 @@ const transporter = nodemailer.createTransport({
     },
 });
 
-// Create Solana connection
-const connection = new Connection(process.env.SOLANA_RPC_URL);
+
+// Initialize config
+const config = {
+    USDC_MINT: new PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
+    TREASURY_WALLET: new PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
+    HOUSE_FEE_PERCENT: 2.5,
+    MIN_BET_AMOUNT: 1,
+    MAX_BET_AMOUNT: 100,
+    connection: new Connection('https://api.devnet.solana.com', 'confirmed')
+};
+
+// Initialize connection
+const connection = config.connection;
 
 // Initialize programId
 let programId;
@@ -175,21 +186,67 @@ io.on('connection', (socket) => {
         try {
             const { walletAddress, betAmount, transactionSignature } = data;
             console.log('Join game request:', { walletAddress, betAmount, transactionSignature });
-
-            // Verify the transaction
-            const transaction = await connection.getTransaction(transactionSignature);
+    
+            // Verify the transaction with retries
+            let transaction = null;
+            let retries = 5;
+            while (retries > 0 && !transaction) {
+                try {
+                    transaction = await connection.getTransaction(transactionSignature, {
+                        commitment: 'confirmed',
+                        maxSupportedTransactionVersion: 0
+                    });
+                    if (transaction) break;
+                } catch (error) {
+                    console.log(`Retry ${6 - retries}: Transaction not found yet`);
+                    retries--;
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+    
             if (!transaction) {
-                throw new Error('Transaction not found');
+                throw new Error('Transaction verification failed after retries');
             }
-
+    
+            // Verify transaction success
             if (transaction.meta.err) {
-                throw new Error('Transaction failed');
+                throw new Error('Transaction failed on chain');
             }
-
-            // Find or create game room
+    
+            // Verify amount (if needed)
+            const postTokenBalances = transaction.meta.postTokenBalances;
+            const preTokenBalances = transaction.meta.preTokenBalances;
+    
+            if (!postTokenBalances || !preTokenBalances) {
+                throw new Error('Transaction token balances not found');
+            }
+    
+            // Find treasury token account changes
+            const treasuryPostBalance = postTokenBalances.find(b => 
+                b.owner === config.TREASURY_WALLET.toString()
+            );
+    
+            const treasuryPreBalance = preTokenBalances.find(b => 
+                b.owner === config.TREASURY_WALLET.toString()
+            );
+    
+            if (!treasuryPostBalance || !treasuryPreBalance) {
+                throw new Error('Treasury balance change not found in transaction');
+            }
+    
+            const balanceChange = (treasuryPostBalance.uiTokenAmount.uiAmount || 0) -
+                                (treasuryPreBalance.uiTokenAmount.uiAmount || 0);
+    
+            if (Math.abs(balanceChange - betAmount) > 0.001) {
+                throw new Error('Transaction amount mismatch');
+            }
+    
+            console.log('Transaction verified successfully');
+    
+            // Create or join game room
             let roomId;
             let joinedExistingRoom = false;
-
+    
             // Look for an existing room with same bet amount
             for (const [id, room] of gameRooms.entries()) {
                 if (room.players.length < 2 && room.betAmount === betAmount) {
@@ -198,8 +255,7 @@ io.on('connection', (socket) => {
                     break;
                 }
             }
-
-            // Create new room if none found
+    
             if (!roomId) {
                 roomId = generateRoomId();
                 gameRooms.set(roomId, {
@@ -216,8 +272,7 @@ io.on('connection', (socket) => {
                     }, 30000)
                 });
             }
-
-            // Add player to room
+    
             const room = gameRooms.get(roomId);
             room.players.push({
                 id: socket.id,
@@ -225,19 +280,17 @@ io.on('connection', (socket) => {
                 score: 0,
                 totalResponseTime: 0
             });
-
-            // Join socket room
+    
             socket.join(roomId);
             socket.emit('gameJoined', roomId);
-
-            // Start game if room is full
+    
             if (room.players.length === 2) {
                 clearTimeout(room.waitingTimeout);
                 startGame(roomId);
             } else if (joinedExistingRoom) {
                 socket.to(roomId).emit('playerJoined', walletAddress);
             }
-
+    
         } catch (error) {
             console.error('Join game error:', error);
             socket.emit('joinGameFailure', error.message);
