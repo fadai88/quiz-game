@@ -10,7 +10,16 @@ const nodemailer = require('nodemailer'); // Import Nodemailer
 const crypto = require('crypto'); // For generating verification tokens
 const User = require('./models/User');
 const axios = require('axios'); // Add this line at the top with other imports
-const { Connection, PublicKey, SystemProgram, Token, TOKEN_PROGRAM_ID } = require('@solana/web3.js');
+// const { Connection, PublicKey, SystemProgram, Token, TOKEN_PROGRAM_ID } = require('@solana/web3.js');
+const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, Keypair } = require('@solana/web3.js');
+
+const { 
+    createAssociatedTokenAccountInstruction, 
+    getAssociatedTokenAddress, 
+    createTransferCheckedInstruction,
+    TOKEN_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID
+} = require('@solana/spl-token');
 const { Program } = require('@project-serum/anchor');
 const bs58 = require('bs58');
 const nacl = require('tweetnacl');
@@ -55,6 +64,9 @@ const transporter = nodemailer.createTransport({
 const config = {
     USDC_MINT: new PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
     TREASURY_WALLET: new PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
+    TREASURY_KEYPAIR: Keypair.fromSecretKey(
+        Buffer.from(JSON.parse(process.env.TREASURY_SECRET_KEY))
+    ),
     HOUSE_FEE_PERCENT: 2.5,
     MIN_BET_AMOUNT: 1,
     MAX_BET_AMOUNT: 100,
@@ -346,7 +358,7 @@ io.on('connection', (socket) => {
                     answer: p.lastAnswer
                 }))
             });
-            completeQuestion(roomId);
+            await completeQuestion(roomId);
         } else {
             // Just update that a player has answered without revealing the answer
             socket.to(roomId).emit('playerAnswered', username);
@@ -485,12 +497,12 @@ function startNextQuestion(roomId) {
     }
 
     // Set a new timeout for this question
-    room.questionTimeout = setTimeout(() => {
-        completeQuestion(roomId);
+    room.questionTimeout = setTimeout(async () => {
+        await completeQuestion(roomId);
     }, 10000); // 10 seconds for each question
 }
 
-function completeQuestion(roomId) {
+async function completeQuestion(roomId) {
     const room = gameRooms.get(roomId);
     if (!room) return;
 
@@ -552,15 +564,8 @@ function completeQuestion(roomId) {
 
         // Update winner's balance if there is a winner
         if (winner) {
-            User.findOneAndUpdate(
-                { walletAddress: winner },
-                { $inc: { virtualBalance: room.betAmount * 1.8 } },
-                { new: true }
-            ).then(updatedUser => {
-                if (!updatedUser) {
-                    console.error('Winner not found:', winner);
-                    return;
-                }
+            try {
+                const payoutSignature = await sendWinnings(winner, room.betAmount);
                 io.to(roomId).emit('gameOver', {
                     players: room.players.map(p => ({ 
                         username: p.username, 
@@ -569,13 +574,13 @@ function completeQuestion(roomId) {
                     })),
                     winner: winner,
                     betAmount: room.betAmount,
-                    winnerBalance: updatedUser.virtualBalance,
+                    payoutSignature,
                     singlePlayerMode: isSinglePlayer
                 });
-            }).catch(error => {
-                console.error('Error updating winner balance:', error);
-                // Still emit gameOver even if balance update fails
+            } catch (error) {
+                console.error('Error processing payout:', error);
                 io.to(roomId).emit('gameOver', {
+                    error: 'Error processing payout. Please contact support.',
                     players: room.players.map(p => ({ 
                         username: p.username, 
                         score: p.score, 
@@ -585,7 +590,7 @@ function completeQuestion(roomId) {
                     betAmount: room.betAmount,
                     singlePlayerMode: isSinglePlayer
                 });
-            });
+            }
         } else {
             io.to(roomId).emit('gameOver', {
                 players: room.players.map(p => ({ 
@@ -602,7 +607,7 @@ function completeQuestion(roomId) {
         gameRooms.delete(roomId);
     }
 }
-
+/*
 // Remove or simplify the determineWinner function since the logic is now in completeQuestion
 function determineWinner(players) {
     const sortedPlayers = [...players].sort((a, b) => {
@@ -614,6 +619,7 @@ function determineWinner(players) {
 
     return sortedPlayers[0].username;
 }
+*/
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
@@ -734,3 +740,87 @@ function addPlayerToRoom(roomId, socketId, walletAddress) {
     }
 }
 
+async function sendWinnings(winnerAddress, betAmount) {
+    try {
+        const winnerPublicKey = new PublicKey(winnerAddress);
+        
+        // Calculate winnings (80% profit)
+        const winningAmount = betAmount * 1.8;
+        
+        // Get token accounts
+        const treasuryTokenAccount = await findAssociatedTokenAddress(
+            config.TREASURY_WALLET,
+            config.USDC_MINT
+        );
+
+        const winnerTokenAccount = await findAssociatedTokenAddress(
+            winnerPublicKey,
+            config.USDC_MINT
+        );
+
+        // Create transfer instruction
+        const transferIx = createTransferCheckedInstruction(
+            treasuryTokenAccount,
+            config.USDC_MINT,
+            winnerTokenAccount,
+            config.TREASURY_WALLET,
+            Math.floor(winningAmount * Math.pow(10, 6)), // Convert to USDC decimals
+            6
+        );
+
+        // Create and send transaction
+        const transaction = new Transaction().add(transferIx);
+        transaction.feePayer = config.TREASURY_WALLET;
+        transaction.recentBlockhash = (await config.connection.getRecentBlockhash()).blockhash;
+
+        // Sign and send transaction
+        const signature = await sendAndConfirmTransaction(
+            config.connection,
+            transaction,
+            [config.TREASURY_KEYPAIR] // Use the treasury keypair for signing
+        );
+
+        console.log('Payout successful:', signature);
+        return signature;
+    } catch (error) {
+        console.error('Error sending winnings:', error);
+        throw error;
+    }
+}
+
+async function verifyPayout(signature, expectedAmount, recipientAddress) {
+    try {
+        const transaction = await connection.getTransaction(signature, {
+            commitment: 'confirmed'
+        });
+
+        if (!transaction || transaction.meta.err) {
+            return false;
+        }
+
+        const postBalances = transaction.meta.postTokenBalances;
+        const recipientBalance = postBalances.find(b => 
+            b.owner === recipientAddress
+        );
+
+        if (!recipientBalance) {
+            return false;
+        }
+
+        const receivedAmount = recipientBalance.uiTokenAmount.uiAmount;
+        return Math.abs(receivedAmount - expectedAmount) < 0.001;
+    } catch (error) {
+        console.error('Error verifying payout:', error);
+        return false;
+    }
+}
+
+async function findAssociatedTokenAddress(walletAddress, tokenMintAddress) {
+    return await getAssociatedTokenAddress(
+        tokenMintAddress,
+        walletAddress,
+        false,
+        TOKEN_PROGRAM_ID,
+        ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+}
