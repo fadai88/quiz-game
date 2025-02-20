@@ -165,19 +165,40 @@
             updateBalance();
         }
 
-        function updateBalance() {
-            fetch(`/api/balance/${connectedWallet}`)
-                .then(response => response.json())
-                .then(data => {
-                    virtualBalance = data.balance;
-                    document.getElementById('balanceDisplay').textContent = `Balance: ${virtualBalance} USDC`;
-                })
-                .catch(error => console.error('Error fetching balance:', error));
+        async function updateBalance() {
+            try {
+                if (!connectedWallet) {
+                    document.getElementById('balanceDisplay').textContent = 'Balance: Not connected';
+                    return;
+                }
+
+                // Get balance using usdcManager instead of API call
+                const balanceResult = await usdcManager.getUSDCBalance(connectedWallet);
+                
+                if (balanceResult.needsTokenAccount) {
+                    // If user needs a token account, show 0 balance and create account
+                    document.getElementById('balanceDisplay').textContent = 'Balance: 0 USDC';
+                    try {
+                        const transaction = balanceResult.createAccountTransaction;
+                        const signed = await window.solana.signTransaction(transaction);
+                        await connection.sendRawTransaction(signed.serialize());
+                        console.log('Created USDC token account');
+                    } catch (error) {
+                        console.error('Error creating token account:', error);
+                    }
+                } else {
+                    // Display the actual USDC balance
+                    const formattedBalance = balanceResult.balance.toFixed(2);
+                    document.getElementById('balanceDisplay').textContent = `Balance: ${formattedBalance} USDC`;
+                }
+            } catch (error) {
+                console.error('Error updating balance:', error);
+                document.getElementById('balanceDisplay').textContent = 'Error fetching balance';
+            }
         }
 
         async function connectWallet() {
             try {
-                // Check if Phantom is installed
                 if (window.solana && window.solana.isPhantom) {
                     phantomProvider = window.solana;
                 } else {
@@ -186,17 +207,15 @@
                     return;
                 }
 
-                // Connect to wallet
                 const response = await phantomProvider.connect();
                 connectedWallet = response.publicKey.toString();
                 console.log('Connected to wallet:', connectedWallet);
 
-                // Save wallet connection
                 localStorage.setItem('walletAddress', connectedWallet);
-
-                // Update UI to show connected state
                 updateWalletStatus();
-                updateBalance();
+                
+                // Update balance immediately after connecting
+                await updateBalance();
                 
                 return connectedWallet;
             } catch (err) {
@@ -213,7 +232,8 @@
             }
         }
 
-        // Check wallet connection on page load
+        let balanceUpdateInterval;
+
         window.addEventListener('load', async () => {
             try {
                 if (!window.solana || !window.solana.isPhantom) {
@@ -249,8 +269,9 @@
                 document.getElementById('walletStatus').textContent = 
                     `Connected: ${connectedWallet.slice(0,4)}...${connectedWallet.slice(-4)}`;
                 
-                socket.emit('walletReconnect', connectedWallet);
-                updateBalance();
+                // Update balance immediately and start interval
+                await updateBalance();
+                balanceUpdateInterval = setInterval(updateBalance, 10000); // Update every 10 seconds
 
             } catch (error) {
                 console.error('Session validation failed:', error);
@@ -259,8 +280,12 @@
             }
         });
 
+        // Clear interval on disconnect
         window.solana?.on('disconnect', () => {
             console.log('Wallet disconnected');
+            if (balanceUpdateInterval) {
+                clearInterval(balanceUpdateInterval);
+            }
             localStorage.removeItem('sessionData');
             window.location.href = 'login.html';
         });
@@ -627,7 +652,7 @@
 
         socket.on('gameOver', (data) => {
             console.log('Received game over data:', data);
-            const { players, winner, betAmount, winnerBalance, singlePlayerMode } = data;
+            const { players, winner, betAmount, winnerBalance, singlePlayerMode, payoutSignature } = data;
             
             questionDiv.textContent = 'Game Over!';
             submitAnswerBtn.style.display = 'none';
@@ -635,8 +660,11 @@
             if (singlePlayerMode) {
                 const player = players[0];
                 if (winner) {
-                    waitingMessage.textContent = `Congratulations! You won with ${player.score} correct answers! You won $${(betAmount * 1.8).toFixed(2)}!`;
-                    virtualBalance = winnerBalance;
+                    waitingMessage.textContent = `Congratulations! You won with ${player.score} correct answers! You won ${(betAmount * 1.8).toFixed(2)} USDC!`;
+                    if (payoutSignature) {
+                        const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
+                        waitingMessage.innerHTML += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
+                    }
                 } else {
                     waitingMessage.textContent = `Game Over! You got ${player.score} correct answers. You need at least 5 correct answers to win.`;
                 }
@@ -669,8 +697,11 @@
                         const tiebreakWinner = players[0].totalResponseTime <= players[1].totalResponseTime ? players[0].username : players[1].username;
                         if (tiebreakWinner === connectedWallet) {
                             const winnings = betAmount ? parseFloat(betAmount) * 1.8 : 0;
-                            waitingMessage.textContent += ` You won $${winnings.toFixed(2)}!`;
-                            virtualBalance = winnerBalance;
+                            waitingMessage.textContent += ` You won ${winnings.toFixed(2)} USDC!`;
+                            if (payoutSignature) {
+                                const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
+                                waitingMessage.innerHTML += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
+                            }
                         } else {
                             waitingMessage.textContent += ` Better luck next time!`;
                         }
@@ -678,9 +709,8 @@
                 }
             }
 
+            // Update UI after game over
             setTimeout(() => {
-                document.getElementById('balanceDisplay').textContent = `Balance: $${virtualBalance.toFixed(2)}`;
-                
                 const scoresHtml = singlePlayerMode ?
                     `<p>${players[0].username}: ${players[0].score} (Total response time: ${players[0].totalResponseTime}ms)</p>` :
                     players.map(p => 
@@ -689,8 +719,10 @@
                 
                 playersDiv.innerHTML = '<h2>Final Scores:</h2>' + scoresHtml;
                 joinGameBtn.style.display = 'inline-block';
-                
                 optionsDiv.innerHTML = '';
+
+                // Update balance after game over
+                updateBalance();
             }, 3000);
         });
 

@@ -9,7 +9,7 @@ const moment = require('moment');
 const nodemailer = require('nodemailer'); // Import Nodemailer
 const crypto = require('crypto'); // For generating verification tokens
 const User = require('./models/User');
-const axios = require('axios'); // Add this line at the top with other imports
+const axios = require('axios');
 // const { Connection, PublicKey, SystemProgram, Token, TOKEN_PROGRAM_ID } = require('@solana/web3.js');
 const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, Keypair } = require('@solana/web3.js');
 
@@ -429,7 +429,7 @@ app.get('/api/balance/:wallet', async (req, res) => {
         res.status(500).json({ error: 'Server error' });
     }
 });
-
+/*
 app.post('/api/topup/:wallet', async (req, res) => {
     try {
         const user = await User.findOneAndUpdate(
@@ -446,6 +446,7 @@ app.post('/api/topup/:wallet', async (req, res) => {
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
+*/
 
 async function startGame(roomId) {
     console.log(`Attempting to start game in room ${roomId}`);

@@ -28,9 +28,7 @@
         <div id="userInfo" style="display:none;">
             <h2>Welcome!</h2>
             <p>Wallet: <span id="walletDisplay"></span></p>
-            <p>Balance: $<span id="balanceDisplay"></span></p>
             <button id="playGameBtn">Play Game</button>
-            <button id="topUpButton">Top Up $10</button>
             <button id="disconnectBtn">Disconnect</button>
         </div>
     </div>
@@ -82,7 +80,7 @@
             // Store complete session data
             const sessionData = {
                 walletAddress: data.walletAddress,
-                virtualBalance: data.virtualBalance,
+                // virtualBalance: data.virtualBalance,
                 timestamp: Date.now(),
                 isConnected: true
             };
@@ -95,7 +93,7 @@
             document.getElementById('userInfo').style.display = 'block';
             document.getElementById('walletDisplay').textContent = 
                 `${connectedWallet.slice(0,4)}...${connectedWallet.slice(-4)}`;
-            document.getElementById('balanceDisplay').textContent = data.virtualBalance;
+            // document.getElementById('balanceDisplay').textContent = data.virtualBalance;
         });
 
         // Update the playGameBtn click handler
@@ -117,7 +115,7 @@
             localStorage.removeItem('walletAddress');
             window.location.reload();
         });
-
+        /*
         document.getElementById('topUpButton').addEventListener('click', async () => {
             const response = await fetch(`/api/topup/${connectedWallet}`, { method: 'POST' });
             const data = await response.json();
@@ -128,6 +126,7 @@
                 alert('Failed to top up. Please try again.');
             }
         });
+        */
 
         function toggleTheme() {
             document.body.classList.toggle('dark-theme');
