@@ -470,9 +470,43 @@
                     return;
                 }
 
+                // Get reCAPTCHA token if enabled
+                let recaptchaToken = null;
+                if (window.recaptchaEnabled && window.grecaptcha) {
+                    try {
+                        await grecaptcha.ready();
+                        recaptchaToken = await grecaptcha.execute(window.recaptchaSiteKey, {action: 'wallet_connect'});
+                    } catch (error) {
+                        console.error('reCAPTCHA error:', error);
+                        // Continue without reCAPTCHA if there's an error
+                    }
+                }
+
                 const response = await phantomProvider.connect();
                 connectedWallet = response.publicKey.toString();
                 console.log('Connected to wallet:', connectedWallet);
+
+                // Generate message for signing
+                const message = `Login to Game - ${Date.now()}`;
+                const encodedMessage = new TextEncoder().encode(message);
+
+                // Request signature from wallet
+                const signatureBytes = await phantomProvider.signMessage(encodedMessage, 'utf8');
+                const signature = btoa(String.fromCharCode.apply(null, signatureBytes));
+
+                // Emit login event with all necessary data
+                socket.emit('walletLogin', {
+                    walletAddress: connectedWallet,
+                    signature,
+                    message,
+                    recaptchaToken,
+                    clientData: {
+                        userAgent: navigator.userAgent,
+                        language: navigator.language,
+                        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                        screenResolution: `${window.screen.width}x${window.screen.height}`
+                    }
+                });
 
                 localStorage.setItem('walletAddress', connectedWallet);
                 updateWalletStatus();
@@ -484,6 +518,7 @@
             } catch (err) {
                 console.error('Error connecting to wallet:', err);
                 alert('Failed to connect wallet: ' + err.message);
+                return null;
             }
         }
 

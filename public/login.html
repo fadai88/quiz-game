@@ -6,6 +6,76 @@
     <title>Trivia Game - Connect Wallet</title>
     <link rel="stylesheet" href="styles.css">
     <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
+    <!-- Add reCAPTCHA v3 -->
+    <script src="https://www.google.com/recaptcha/api.js?render=YOUR_SITE_KEY"></script>
+    <style>
+        .container {
+            max-width: 600px;
+            margin: auto;
+            background: var(--container-bg);
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            transition: background-color 0.3s;
+        }
+        
+        .login-steps {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: rgba(0,0,0,0.05);
+            border-radius: 5px;
+        }
+        
+        .success-message {
+            color: #4CAF50;
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #e8f5e9;
+            border-radius: 5px;
+        }
+        
+        .error-message {
+            color: #f44336;
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #ffebee;
+            border-radius: 5px;
+        }
+        
+        /* Hidden honeypot field */
+        .hidden-field {
+            display: none;
+        }
+        
+        .recaptcha-terms {
+            font-size: 0.8em;
+            margin-top: 15px;
+            color: #666;
+        }
+        
+        .wallet-button {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            background-color: var(--button-bg);
+            padding: 12px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin: 20px 0;
+        }
+        
+        .wallet-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        
+        .wallet-icon {
+            width: 24px;
+            height: 24px;
+        }
+    </style>
 </head>
 <body>
     <header>
@@ -22,13 +92,42 @@
     <div class="container">
         <div id="walletSection">
             <h2>Connect Your Wallet</h2>
-            <button id="connectWalletBtn">Connect Wallet</button>
+            <p>Connect your Solana wallet to start playing and earning USDC!</p>
+            
+            <!-- Hidden honeypot field to catch bots -->
+            <div class="hidden-field">
+                <input type="text" id="username" name="username" autocomplete="off">
+            </div>
+            
+            <button id="connectWalletBtn" class="wallet-button">
+                <img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">
+                Connect Phantom Wallet
+            </button>
+            
+            <div class="login-steps">
+                <h3>How it works:</h3>
+                <ol>
+                    <li>Click the "Connect Wallet" button above</li>
+                    <li>Approve the connection in your Phantom wallet</li>
+                    <li>Sign the message to verify your wallet ownership</li>
+                    <li>You'll be automatically redirected to the game!</li>
+                </ol>
+            </div>
+            
+            <div class="recaptcha-terms">
+                This site is protected by reCAPTCHA and the Google
+                <a href="https://policies.google.com/privacy">Privacy Policy</a> and
+                <a href="https://policies.google.com/terms">Terms of Service</a> apply.
+            </div>
+            
             <p id="walletStatus"></p>
+            <div id="loginMessage"></div>
         </div>
+        
         <div id="userInfo" style="display:none;">
             <h2>Welcome!</h2>
             <p>Wallet: <span id="walletDisplay"></span></p>
-            <button id="playGameBtn">Play Game</button>
+            <button id="playGameBtn" class="wallet-button">Play Game</button>
             <button id="disconnectBtn">Disconnect</button>
         </div>
     </div>
@@ -37,39 +136,127 @@
     <script>
         const socket = io();
         let connectedWallet = null;
+        
+        // Record page load time for bot detection
+        window.pageLoadTime = Date.now();
+        
+        // Track user behavior metrics
+        const behaviorMetrics = {
+            mouseMovements: 0,
+            keyPresses: 0,
+            clicks: 0,
+            timeOnPage: 0
+        };
+        
+        // Track mouse movements
+        document.addEventListener('mousemove', () => {
+            behaviorMetrics.mouseMovements++;
+        });
+        
+        // Track key presses
+        document.addEventListener('keydown', () => {
+            behaviorMetrics.keyPresses++;
+        });
+        
+        // Track clicks
+        document.addEventListener('click', () => {
+            behaviorMetrics.clicks++;
+        });
+        
+        // Update time on page
+        setInterval(() => {
+            behaviorMetrics.timeOnPage = Math.floor((Date.now() - window.pageLoadTime) / 1000);
+        }, 1000);
 
         async function connectWallet() {
             try {
+                // Check for honeypot field
+                if (document.getElementById('username').value !== '') {
+                    console.log('Bot detected via honeypot field');
+                    showError('Connection failed. Please try again later.');
+                    // Silently fail for bots
+                    return;
+                }
+                
+                // Check for behavioral indicators of bot
+                if (behaviorMetrics.mouseMovements < 5 && 
+                    behaviorMetrics.timeOnPage < 2 && 
+                    behaviorMetrics.clicks < 2) {
+                    console.log('Suspicious behavior detected: possible bot');
+                    showError('Please wait a moment and try again.');
+                    return;
+                }
+                
                 console.log('Connecting wallet...');
                 if (!window.solana || !window.solana.isPhantom) {
                     alert('Please install Phantom wallet!');
+                    window.open('https://phantom.app/', '_blank');
                     return;
                 }
 
-                const resp = await window.solana.connect();
-                const publicKey = resp.publicKey.toString();
-                console.log('Connected to wallet:', publicKey);
+                // Get reCAPTCHA token if enabled
+                let recaptchaToken = null;
+                if (window.recaptchaEnabled && window.grecaptcha) {
+                    try {
+                        await grecaptcha.ready();
+                        recaptchaToken = await grecaptcha.execute(window.recaptchaSiteKey, {action: 'wallet_connect'});
+                    } catch (error) {
+                        console.error('reCAPTCHA error:', error);
+                        showError('Verification service unavailable. Please try again.');
+                        return;
+                    }
+                }
                 
-                // Sign message to verify wallet ownership
-                const message = `Login to Brainy Battle Quiz: ${Date.now()}`;
-                const encodedMessage = new TextEncoder().encode(message);
-                console.log('Requesting signature for message:', message);
-                const signedData = await window.solana.signMessage(encodedMessage, 'utf8');
-                console.log('Got signature:', signedData.signature);
+                const connectButton = document.getElementById('connectWalletBtn');
+                connectButton.disabled = true;
+                connectButton.innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connecting...';
                 
-                // Convert Uint8Array to base64 string for transmission
-                const signature = btoa(String.fromCharCode.apply(null, signedData.signature));
-                
-                // Send to server for verification
-                socket.emit('walletLogin', { 
-                    walletAddress: publicKey, 
-                    signature: signature,
-                    message: message 
-                });
-                console.log('Sent login request to server');
+                try {
+                    // Connect to wallet
+                    const resp = await window.solana.connect();
+                    const publicKey = resp.publicKey.toString();
+                    console.log('Connected to wallet:', publicKey);
+                    
+                    // Sign message to verify wallet ownership
+                    const message = `Login to Brainy Battle Quiz: ${Date.now()}`;
+                    const encodedMessage = new TextEncoder().encode(message);
+                    console.log('Requesting signature for message:', message);
+                    const signedData = await window.solana.signMessage(encodedMessage, 'utf8');
+                    console.log('Got signature:', signedData.signature);
+                    
+                    // Convert Uint8Array to base64 string for transmission
+                    const signature = btoa(String.fromCharCode.apply(null, signedData.signature));
+                    
+                    // Send to server for verification
+                    socket.emit('walletLogin', { 
+                        walletAddress: publicKey, 
+                        signature: signature,
+                        message: message,
+                        recaptchaToken: recaptchaToken,
+                        clientData: {
+                            timestamp: new Date().toISOString(),
+                            timeOnPage: behaviorMetrics.timeOnPage,
+                            mouseMovements: behaviorMetrics.mouseMovements,
+                            clicks: behaviorMetrics.clicks,
+                            userAgent: navigator.userAgent,
+                            language: navigator.language,
+                            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                            screenResolution: `${window.screen.width}x${window.screen.height}`
+                        }
+                    });
+                    console.log('Sent login request to server');
+                } catch (error) {
+                    console.error('Wallet connection error:', error);
+                    connectButton.disabled = false;
+                    connectButton.innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
+                    showError(error.message || 'Failed to connect wallet. Please try again.');
+                }
             } catch (err) {
-                console.error('Error connecting wallet:', err);
-                alert('Failed to connect wallet: ' + err.message);
+                console.error('Error in connectWallet:', err);
+                const connectButton = document.getElementById('connectWalletBtn');
+                connectButton.disabled = false;
+                connectButton.innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
+                showError('Failed to connect wallet: ' + err.message);
             }
         }
 
@@ -80,7 +267,6 @@
             // Store complete session data
             const sessionData = {
                 walletAddress: data.walletAddress,
-                // virtualBalance: data.virtualBalance,
                 timestamp: Date.now(),
                 isConnected: true
             };
@@ -93,50 +279,64 @@
             document.getElementById('userInfo').style.display = 'block';
             document.getElementById('walletDisplay').textContent = 
                 `${connectedWallet.slice(0,4)}...${connectedWallet.slice(-4)}`;
-            // document.getElementById('balanceDisplay').textContent = data.virtualBalance;
-        });
-
-        // Update the playGameBtn click handler
-        document.getElementById('playGameBtn').addEventListener('click', () => {
-            window.location.href = 'game.html';
+                
+            showSuccess('Successfully connected! You can now play the game.');
         });
 
         socket.on('loginFailure', (message) => {
             console.error('Login failed:', message);
-            alert(`Login failed: ${message}`);
+            document.getElementById('connectWalletBtn').disabled = false;
+            document.getElementById('connectWalletBtn').innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
+            showError(`Login failed: ${message}`);
         });
 
         document.getElementById('connectWalletBtn').addEventListener('click', connectWallet);
+        
         document.getElementById('playGameBtn').addEventListener('click', () => {
             window.location.href = `game.html?wallet=${connectedWallet}`;
         });
 
         document.getElementById('disconnectBtn').addEventListener('click', () => {
-            localStorage.removeItem('walletAddress');
+            if (window.solana && window.solana.isConnected) {
+                window.solana.disconnect();
+            }
+            localStorage.removeItem('sessionData');
             window.location.reload();
         });
-        /*
-        document.getElementById('topUpButton').addEventListener('click', async () => {
-            const response = await fetch(`/api/topup/${connectedWallet}`, { method: 'POST' });
-            const data = await response.json();
-            if (data.success) {
-                document.getElementById('balanceDisplay').textContent = data.newBalance;
-                alert('Successfully topped up $10!');
-            } else {
-                alert('Failed to top up. Please try again.');
-            }
-        });
-        */
 
         function toggleTheme() {
             document.body.classList.toggle('dark-theme');
         }
+        
+        function showError(message) {
+            const loginMessage = document.getElementById('loginMessage');
+            loginMessage.textContent = message;
+            loginMessage.className = 'error-message';
+        }
+        
+        function showSuccess(message) {
+            const loginMessage = document.getElementById('loginMessage');
+            loginMessage.textContent = message;
+            loginMessage.className = 'success-message';
+        }
 
         // Check if wallet is already connected
         window.addEventListener('load', () => {
-            const savedWallet = localStorage.getItem('walletAddress');
-            if (savedWallet) {
-                socket.emit('walletReconnect', savedWallet);
+            const sessionData = localStorage.getItem('sessionData');
+            if (sessionData) {
+                try {
+                    const parsed = JSON.parse(sessionData);
+                    // Check if session is still valid (24 hours)
+                    if (parsed.timestamp && (Date.now() - parsed.timestamp < 24 * 60 * 60 * 1000)) {
+                        socket.emit('walletReconnect', parsed.walletAddress);
+                    } else {
+                        console.log('Session expired');
+                        localStorage.removeItem('sessionData');
+                    }
+                } catch (e) {
+                    console.error('Error parsing session data', e);
+                    localStorage.removeItem('sessionData');
+                }
             }
         });
     </script>

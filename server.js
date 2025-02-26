@@ -3,14 +3,14 @@ const http = require('http');
 const socketIo = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const path = require('path');
 require('dotenv').config();
 const moment = require('moment');
 const nodemailer = require('nodemailer'); // Import Nodemailer
 const crypto = require('crypto'); // For generating verification tokens
 const User = require('./models/User');
 const axios = require('axios');
-// const { Connection, PublicKey, SystemProgram, Token, TOKEN_PROGRAM_ID } = require('@solana/web3.js');
+const fs = require('fs');
+const path = require('path');
 const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, Keypair } = require('@solana/web3.js');
 
 const { 
@@ -37,6 +37,7 @@ const io = socketIo(server, {
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
 
 mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
     .then(() => console.log('Connected to MongoDB'))
@@ -84,6 +85,32 @@ if (process.env.PROGRAM_ID) {
     console.warn('Warning: PROGRAM_ID not set in environment variables');
     // Use SystemProgram.programId instead of string
     programId = SystemProgram.programId;
+}
+
+const Redis = require('ioredis');
+let redisClient;
+
+try {
+    redisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+    console.log('Redis connected for rate limiting');
+} catch (error) {
+    console.warn('Redis not available, using in-memory rate limiting');
+    // Simple in-memory storage for rate limiting if Redis isn't available
+    redisClient = {
+        rateLimits: {},
+        async get(key) {
+            return this.rateLimits[key] || 0;
+        },
+        async set(key, value, expType, expValue) {
+            this.rateLimits[key] = value;
+            // Simple expiration
+            if (expType === 'EX') {
+                setTimeout(() => {
+                    delete this.rateLimits[key];
+                }, expValue * 1000);
+            }
+        }
+    };
 }
 
 // Add the verification function
@@ -136,45 +163,123 @@ const verifyUSDCTransaction = async (transactionSignature, expectedAmount, sende
 
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
+    
+    // Track connection data
+    const connectionData = {
+        ip: socket.handshake.headers['x-forwarded-for'] || socket.handshake.address,
+        userAgent: socket.handshake.headers['user-agent'],
+        timestamp: new Date(),
+        sessionId: socket.id
+    };
+    
+    // Check if IP is in blocklist
+    if (redisClient) {  // Add check for redisClient existence
+        (async () => {
+            try {
+                const isBlocked = await redisClient.get(`blocklist:${connectionData.ip}`);
+                if (isBlocked) {
+                    console.warn(`Blocked IP attempting to connect: ${connectionData.ip}`);
+                    socket.disconnect();
+                }
+            } catch (error) {
+                console.error('Error checking IP blocklist:', error);
+            }
+        })();
+    }
 
-    socket.on('walletLogin', async ({ walletAddress, signature, message }) => {
+    socket.on('walletLogin', async ({ walletAddress, signature, message, recaptchaToken, clientData }) => {
         try {
             console.log('Wallet login attempt:', { walletAddress, message });
             
-            // Create public key from wallet address
-            const publicKey = new PublicKey(walletAddress);
+            // 1. Rate limiting check
+            if (redisClient) {
+                const clientIP = connectionData.ip;
+                const loginLimitKey = `login:${clientIP}`;
+                try {
+                    const loginAttempts = await redisClient.get(loginLimitKey) || 0;
+                    
+                    if (loginAttempts > 10) {
+                        console.warn(`Rate limit exceeded for IP ${clientIP}`);
+                        return socket.emit('loginFailure', 'Too many login attempts. Please try again later.');
+                    }
+                    
+                    await redisClient.set(loginLimitKey, parseInt(loginAttempts) + 1, 'EX', 3600);
+                } catch (error) {
+                    console.error('Redis rate limiting error:', error);
+                }
+            }
             
-            // Convert base64 signature back to Uint8Array
-            const signatureBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
-            const messageBytes = new TextEncoder().encode(message);
+            // 2. reCAPTCHA verification (if enabled)
+            if (process.env.ENABLE_RECAPTCHA && recaptchaToken) {
+                try {
+                    const recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                    if (!recaptchaResult.success) {
+                        console.warn(`reCAPTCHA verification failed for wallet ${walletAddress}`);
+                        return socket.emit('loginFailure', 'Verification failed. Please try again.');
+                    }
+                } catch (error) {
+                    console.error('reCAPTCHA verification error:', error);
+                    return socket.emit('loginFailure', 'Verification service unavailable. Please try again later.');
+                }
+            }
             
-            // Verify using nacl
-            const verified = nacl.sign.detached.verify(
-                messageBytes,
-                signatureBytes,
-                publicKey.toBytes()
-            );
+            // 3. Signature verification
+            try {
+                const publicKey = new PublicKey(walletAddress);
+                const signatureBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
+                const messageBytes = new TextEncoder().encode(message);
+                
+                const verified = nacl.sign.detached.verify(
+                    messageBytes,
+                    signatureBytes,
+                    publicKey.toBytes()
+                );
 
-            if (!verified) {
-                console.log('Signature verification failed');
-                return socket.emit('loginFailure', 'Invalid signature');
+                if (!verified) {
+                    console.warn(`Invalid signature for wallet ${walletAddress}`);
+                    return socket.emit('loginFailure', 'Invalid signature');
+                }
+            } catch (error) {
+                console.error('Signature verification error:', error);
+                return socket.emit('loginFailure', 'Invalid wallet credentials');
             }
 
-            // Find or create user with only walletAddress
-            let user = await User.findOne({ walletAddress });
-            if (!user) {
-                console.log('Creating new user for wallet:', walletAddress);
-                user = await User.create({ walletAddress });
-            }
+            // 4. Find or create user
+            try {
+                let user = await User.findOne({ walletAddress });
+                if (!user) {
+                    console.log('Creating new user for wallet:', walletAddress);
+                    user = await User.create({ 
+                        walletAddress,
+                        registrationIP: connectionData.ip,
+                        registrationDate: new Date(),
+                        lastLoginIP: connectionData.ip,
+                        lastLoginDate: new Date(),
+                        userAgent: connectionData.userAgent
+                    });
+                } else {
+                    // Update login information
+                    user.lastLoginIP = connectionData.ip;
+                    user.lastLoginDate = new Date();
+                    user.userAgent = connectionData.userAgent;
+                    await user.save();
+                }
 
-            console.log('Login successful for wallet:', walletAddress);
-            socket.emit('loginSuccess', {
-                walletAddress: user.walletAddress,
-                virtualBalance: user.virtualBalance
-            });
+                // Log successful login
+                console.log('Login successful for wallet:', walletAddress);
+                
+                // Emit success response with minimal user data
+                socket.emit('loginSuccess', {
+                    walletAddress: user.walletAddress,
+                    virtualBalance: user.virtualBalance
+                });
+            } catch (error) {
+                console.error('Database error during login:', error);
+                socket.emit('loginFailure', 'Server error during login. Please try again.');
+            }
         } catch (error) {
-            console.error('Login error:', error);
-            socket.emit('loginFailure', error.message);
+            console.error('Unexpected login error:', error);
+            socket.emit('loginFailure', 'An unexpected error occurred. Please try again.');
         }
     });
 
@@ -398,6 +503,7 @@ io.on('connection', (socket) => {
     });
 });
 
+
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
     try {
@@ -417,6 +523,27 @@ app.post('/login', async (req, res) => {
     }
 });
 
+app.get('/login.html', (req, res) => {
+    // Read the file
+    let loginHtml = fs.readFileSync(path.join(__dirname, 'public', 'login.html'), 'utf8');
+    
+    // Inject the reCAPTCHA setting
+    const recaptchaEnabled = process.env.ENABLE_RECAPTCHA === 'true';
+    const recaptchaSiteKey = process.env.RECAPTCHA_SITE_KEY || '';
+    
+    // Replace both the site key and add the enabled flag
+    loginHtml = loginHtml.replace('YOUR_SITE_KEY', recaptchaSiteKey);
+    loginHtml = loginHtml.replace(
+        '<script>',
+        `<script>
+        window.recaptchaEnabled = ${recaptchaEnabled};
+        window.recaptchaSiteKey = "${recaptchaSiteKey}";`
+    );
+    
+    // Send the modified HTML
+    res.send(loginHtml);
+});
+
 app.get('/api/balance/:wallet', async (req, res) => {
     try {
         const user = await User.findOne({ walletAddress: req.params.wallet });
@@ -429,24 +556,7 @@ app.get('/api/balance/:wallet', async (req, res) => {
         res.status(500).json({ error: 'Server error' });
     }
 });
-/*
-app.post('/api/topup/:wallet', async (req, res) => {
-    try {
-        const user = await User.findOneAndUpdate(
-            { walletAddress: req.params.wallet },
-            { $inc: { virtualBalance: 10 } },
-            { new: true }
-        );
-        if (user) {
-            res.json({ success: true, newBalance: user.virtualBalance });
-        } else {
-            res.status(404).json({ success: false, message: 'User not found' });
-        }
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
-});
-*/
+
 
 async function startGame(roomId) {
     console.log(`Attempting to start game in room ${roomId}`);
@@ -608,19 +718,7 @@ async function completeQuestion(roomId) {
         gameRooms.delete(roomId);
     }
 }
-/*
-// Remove or simplify the determineWinner function since the logic is now in completeQuestion
-function determineWinner(players) {
-    const sortedPlayers = [...players].sort((a, b) => {
-        if (b.score !== a.score) {
-            return b.score - a.score;
-        }
-        return (a.totalResponseTime || 0) - (b.totalResponseTime || 0);
-    });
 
-    return sortedPlayers[0].username;
-}
-*/
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
@@ -677,16 +775,49 @@ app.post('/register', async (req, res) => {
 
 // Function to verify reCAPTCHA token
 async function verifyRecaptcha(token) {
-    const secretKey = process.env.RECAPTCHA_SECRET_KEY; // Ensure this is set correctly
-    const response = await axios.post(`https://www.google.com/recaptcha/api/siteverify`, null, {
-        params: {
-            secret: secretKey,
-            response: token
+    if (process.env.ENABLE_RECAPTCHA !== 'true') {
+        console.log('reCAPTCHA verification skipped (disabled in config)');
+        return { success: true, score: 1.0 };
+    }
+    try {
+        const secretKey = process.env.RECAPTCHA_SECRET_KEY;
+        if (!secretKey) {
+            console.warn('reCAPTCHA secret key not configured, skipping verification');
+            return { success: true, score: 1.0 }; // Default to success in development
         }
-    });
-    console.log('reCAPTCHA verification response:', response.data); // Log the verification response
-    return response.data;
+        
+        const response = await axios.post('https://www.google.com/recaptcha/api/siteverify', null, {
+            params: {
+                secret: secretKey,
+                response: token
+            }
+        });
+        
+        console.log('reCAPTCHA verification response:', response.data);
+        
+        // Add proper validation
+        if (!response.data.success) {
+            console.warn('reCAPTCHA verification failed:', response.data['error-codes']);
+            return { success: false, error: response.data['error-codes'] };
+        }
+        
+        // Validate score for v3 (threshold 0.5 is recommended by Google)
+        if (response.data.score !== undefined && response.data.score < 0.5) {
+            console.warn(`reCAPTCHA score too low: ${response.data.score}`);
+            return { success: false, score: response.data.score, error: 'Bot activity suspected' };
+        }
+        
+        return { success: true, score: response.data.score };
+    } catch (error) {
+        console.error('reCAPTCHA verification error:', error);
+        return { success: false, error: 'Verification service error' };
+    }
 }
+
+const suspiciousActivity = {
+    ips: {},
+    wallets: {}
+};
 
 // Add new function for single player mode
 async function startSinglePlayerGame(roomId) {
@@ -824,4 +955,45 @@ async function findAssociatedTokenAddress(walletAddress, tokenMintAddress) {
         TOKEN_PROGRAM_ID,
         ASSOCIATED_TOKEN_PROGRAM_ID
     );
+}
+
+app.get('/api/tokens.json', (req, res) => {
+    const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    console.warn(`Potential bot detected accessing honeypot: ${clientIP}`);
+    redisClient.set(`blocklist:${clientIP}`, 1, 'EX', 86400); // Block for 24 hours
+    
+    // Return fake data
+    res.json({ status: "success", data: { tokens: [] } });
+});
+
+app.get('/admin', (req, res) => {
+    const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    console.warn(`Potential bot detected accessing admin honeypot: ${clientIP}`);
+    redisClient.set(`blocklist:${clientIP}`, 1, 'EX', 86400);
+    
+    // Redirect to home
+    res.redirect('/');
+});
+
+// Add suspicious wallet detection during game play
+async function detectSuspiciousWalletActivity(walletAddress) {
+    // Check for too many games in short period
+    const recentGames = await Game.countDocuments({
+        'players.walletAddress': walletAddress,
+        createdAt: { $gte: new Date(Date.now() - 1000 * 60 * 60) } // Last hour
+    });
+    
+    if (recentGames > 20) {
+        console.warn(`Suspicious activity: Wallet ${walletAddress} played ${recentGames} games in the last hour`);
+        return true;
+    }
+    
+    // Check win rate (if abnormally high)
+    const stats = await User.findOne({ walletAddress });
+    if (stats && stats.gamesPlayed > 10 && (stats.wins / stats.gamesPlayed > 0.8)) {
+        console.warn(`Suspicious activity: Wallet ${walletAddress} has ${stats.wins}/${stats.gamesPlayed} wins`);
+        return true;
+    }
+    
+    return false;
 }
