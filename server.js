@@ -38,9 +38,35 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-
+// LOOKT AT THIS FUNCTION AGAIN WHEN THE GAME IS LIVE!!!
 mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-    .then(() => console.log('Connected to MongoDB'))
+    .then(async () => {
+        console.log('Connected to MongoDB');
+        
+        // Drop both problematic indexes
+        try {
+            const collections = await mongoose.connection.db.collections();
+            const usersCollection = collections.find(c => c.collectionName === 'users');
+            
+            if (usersCollection) {
+                // Drop both username and email indexes
+                const indexes = await usersCollection.indexes();
+                
+                for (const index of indexes) {
+                    // Only drop the single-field unique indexes for username and email
+                    if (index.name === 'username_1' || index.name === 'email_1') {
+                        console.log(`Dropping index: ${index.name}`);
+                        await usersCollection.dropIndex(index.name);
+                    }
+                }
+                
+                console.log('Successfully dropped problematic indexes');
+            }
+        } catch (error) {
+            console.error('Error dropping indexes:', error);
+            // Continue anyway - the indexes might not exist
+        }
+    })
     .catch(err => console.error('Could not connect to MongoDB', err));
 
 const Quiz = mongoose.model('Quiz', new mongoose.Schema({
@@ -197,8 +223,8 @@ io.on('connection', (socket) => {
                 const loginLimitKey = `login:${clientIP}`;
                 try {
                     const loginAttempts = await redisClient.get(loginLimitKey) || 0;
-                    
-                    if (loginAttempts > 10) {
+                            // DECREASE THE THRESHOLD WHEN THE GAME IS LIVE!!!
+                    if (loginAttempts > 100) {
                         console.warn(`Rate limit exceeded for IP ${clientIP}`);
                         return socket.emit('loginFailure', 'Too many login attempts. Please try again later.');
                     }
