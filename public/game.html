@@ -647,23 +647,43 @@
 
         submitAnswerBtn.addEventListener('click', () => {
             const selectedOption = document.querySelector('input[name="answer"]:checked');
-            if (selectedOption) {
-                const responseTime = moment().diff(moment(questionStartTime), 'milliseconds');
-                const selectedAnswer = parseInt(selectedOption.value);
-                socket.emit('submitAnswer', { roomId: currentRoomId, answer: selectedAnswer, responseTime, username: connectedWallet });
-                submitAnswerBtn.disabled = true;
-                waitingMessage.textContent = 'Waiting for other player to answer...';
-                
-                if (selectedAnswer === correctAnswer) {
-                    selectedOption.parentElement.classList.add('correct');
-                } else {
-                    selectedOption.parentElement.classList.add('incorrect');
-                    document.querySelector(`input[value="${correctAnswer}"]`).parentElement.classList.add('correct');
-                }
-            } else {
+            if (!selectedOption) {
                 alert('Please select an answer!');
+                return;
+            }
+            
+            const responseTime = moment().diff(moment(questionStartTime), 'milliseconds');
+            const selectedAnswer = parseInt(selectedOption.value);
+            
+            socket.emit('submitAnswer', { 
+                roomId: currentRoomId, 
+                answer: selectedAnswer, 
+                responseTime, 
+                username: connectedWallet 
+            });
+            
+            submitAnswerBtn.disabled = true;
+            waitingMessage.textContent = 'Waiting for other player to answer...';
+            
+            try {
+                // Make sure correctAnswer is defined before using it
+                if (typeof correctAnswer !== 'undefined') {
+                    if (selectedAnswer === correctAnswer) {
+                        selectedOption.parentElement.classList.add('correct');
+                    } else {
+                        selectedOption.parentElement.classList.add('incorrect');
+                        const correctOptionElement = document.querySelector(`input[value="${correctAnswer}"]`);
+                        if (correctOptionElement && correctOptionElement.parentElement) {
+                            correctOptionElement.parentElement.classList.add('correct');
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('Error highlighting answer:', error);
+                // Even if highlighting fails, the answer was still submitted
             }
         });
+
 
         socket.on('gameJoined', (roomId) => {
             currentRoomId = roomId;
@@ -675,11 +695,18 @@
             waitingMessage.textContent = `${username} joined. Game is starting...`;
         });
 
-        socket.on('gameStart', ({ players, questionCount, singlePlayerMode }) => {
-            waitingMessage.textContent = singlePlayerMode ? 
-                'No other players found. Starting single player mode...' : 
-                'Game started!';
-            updatePlayers(players);
+        socket.on('gameStart', ({ players, questionCount, singlePlayerMode, botOpponent }) => {
+            if (botOpponent) {
+                waitingMessage.textContent = `Playing against ${botOpponent} 🤖`;
+                document.body.classList.add('playing-bot');
+                playBotSound('start');
+            } else {
+                waitingMessage.textContent = singlePlayerMode ? 
+                    'No other players found. Starting single player mode...' : 
+                    'Game started!';
+                document.body.classList.remove('playing-bot');
+            }
+            updatePlayerUI(players);
         });
 
         socket.on('nextQuestion', ({ question, options, questionNumber, totalQuestions, questionStartTime: qStartTime, correctAnswerIndex }) => {
@@ -823,10 +850,22 @@
             countdownTimer.style.display = 'block';
         }
 
+        function updatePlayerUI(players) {
+            playersDiv.innerHTML = '<h2>Players:</h2>' + players.map(p => {
+                const botClass = p.isBot ? ' class="bot-player"' : '';
+                const botIcon = p.isBot ? ' 🤖' : '';
+                const difficultyBadge = p.isBot && p.difficulty ? 
+                    `<span class="difficulty-badge ${p.difficulty.toLowerCase()}">${p.difficulty}</span>` : '';
+                return `
+                    <p${botClass}>
+                        ${p.username}${botIcon}${difficultyBadge}: ${p.score} 
+                        <span class="response-time">(Response time: ${p.totalResponseTime || 0}ms)</span>
+                    </p>`;
+            }).join('');
+        }
+
         function updatePlayers(players) {
-            playersDiv.innerHTML = '<h2>Players:</h2>' + players.map(p => 
-                `<p>${p.username}: ${p.score} (Total response time: ${p.totalResponseTime || 0}ms)</p>`
-            ).join('');
+            updatePlayerUI(players);
         }
 
         function resetGame() {
@@ -891,33 +930,143 @@
             event.preventDefault();
         });
 
+        // Also update the answerResult handler with similar error checking:
         socket.on('answerResult', (data) => {
             const { username, isCorrect, correctAnswer } = data;
-            if (username === connectedWallet) {
-                const selectedOption = document.querySelector('input[name="answer"]:checked');
-                if (selectedOption) {
-                    selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
+            
+            try {
+                if (username === connectedWallet) {
+                    const selectedOption = document.querySelector('input[name="answer"]:checked');
+                    if (selectedOption && selectedOption.parentElement) {
+                        selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
+                    }
                 }
+            } catch (error) {
+                console.error('Error highlighting answers in answerResult:', error);
             }
         });
 
-        socket.on('playerAnswered', (username) => {
-            waitingMessage.textContent = `${username} has submitted their answer`;
+        socket.on('playerAnswered', (data) => {
+            if (typeof data === 'string') {
+                // Handle legacy format
+                waitingMessage.textContent = `${data} has submitted their answer`;
+                return;
+            }
+            
+            const { username, isBot, responseTime, timedOut } = data;
+            if (username !== connectedWallet) {
+                if (isBot) {
+                    waitingMessage.innerHTML = `
+                        <div class="bot-answer">
+                            ${username} 🤖 has answered in ${responseTime}ms
+                            <span class="bot-thinking"></span>
+                        </div>`;
+                    playBotSound('answer');
+                } else {
+                    waitingMessage.textContent = timedOut ? 
+                        `${username} ran out of time!` : 
+                        `${username} has submitted their answer`;
+                }
+            }
         });
 
         socket.on('roundComplete', (data) => {
             const { correctAnswer, playerResults } = data;
             const options = document.querySelectorAll('#options input');
             
-            // Show correct answer
-            options[correctAnswer].parentElement.classList.add('correct');
-            
-            // Only show the current player's incorrect answer if they were wrong
-            const playerResult = playerResults.find(result => result.username === connectedWallet);
-            if (playerResult && !playerResult.isCorrect) {
-                options[playerResult.answer].parentElement.classList.add('incorrect');
+            try {
+                // Show correct answer if options exist
+                if (options && options.length > correctAnswer && options[correctAnswer].parentElement) {
+                    options[correctAnswer].parentElement.classList.add('correct');
+                    
+                    // Only show the current player's incorrect answer if they were wrong
+                    const playerResult = playerResults.find(result => result.username === connectedWallet);
+                    if (playerResult && !playerResult.isCorrect && 
+                        playerResult.answer >= 0 && 
+                        playerResult.answer < options.length && 
+                        options[playerResult.answer].parentElement) {
+                        options[playerResult.answer].parentElement.classList.add('incorrect');
+                    }
+                }
+            } catch (error) {
+                console.error('Error highlighting answers in roundComplete:', error);
             }
         });
+
+        // Add bot-related CSS
+        const botStyles = document.createElement('style');
+        botStyles.textContent = `
+            .bot-player {
+                color: #0078ff;
+                font-weight: bold;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            
+            .playing-bot .container {
+                border: 2px solid #0078ff;
+                animation: bot-glow 2s infinite alternate;
+            }
+            
+            .difficulty-badge {
+                font-size: 0.8em;
+                padding: 2px 6px;
+                border-radius: 12px;
+                margin-left: 4px;
+            }
+            
+            .difficulty-badge.easy { background: #4CAF50; color: white; }
+            .difficulty-badge.medium { background: #FFC107; color: black; }
+            .difficulty-badge.hard { background: #F44336; color: white; }
+            
+            .response-time {
+                font-size: 0.9em;
+                opacity: 0.8;
+            }
+            
+            @keyframes bot-glow {
+                from { box-shadow: 0 0 5px rgba(0, 120, 255, 0.5); }
+                to { box-shadow: 0 0 15px rgba(0, 120, 255, 0.8); }
+            }
+            
+            .bot-thinking {
+                display: inline-block;
+                margin-left: 5px;
+                font-size: 12px;
+                color: #0078ff;
+                animation: thinking 1.5s infinite;
+            }
+            
+            @keyframes thinking {
+                0% { content: '.'; }
+                33% { content: '..'; }
+                66% { content: '...'; }
+                100% { content: ''; }
+            }
+            
+            .bot-answer {
+                border-left: 3px solid #0078ff;
+                padding-left: 8px;
+                margin: 4px 0;
+            }
+        `;
+        document.head.appendChild(botStyles);
+
+        // Add bot sound effects (optional)
+        function playBotSound(type) {
+            const sounds = {
+                start: 'bot-start.mp3',
+                answer: 'bot-answer.mp3',
+                win: 'bot-win.mp3',
+                lose: 'bot-lose.mp3'
+            };
+            
+            const sound = sounds[type];
+            if (sound && window.playSound) {
+                window.playSound(sound);
+            }
+        }
     </script>
 </body>
 </html>

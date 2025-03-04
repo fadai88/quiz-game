@@ -187,6 +187,78 @@ const verifyUSDCTransaction = async (transactionSignature, expectedAmount, sende
     }
 };
 
+const BOT_LEVELS = {
+    EASY: { correctRate: 0.4, responseTimeRange: [2000, 6000] },    // 40% correct, 2-6 seconds
+    MEDIUM: { correctRate: 0.6, responseTimeRange: [1500, 4000] },  // 60% correct, 1.5-4 seconds
+    HARD: { correctRate: 0.8, responseTimeRange: [1000, 3000] }     // 80% correct, 1-3 seconds
+  };
+  
+  // Bot player class
+  class TriviaBot {
+    constructor(botName = 'BrainyBot', difficulty = 'MEDIUM') {
+      this.id = `bot-${Date.now()}`;
+      this.username = botName;
+      this.score = 0;
+      this.totalResponseTime = 0;
+      this.difficulty = BOT_LEVELS[difficulty] || BOT_LEVELS.MEDIUM;
+      this.currentQuestionIndex = 0;
+      this.answersGiven = [];
+      this.isBot = true;
+    }
+  
+    async answerQuestion(question, options, correctAnswer) {
+      // Determine if the bot will answer correctly based on difficulty
+      const willAnswerCorrectly = Math.random() < this.difficulty.correctRate;
+      
+      // Choose answer
+      let botAnswer;
+      if (willAnswerCorrectly) {
+        botAnswer = correctAnswer;
+      } else {
+        // Select a random incorrect answer
+        const incorrectOptions = Array.from(Array(options.length).keys())
+          .filter(index => index !== correctAnswer);
+        botAnswer = incorrectOptions[Math.floor(Math.random() * incorrectOptions.length)];
+      }
+      
+      // Determine response time within the difficulty's range
+      const [minTime, maxTime] = this.difficulty.responseTimeRange;
+      const responseTime = Math.floor(Math.random() * (maxTime - minTime)) + minTime;
+      
+      // Simulate "thinking" time
+      await new Promise(resolve => setTimeout(resolve, responseTime));
+      
+      // Update bot stats
+      this.totalResponseTime += responseTime;
+      if (botAnswer === correctAnswer) {
+        this.score += 1;
+      }
+      
+      this.answersGiven.push({
+        questionIndex: this.currentQuestionIndex++,
+        answer: botAnswer,
+        isCorrect: botAnswer === correctAnswer,
+        responseTime
+      });
+      
+      return {
+        answer: botAnswer,
+        responseTime,
+        isCorrect: botAnswer === correctAnswer
+      };
+    }
+    
+    // For analytics and fun facts
+    getStats() {
+      return {
+        totalQuestionsAnswered: this.answersGiven.length,
+        correctAnswers: this.score,
+        averageResponseTime: this.totalResponseTime / Math.max(1, this.answersGiven.length),
+        answersGiven: this.answersGiven
+      };
+    }
+  }
+
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
     
@@ -616,6 +688,7 @@ function startNextQuestion(roomId) {
     const currentQuestion = room.questions[room.currentQuestionIndex];
     const questionStartTime = moment();
 
+    // Send question to human players
     io.to(roomId).emit('nextQuestion', {
         question: currentQuestion.question,
         options: currentQuestion.options,
@@ -633,10 +706,150 @@ function startNextQuestion(roomId) {
         clearTimeout(room.questionTimeout);
     }
 
-    // Set a new timeout for this question
+    // If room has a bot, get their answer
+    const bot = room.players.find(p => p.isBot);
+    if (bot) {
+        // Bot will answer according to its difficulty
+        bot.answerQuestion(
+            currentQuestion.question, 
+            currentQuestion.options, 
+            currentQuestion.correctAnswer
+        ).then(botAnswer => {
+            // Emit that bot has answered
+            io.to(roomId).emit('playerAnswered', bot.username);
+            
+            // Check if both players have answered
+            const humanPlayer = room.players.find(p => !p.isBot);
+            if (humanPlayer.answered) {
+                io.to(roomId).emit('roundComplete', {
+                    correctAnswer: currentQuestion.correctAnswer,
+                    playerResults: room.players.map(p => ({
+                        username: p.username,
+                        isCorrect: p === bot ? 
+                            botAnswer.isCorrect : 
+                            p.lastAnswer === currentQuestion.correctAnswer,
+                        answer: p === bot ? botAnswer.answer : p.lastAnswer
+                    }))
+                });
+                completeQuestion(roomId);
+            }
+        });
+    }
+
+    // Set a timeout for this question
     room.questionTimeout = setTimeout(async () => {
+        // If time's up and the human player hasn't answered,
+        // mark as incorrect and proceed
+        room.players.forEach(player => {
+            if (!player.isBot && !player.answered) {
+                player.answered = true;
+                player.lastAnswer = -1; // Invalid answer
+                io.to(roomId).emit('playerAnswered', player.username);
+            }
+        });
+        
         await completeQuestion(roomId);
     }, 10000); // 10 seconds for each question
+}
+
+// Helper function to handle bot answers
+async function handleBotAnswer(room, bot, currentQuestion) {
+    try {
+        const botAnswer = await bot.answerQuestion(
+            currentQuestion.question, 
+            currentQuestion.options, 
+            currentQuestion.correctAnswer
+        );
+
+        // Store bot's answer
+        bot.answered = true;
+        bot.lastAnswer = botAnswer.answer;
+        
+        // Emit bot's answer event
+        io.to(room.id).emit('playerAnswered', {
+            username: bot.username,
+            isBot: true,
+            responseTime: botAnswer.responseTime
+        });
+        
+        // Check if round is complete
+        const humanPlayer = room.players.find(p => !p.isBot);
+        if (humanPlayer.answered) {
+            emitRoundComplete(room, currentQuestion.correctAnswer, botAnswer);
+        }
+    } catch (error) {
+        console.error('Error handling bot answer:', error);
+        // Handle bot error gracefully - maybe give it a wrong answer
+        bot.answered = true;
+        bot.lastAnswer = -1;
+    }
+}
+
+// Helper function to handle question timeout
+async function handleQuestionTimeout(room, roomId) {
+    const unansweredPlayers = room.players.filter(player => !player.answered && !player.isBot);
+    
+    unansweredPlayers.forEach(player => {
+        player.answered = true;
+        player.lastAnswer = -1;
+        io.to(roomId).emit('playerAnswered', {
+            username: player.username,
+            isBot: false,
+            timedOut: true
+        });
+    });
+
+    if (unansweredPlayers.length > 0) {
+        await completeQuestion(roomId);
+    }
+}
+
+// Helper function to emit round completion
+function emitRoundComplete(room, correctAnswer, botAnswer) {
+    io.to(room.id).emit('roundComplete', {
+        correctAnswer: correctAnswer,
+        playerResults: room.players.map(p => ({
+            username: p.username,
+            isCorrect: p.isBot ? 
+                botAnswer.isCorrect : 
+                p.lastAnswer === correctAnswer,
+            answer: p.isBot ? botAnswer.answer : p.lastAnswer,
+            responseTime: p.isBot ? botAnswer.responseTime : p.responseTime,
+            isBot: p.isBot || false
+        }))
+    });
+    
+    completeQuestion(room.id);
+}
+
+function chooseBotName() {
+    const botNames = [
+        'BrainyBot', 'QuizMaster', 'Trivia Titan', 'FactFinder', 
+        'QuestionQueen', 'KnowledgeKing', 'TriviaWhiz', 'WisdomBot',
+        'FactBot', 'QuizGenius', 'BrainiacBot', 'TriviaLegend'
+    ];
+    return botNames[Math.floor(Math.random() * botNames.length)];
+}
+
+// Determine bot difficulty based on player stats or other factors
+async function determineBotDifficulty(playerUsername) {
+    try {
+        // You could look up player stats and match difficulty
+        const player = await User.findOne({ walletAddress: playerUsername });
+        
+        if (!player || player.gamesPlayed < 5) {
+            return 'EASY'; // For new players
+        }
+        
+        const winRate = player.wins / player.gamesPlayed;
+        
+        if (winRate < 0.4) return 'EASY';
+        if (winRate > 0.7) return 'HARD';
+        return 'MEDIUM';
+    } catch (error) {
+        console.error('Error determining bot difficulty:', error);
+        return 'MEDIUM'; // Default to medium difficulty on error
+    }
 }
 
 async function completeQuestion(roomId) {
@@ -651,7 +864,8 @@ async function completeQuestion(roomId) {
     io.to(roomId).emit('updateScores', room.players.map(p => ({ 
         username: p.username, 
         score: p.score, 
-        totalResponseTime: p.totalResponseTime || 0
+        totalResponseTime: p.totalResponseTime || 0,
+        isBot: p.isBot || false
     })));
 
     if (room.questionTimeout) {
@@ -664,55 +878,47 @@ async function completeQuestion(roomId) {
     if (room.currentQuestionIndex < room.questions.length) {
         setTimeout(() => {
             startNextQuestion(roomId);
-        }, 1000);
+        }, 2000); // Slightly longer pause between questions for better UX
     } else {
+        // Game over logic remains similar, just ensure bot is properly included
         console.log(`Game over in room ${roomId}`);
-        const isSinglePlayer = room.players.length === 1;
-        let winner = null;
-
-        if (isSinglePlayer) {
-            const player = room.players[0];
-            winner = player.score >= 5 ? player.username : null;
-            console.log(`Single player game ended. Player ${player.username} scored ${player.score}/7 ${winner ? '(WIN)' : '(LOSS)'}`);
-        } else {
-            const sortedPlayers = [...room.players].sort((a, b) => {
-                if (b.score !== a.score) {
-                    return b.score - a.score;
-                }
-                return (a.totalResponseTime || 0) - (b.totalResponseTime || 0);
-            });
-
-            // Log detailed game results
-            console.log('Game Results:');
-            sortedPlayers.forEach(player => {
-                console.log(`Player ${player.username}: ${player.score} correct answers, Response time: ${player.totalResponseTime}ms`);
-            });
-
-            if (sortedPlayers[0].score > sortedPlayers[1].score) {
-                winner = sortedPlayers[0].username;
-                console.log(`Winner by score: ${winner} (${sortedPlayers[0].score} vs ${sortedPlayers[1].score})`);
-            } else if (sortedPlayers[0].score === sortedPlayers[1].score) {
-                winner = sortedPlayers[0].totalResponseTime <= sortedPlayers[1].totalResponseTime ? 
-                    sortedPlayers[0].username : sortedPlayers[1].username;
-                console.log(`Tie on score (${sortedPlayers[0].score}), Winner by response time: ${winner}`);
-                console.log(`Response times: ${sortedPlayers[0].username}: ${sortedPlayers[0].totalResponseTime}ms, ${sortedPlayers[1].username}: ${sortedPlayers[1].totalResponseTime}ms`);
+        const sortedPlayers = [...room.players].sort((a, b) => {
+            if (b.score !== a.score) {
+                return b.score - a.score;
             }
+            return (a.totalResponseTime || 0) - (b.totalResponseTime || 0);
+        });
+
+        // Log detailed game results
+        console.log('Game Results:');
+        sortedPlayers.forEach(player => {
+            console.log(`Player ${player.username}${player.isBot ? ' (BOT)' : ''}: ${player.score} correct answers, Response time: ${player.totalResponseTime}ms`);
+        });
+
+        // Determine winner
+        let winner = null;
+        if (sortedPlayers[0].score > sortedPlayers[1].score) {
+            winner = sortedPlayers[0].username;
+        } else if (sortedPlayers[0].score === sortedPlayers[1].score) {
+            winner = sortedPlayers[0].totalResponseTime <= sortedPlayers[1].totalResponseTime ? 
+                sortedPlayers[0].username : sortedPlayers[1].username;
         }
 
-        // Update winner's balance if there is a winner
-        if (winner) {
+        // If human player won, process payout
+        if (winner && !sortedPlayers.find(p => p.username === winner)?.isBot) {
             try {
                 const payoutSignature = await sendWinnings(winner, room.betAmount);
                 io.to(roomId).emit('gameOver', {
                     players: room.players.map(p => ({ 
                         username: p.username, 
                         score: p.score, 
-                        totalResponseTime: p.totalResponseTime || 0
+                        totalResponseTime: p.totalResponseTime || 0,
+                        isBot: p.isBot || false
                     })),
                     winner: winner,
                     betAmount: room.betAmount,
                     payoutSignature,
-                    singlePlayerMode: isSinglePlayer
+                    botOpponent: room.hasBot
                 });
             } catch (error) {
                 console.error('Error processing payout:', error);
@@ -721,28 +927,56 @@ async function completeQuestion(roomId) {
                     players: room.players.map(p => ({ 
                         username: p.username, 
                         score: p.score, 
-                        totalResponseTime: p.totalResponseTime || 0
+                        totalResponseTime: p.totalResponseTime || 0,
+                        isBot: p.isBot || false
                     })),
                     winner: winner,
                     betAmount: room.betAmount,
-                    singlePlayerMode: isSinglePlayer
+                    botOpponent: room.hasBot
                 });
             }
         } else {
+            // No payout if bot won
             io.to(roomId).emit('gameOver', {
                 players: room.players.map(p => ({ 
                     username: p.username, 
                     score: p.score, 
-                    totalResponseTime: p.totalResponseTime || 0
+                    totalResponseTime: p.totalResponseTime || 0,
+                    isBot: p.isBot || false
                 })),
-                winner: null,
+                winner: winner,
                 betAmount: room.betAmount,
-                singlePlayerMode: isSinglePlayer
+                botOpponent: room.hasBot
             });
         }
 
         gameRooms.delete(roomId);
     }
+}
+
+// Helper function to handle game over logic
+async function handleGameOver(room, roomId) {
+    console.log(`Game over in room ${roomId}`);
+    
+    const sortedPlayers = [...room.players].sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return (a.totalResponseTime || 0) - (b.totalResponseTime || 0);
+    });
+
+    // Log detailed results
+    console.log('Game Results:');
+    sortedPlayers.forEach(player => {
+        console.log(`Player ${player.username}${player.isBot ? ' (BOT)' : ''}: ${player.score} correct answers, Response time: ${player.totalResponseTime || 0}ms`);
+    });
+
+    // Determine winner
+    const winner = determineWinner(sortedPlayers);
+
+    // Handle payout and emit game over event
+    await handleGameOverEmit(room, sortedPlayers, winner, roomId);
+
+    // Cleanup
+    gameRooms.delete(roomId);
 }
 
 
@@ -847,22 +1081,44 @@ const suspiciousActivity = {
 
 // Add new function for single player mode
 async function startSinglePlayerGame(roomId) {
+    console.log('Starting single player game with bot for room:', roomId);
     const room = gameRooms.get(roomId);
-    if (!room) return;
+    if (!room) {
+        console.log('Room not found for bot creation');
+        return;
+    }
 
     try {
+        // Get questions
         room.questions = await Quiz.aggregate([{ $sample: { size: 7 } }]);
-        const player = room.players[0];
+        const humanPlayer = room.players[0];
+        console.log('Human player:', humanPlayer.username);
+        
+        // Create a bot and add it to the room
+        const difficulty = await determineBotDifficulty(humanPlayer.username);
+        const botName = chooseBotName();
+        console.log('Creating bot with name:', botName, 'and difficulty:', difficulty);
+        
+        const bot = new TriviaBot(botName, difficulty);
+        room.players.push(bot);
+        room.hasBot = true;
+        console.log('Bot added to room. Total players:', room.players.length);
         
         io.to(roomId).emit('gameStart', { 
-            players: room.players, 
+            players: room.players.map(p => ({
+                username: p.username,
+                score: p.score,
+                isBot: p.isBot || false,
+                difficulty: p.isBot ? difficulty : undefined
+            })),
             questionCount: room.questions.length,
-            singlePlayerMode: true 
+            singlePlayerMode: false,
+            botOpponent: bot.username
         });
 
         startNextQuestion(roomId);
     } catch (error) {
-        console.error('Error starting single player game:', error);
+        console.error('Error starting single player game with bot:', error);
         io.to(roomId).emit('gameError', 'Failed to start the game. Please try again.');
     }
 }
@@ -1023,3 +1279,89 @@ async function detectSuspiciousWalletActivity(walletAddress) {
     
     return false;
 }
+
+function determineWinner(players) {
+    if (!players || players.length === 0) {
+      return null;
+    }
+    
+    if (players.length === 1) {
+      // Single player mode - win if score is 5 or more (or use your threshold logic)
+      return players[0].score >= 5 ? players[0].username : null;
+    }
+    
+    // For multiplayer (including bot play)
+    if (players[0].score > players[1].score) {
+      // Clear winner by score
+      return players[0].username;
+    } else if (players[0].score === players[1].score) {
+      // Tie on score, use response time as tiebreaker
+      return players[0].totalResponseTime <= players[1].totalResponseTime ? 
+        players[0].username : players[1].username;
+    }
+    
+    // Should never reach here if players are sorted properly
+    return null;
+  }
+
+  // Add this function to your server.js file
+
+// Helper function to handle game over emit logic
+async function handleGameOverEmit(room, players, winner, roomId) {
+    try {
+      const isSinglePlayer = room.players.length === 1;
+      const hasBot = room.players.some(p => p.isBot);
+      
+      // If there's a winner and they're not a bot, send winnings
+      if (winner && !players.find(p => p.username === winner)?.isBot) {
+        try {
+          const payoutSignature = await sendWinnings(winner, room.betAmount);
+          io.to(roomId).emit('gameOver', {
+            players: players.map(p => ({ 
+              username: p.username, 
+              score: p.score, 
+              totalResponseTime: p.totalResponseTime || 0,
+              isBot: p.isBot || false
+            })),
+            winner: winner,
+            betAmount: room.betAmount,
+            payoutSignature,
+            singlePlayerMode: isSinglePlayer,
+            botOpponent: hasBot
+          });
+        } catch (error) {
+          console.error('Error processing payout:', error);
+          io.to(roomId).emit('gameOver', {
+            error: 'Error processing payout. Please contact support.',
+            players: players.map(p => ({ 
+              username: p.username, 
+              score: p.score, 
+              totalResponseTime: p.totalResponseTime || 0,
+              isBot: p.isBot || false
+            })),
+            winner: winner,
+            betAmount: room.betAmount,
+            singlePlayerMode: isSinglePlayer,
+            botOpponent: hasBot
+          });
+        }
+      } else {
+        // No payout (no winner or bot won)
+        io.to(roomId).emit('gameOver', {
+          players: players.map(p => ({ 
+            username: p.username, 
+            score: p.score, 
+            totalResponseTime: p.totalResponseTime || 0,
+            isBot: p.isBot || false
+          })),
+          winner: winner,
+          betAmount: room.betAmount,
+          singlePlayerMode: isSinglePlayer,
+          botOpponent: hasBot
+        });
+      }
+    } catch (error) {
+      console.error('Error in handleGameOverEmit:', error);
+      io.to(roomId).emit('gameError', 'An error occurred while ending the game.');
+    }
+  }
