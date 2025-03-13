@@ -5,11 +5,14 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 require('dotenv').config();
 const moment = require('moment');
+const nodemailer = require('nodemailer'); // Import Nodemailer
 const crypto = require('crypto'); // For generating verification tokens
 const User = require('./models/User');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const PaymentQueue = require('./models/PaymentQueue');
+const PaymentProcessor = require('./services/PaymentProcessor');
 const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, Keypair } = require('@solana/web3.js');
 
 const { 
@@ -76,8 +79,60 @@ const Quiz = mongoose.model('Quiz', new mongoose.Schema({
 
 const gameRooms = new Map();
 
+// Configure Nodemailer
+const transporter = nodemailer.createTransport({
+    service: 'gmail', // or your email service
+    auth: {
+        user: process.env.EMAIL_USER, // Your email address
+        pass: process.env.EMAIL_PASS, // Your app password or email password
+    },
+});
 
-// Initialize config
+// Initialize connection with fallback URLs and better configuration
+const initSolanaConnection = () => {
+    // Primary and fallback RPC endpoints
+    const rpcEndpoints = [
+        'https://api.devnet.solana.com',
+        'https://devnet.solana.rpcpool.com',
+        'https://devnet-rpc.magicblock.app'
+    ];
+    
+    const connectionOptions = {
+        commitment: 'confirmed',
+        confirmTransactionInitialTimeout: 60000, // 60 seconds
+        disableRetryOnRateLimit: false,
+        confirmTransactionRetries: 5,
+        wsEndpoint: process.env.SOLANA_WS_URL // Optional WebSocket endpoint
+    };
+    
+    // Try to use custom endpoint from env first if available
+    if (process.env.SOLANA_RPC_URL) {
+        try {
+            console.log(`Using custom Solana RPC URL from environment: ${process.env.SOLANA_RPC_URL}`);
+            const connection = new Connection(process.env.SOLANA_RPC_URL, connectionOptions);
+            // Test the connection
+            connection.getVersion()
+                .then(() => console.log('Successfully connected to custom RPC endpoint'))
+                .catch(err => {
+                    console.warn('Warning: Custom RPC endpoint test failed:', err.message);
+                    console.log('Will fall back to default endpoints if needed');
+                });
+            return connection;
+        } catch (error) {
+            console.error('Error initializing custom RPC connection:', error);
+            console.log('Falling back to default endpoints');
+        }
+    }
+    
+    // Use the first endpoint from the list
+    console.log(`Using default Solana RPC URL: ${rpcEndpoints[0]}`);
+    return new Connection(rpcEndpoints[0], connectionOptions);
+};
+
+// Initialize connection
+const connection = initSolanaConnection();
+
+// Update the config object with enhanced settings
 const config = {
     USDC_MINT: new PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
     TREASURY_WALLET: new PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
@@ -87,11 +142,92 @@ const config = {
     HOUSE_FEE_PERCENT: 2.5,
     MIN_BET_AMOUNT: 1,
     MAX_BET_AMOUNT: 100,
-    connection: new Connection('https://api.devnet.solana.com', 'confirmed')
+    connection: connection,
+    rpcEndpoints: [
+        'https://api.devnet.solana.com',
+        'https://devnet.solana.rpcpool.com',
+        'https://devnet-rpc.magicblock.app'
+    ],
+    currentEndpointIndex: 0,
+    connectionOptions: {
+        commitment: 'confirmed',
+        confirmTransactionInitialTimeout: 60000,
+        disableRetryOnRateLimit: false,
+        confirmTransactionRetries: 5
+    }
 };
 
-// Initialize connection
-const connection = config.connection;
+const paymentProcessor = new PaymentProcessor({
+    ...config, // Pass your existing config
+    io: io // Pass the socket.io instance for event emission
+  });
+
+  // Start the payment processor with a 1-minute interval
+paymentProcessor.startProcessing(60000);
+
+// Add a graceful shutdown handler
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, shutting down payment processor...');
+  paymentProcessor.stopProcessing();
+  // Wait for any in-progress transactions
+  await new Promise(resolve => setTimeout(resolve, 5000));
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received, shutting down payment processor...');
+  paymentProcessor.stopProcessing();
+  // Wait for any in-progress transactions
+  await new Promise(resolve => setTimeout(resolve, 5000));
+  process.exit(0);
+});
+
+// Enhanced function to get alternative connection with health check
+async function getAlternativeConnection(currentEndpointIndex = 0) {
+    const maxAttempts = config.rpcEndpoints.length;
+    let attempts = 0;
+    
+    while (attempts < maxAttempts) {
+        const nextEndpointIndex = (currentEndpointIndex + attempts + 1) % config.rpcEndpoints.length;
+        const nextEndpoint = config.rpcEndpoints[nextEndpointIndex];
+        
+        try {
+            console.log(`Attempting to connect to RPC endpoint: ${nextEndpoint}`);
+            const newConnection = new Connection(nextEndpoint, config.connectionOptions);
+            
+            // Test the connection
+            await newConnection.getVersion();
+            console.log(`Successfully connected to ${nextEndpoint}`);
+            
+            // Update current endpoint index in config
+            config.currentEndpointIndex = nextEndpointIndex;
+            
+            return newConnection;
+        } catch (error) {
+            console.warn(`Failed to connect to ${nextEndpoint}:`, error.message);
+            attempts++;
+            
+            if (attempts === maxAttempts) {
+                throw new Error('All RPC endpoints failed');
+            }
+        }
+    }
+}
+
+// Add connection health monitoring
+setInterval(async () => {
+    try {
+        await connection.getVersion();
+    } catch (error) {
+        console.warn('Current RPC connection may be unhealthy:', error.message);
+        try {
+            config.connection = await getAlternativeConnection(config.currentEndpointIndex);
+            console.log('Successfully switched to alternative RPC endpoint');
+        } catch (fallbackError) {
+            console.error('Failed to switch to alternative RPC endpoint:', fallbackError.message);
+        }
+    }
+}, 30000); // Check every 30 seconds
 
 // Initialize programId
 let programId;
@@ -463,16 +599,18 @@ io.on('connection', (socket) => {
     
             if (!roomId) {
                 roomId = generateRoomId();
+                roomId = generateRoomId();
                 gameRooms.set(roomId, {
                     players: [],
                     questions: [],
                     currentQuestionIndex: 0,
                     answersReceived: 0,
                     betAmount: betAmount,
-                    waitingTimeout: null,
-                    gameStarted: false // Flag to track if game has started
+                    // Store the timeout but don't automatically start bot game
+                    waitingTimeout: null
                 });
             }
+
     
             const room = gameRooms.get(roomId);
             room.players.push({
@@ -485,28 +623,16 @@ io.on('connection', (socket) => {
             socket.join(roomId);
             socket.emit('gameJoined', roomId);
     
-            if (joinedExistingRoom) {
+            if (room.players.length === 2) {
+                clearTimeout(room.waitingTimeout);
+                startGame(roomId);
+            } else if (joinedExistingRoom) {
                 socket.to(roomId).emit('playerJoined', walletAddress);
             }
     
         } catch (error) {
             console.error('Join game error:', error);
             socket.emit('joinGameFailure', error.message);
-        }
-    });
-
-    socket.on('playerReady', ({ roomId }) => {
-        console.log(`Player ${socket.id} ready in room ${roomId}`);
-        const room = gameRooms.get(roomId);
-        
-        if (!room) {
-            return socket.emit('gameError', 'Room not found');
-        }
-        
-        // Only start the game if there are 2 players and game hasn't started yet
-        if (room.players.length === 2 && !room.gameStarted) {
-            room.gameStarted = true;
-            startGame(roomId);
         }
     });
 
@@ -613,6 +739,74 @@ io.on('connection', (socket) => {
                 }
                 break;
             }
+        }
+    });
+
+    // Get payment status
+    socket.on('getPaymentStatus', async ({ paymentId }) => {
+        try {
+            const payment = await PaymentQueue.findById(paymentId);
+            if (!payment) {
+                return socket.emit('paymentStatus', { 
+                    success: false, 
+                    error: 'Payment not found' 
+                });
+            }
+            
+            socket.emit('paymentStatus', {
+                success: true,
+                payment: {
+                    id: payment._id,
+                    status: payment.status,
+                    amount: payment.amount,
+                    createdAt: payment.createdAt,
+                    completedAt: payment.completedAt,
+                    transactionSignature: payment.transactionSignature,
+                    attempts: payment.attempts
+                }
+            });
+        } catch (error) {
+            console.error('Payment status error:', error);
+            socket.emit('paymentStatus', { 
+                success: false, 
+                error: error.message || 'Error retrieving payment status' 
+            });
+        }
+    });
+    
+    // Get all payments for a wallet
+    socket.on('getWalletPayments', async ({ walletAddress }) => {
+        try {
+            if (walletAddress !== socket.data.walletAddress) {
+                console.warn(`Unauthorized wallet payment request from ${socket.id}`);
+                return socket.emit('walletPayments', {
+                    success: false,
+                    error: 'Unauthorized'
+                });
+            }
+            
+            const payments = await PaymentQueue.find({ recipientWallet: walletAddress })
+                .sort({ createdAt: -1 })
+                .limit(50);
+            
+            socket.emit('walletPayments', {
+                success: true,
+                payments: payments.map(p => ({
+                    id: p._id,
+                    status: p.status,
+                    amount: p.amount,
+                    createdAt: p.createdAt,
+                    completedAt: p.completedAt,
+                    transactionSignature: p.transactionSignature,
+                    gameId: p.gameId
+                }))
+            });
+        } catch (error) {
+            console.error('Wallet payments error:', error);
+            socket.emit('walletPayments', {
+                success: false,
+                error: error.message || 'Error retrieving wallet payments'
+            });
         }
     });
 });
@@ -923,7 +1117,7 @@ async function completeQuestion(roomId) {
         // If human player won, process payout
         if (winner && !sortedPlayers.find(p => p.username === winner)?.isBot) {
             try {
-                const payoutSignature = await sendWinnings(winner, room.betAmount);
+                const payoutResult = await sendWinnings(winner, room.betAmount, roomId);
                 io.to(roomId).emit('gameOver', {
                     players: room.players.map(p => ({ 
                         username: p.username, 
@@ -933,7 +1127,7 @@ async function completeQuestion(roomId) {
                     })),
                     winner: winner,
                     betAmount: room.betAmount,
-                    payoutSignature,
+                    payoutResult,
                     botOpponent: room.hasBot
                 });
             } catch (error) {
@@ -1025,7 +1219,30 @@ app.get('/verify-email', async (req, res) => {
         res.status(500).send('Error verifying email');
     }
 });
+/*
+app.post('/register', async (req, res) => {
+    const { username, email, password } = req.body;
 
+    try {
+        const verificationToken = crypto.randomBytes(32).toString('hex'); // Generate token
+        const user = new User({ username, email, password, verificationToken, isVerified: false }); // Save user with verificationToken
+        await user.save();
+
+        // Send verification email
+        const verificationUrl = `${process.env.BASE_URL}/verify-email?token=${verificationToken}`;
+        await transporter.sendMail({
+            to: email,
+            subject: 'Email Verification',
+            html: `Please verify your email by clicking <a href="${verificationUrl}">here</a>`,
+        });
+
+        console.log(`User registered: ${username}, pending verification`); // Log registration
+        res.status(201).json({ success: true, message: 'Registration successful! Please check your email to verify your account.' });
+    } catch (error) {
+        res.status(400).json({ success: false, message: error.message });
+    }
+});
+*/
 
 // Function to verify reCAPTCHA token
 async function verifyRecaptcha(token) {
@@ -1155,51 +1372,53 @@ function addPlayerToRoom(roomId, socketId, walletAddress) {
     }
 }
 
-async function sendWinnings(winnerAddress, betAmount) {
+async function sendWinnings(winnerAddress, betAmount, gameId) {
     try {
-        const winnerPublicKey = new PublicKey(winnerAddress);
-        
-        // Calculate winnings (80% profit)
-        const winningAmount = betAmount * 1.8;
-        
-        // Get token accounts
-        const treasuryTokenAccount = await findAssociatedTokenAddress(
-            config.TREASURY_WALLET,
-            config.USDC_MINT
-        );
-
-        const winnerTokenAccount = await findAssociatedTokenAddress(
-            winnerPublicKey,
-            config.USDC_MINT
-        );
-
-        // Create transfer instruction
-        const transferIx = createTransferCheckedInstruction(
-            treasuryTokenAccount,
-            config.USDC_MINT,
-            winnerTokenAccount,
-            config.TREASURY_WALLET,
-            Math.floor(winningAmount * Math.pow(10, 6)), // Convert to USDC decimals
-            6
-        );
-
-        // Create and send transaction
-        const transaction = new Transaction().add(transferIx);
-        transaction.feePayer = config.TREASURY_WALLET;
-        transaction.recentBlockhash = (await config.connection.getRecentBlockhash()).blockhash;
-
-        // Sign and send transaction
-        const signature = await sendAndConfirmTransaction(
-            config.connection,
-            transaction,
-            [config.TREASURY_KEYPAIR] // Use the treasury keypair for signing
-        );
-
-        console.log('Payout successful:', signature);
-        return signature;
+      const winningAmount = betAmount * 1.8;
+      console.log(`Queueing payment of ${winningAmount} USDC to ${winnerAddress} for game ${gameId}`);
+      
+      // Add to payment queue instead of sending immediately
+      const payment = await paymentProcessor.queuePayment(
+        winnerAddress,
+        winningAmount,
+        gameId,  // Make sure this is passed!
+        betAmount,
+        {
+          source: 'game_win',
+          timestamp: new Date().toISOString()
+        }
+      );
+      
+      // Return the payment ID which can be used for status lookups
+      return {
+        success: true,
+        paymentId: payment._id.toString(),
+        status: 'queued',
+        amount: winningAmount
+      };
     } catch (error) {
-        console.error('Error sending winnings:', error);
-        throw error;
+      console.error('Error queueing payment:', error);
+      return {
+        success: false,
+        error: error.message || 'Unknown error',
+        status: 'failed'
+      };
+    }
+  }
+
+// Helper function for blockhash retry
+async function getRecentBlockhashWithRetry(connection, maxRetries = 3) {
+    let attempts = 0;
+    while (attempts < maxRetries) {
+        try {
+            console.log(`Getting recent blockhash (attempt ${attempts + 1})...`);
+            return await connection.getRecentBlockhash('finalized');
+        } catch (error) {
+            attempts++;
+            if (attempts === maxRetries) throw error;
+            console.warn(`Blockhash fetch attempt ${attempts} failed:`, error.message);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
     }
 }
 
@@ -1258,6 +1477,52 @@ app.get('/admin', (req, res) => {
     res.redirect('/');
 });
 
+app.post('/api/admin/retry-payments', async (req, res) => {
+    try {
+      // Add authentication check here
+      const apiKey = req.headers['x-api-key'];
+      if (apiKey !== process.env.ADMIN_API_KEY) {
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+      }
+      
+      const result = await paymentProcessor.retryFailedPayments();
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        error: error.message || 'Error retrying payments'
+      });
+    }
+  });
+  
+  // Add an API endpoint to check payment status
+  app.get('/api/payments/:id', async (req, res) => {
+    try {
+      const payment = await PaymentQueue.findById(req.params.id);
+      if (!payment) {
+        return res.status(404).json({ success: false, error: 'Payment not found' });
+      }
+      
+      res.json({
+        success: true,
+        payment: {
+          id: payment._id,
+          status: payment.status,
+          amount: payment.amount,
+          createdAt: payment.createdAt,
+          completedAt: payment.completedAt,
+          transactionSignature: payment.transactionSignature,
+          attempts: payment.attempts
+        }
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        error: error.message || 'Error retrieving payment'
+      });
+    }
+  });
+
 // Add suspicious wallet detection during game play
 async function detectSuspiciousWalletActivity(walletAddress) {
     // Check for too many games in short period
@@ -1304,6 +1569,7 @@ function determineWinner(players) {
     // Should never reach here if players are sorted properly
     return null;
   }
+  // Add this function to your server.js file
 
 // Helper function to handle game over emit logic
 async function handleGameOverEmit(room, players, winner, roomId) {
@@ -1311,39 +1577,37 @@ async function handleGameOverEmit(room, players, winner, roomId) {
       const isSinglePlayer = room.players.length === 1;
       const hasBot = room.players.some(p => p.isBot);
       
-      // If there's a winner and they're not a bot, send winnings
+      // If there's a winner and they're not a bot, queue the payout
       if (winner && !players.find(p => p.username === winner)?.isBot) {
+        let paymentResult = null;
+        
         try {
-          const payoutSignature = await sendWinnings(winner, room.betAmount);
-          io.to(roomId).emit('gameOver', {
-            players: players.map(p => ({ 
-              username: p.username, 
-              score: p.score, 
-              totalResponseTime: p.totalResponseTime || 0,
-              isBot: p.isBot || false
-            })),
-            winner: winner,
-            betAmount: room.betAmount,
-            payoutSignature,
-            singlePlayerMode: isSinglePlayer,
-            botOpponent: hasBot
-          });
+          console.log(`Attempting to queue winnings for ${winner}`);
+          paymentResult = await sendWinnings(winner, room.betAmount, gameId);
+          console.log(`Payment queued for ${winner}:`, paymentResult);
         } catch (error) {
-          console.error('Error processing payout:', error);
-          io.to(roomId).emit('gameOver', {
-            error: 'Error processing payout. Please contact support.',
-            players: players.map(p => ({ 
-              username: p.username, 
-              score: p.score, 
-              totalResponseTime: p.totalResponseTime || 0,
-              isBot: p.isBot || false
-            })),
-            winner: winner,
-            betAmount: room.betAmount,
-            singlePlayerMode: isSinglePlayer,
-            botOpponent: hasBot
-          });
+          console.error('Error queueing payout:', error);
+          paymentResult = {
+            success: false,
+            error: error.message || 'Unknown error',
+            status: 'failed'
+          };
         }
+        
+        // Always emit game over, with payment result
+        io.to(roomId).emit('gameOver', {
+          players: players.map(p => ({ 
+            username: p.username, 
+            score: p.score, 
+            totalResponseTime: p.totalResponseTime || 0,
+            isBot: p.isBot || false
+          })),
+          winner: winner,
+          betAmount: room.betAmount,
+          payment: paymentResult,
+          singlePlayerMode: isSinglePlayer,
+          botOpponent: hasBot
+        });
       } else {
         // No payout (no winner or bot won)
         io.to(roomId).emit('gameOver', {
