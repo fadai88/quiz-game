@@ -212,6 +212,7 @@
                         <span class="choice-icon">🤖</span>
                         <span class="choice-title">Play Against Bot</span>
                         <span class="choice-desc">Start immediately against an AI opponent</span>
+                        <span class="reward-info">Win 1.5x your bet!</span>
                     </button>
                 </div>
             </div>
@@ -889,7 +890,7 @@
 
         socket.on('gameOver', (data) => {
             console.log('Received game over data:', data);
-            const { players, winner, betAmount, winnerBalance, singlePlayerMode, payoutSignature } = data;
+            const { players, winner, betAmount, winnerBalance, singlePlayerMode, payoutSignature, botOpponent } = data;
             
             questionDiv.textContent = 'Game Over!';
             submitAnswerBtn.style.display = 'none';
@@ -897,7 +898,10 @@
             if (singlePlayerMode) {
                 const player = players[0];
                 if (winner) {
-                    waitingMessage.textContent = `Congratulations! You won with ${player.score} correct answers! You won ${(betAmount * 1.8).toFixed(2)} USDC!`;
+                    const multiplier = botOpponent ? 1.5 : 1.8;
+                    const winnings = betAmount * multiplier;
+                    
+                    waitingMessage.textContent = `Congratulations! You won with ${player.score} correct answers! You won ${winnings.toFixed(2)} USDC!`;
                     if (payoutSignature) {
                         const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
                         waitingMessage.innerHTML += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;

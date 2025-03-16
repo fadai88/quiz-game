@@ -178,76 +178,75 @@ const verifyUSDCTransaction = async (transactionSignature, expectedAmount, sende
 };
 
 const BOT_LEVELS = {
-    EASY: { correctRate: 0.4, responseTimeRange: [2000, 6000] },    // 40% correct, 2-6 seconds
     MEDIUM: { correctRate: 0.6, responseTimeRange: [1500, 4000] },  // 60% correct, 1.5-4 seconds
     HARD: { correctRate: 0.8, responseTimeRange: [1000, 3000] }     // 80% correct, 1-3 seconds
-  };
-  
-  // Bot player class
-  class TriviaBot {
+};
+
+// Bot player class
+class TriviaBot {
     constructor(botName = 'BrainyBot', difficulty = 'MEDIUM') {
-      this.id = `bot-${Date.now()}`;
-      this.username = botName;
-      this.score = 0;
-      this.totalResponseTime = 0;
-      this.difficulty = BOT_LEVELS[difficulty] || BOT_LEVELS.MEDIUM;
-      this.currentQuestionIndex = 0;
-      this.answersGiven = [];
-      this.isBot = true;
+        this.id = `bot-${Date.now()}`;
+        this.username = botName;
+        this.score = 0;
+        this.totalResponseTime = 0;
+        this.difficulty = BOT_LEVELS[difficulty] || BOT_LEVELS.MEDIUM;
+        this.currentQuestionIndex = 0;
+        this.answersGiven = [];
+        this.isBot = true;
     }
-  
+
     async answerQuestion(question, options, correctAnswer) {
-      // Determine if the bot will answer correctly based on difficulty
-      const willAnswerCorrectly = Math.random() < this.difficulty.correctRate;
-      
-      // Choose answer
-      let botAnswer;
-      if (willAnswerCorrectly) {
-        botAnswer = correctAnswer;
-      } else {
-        // Select a random incorrect answer
-        const incorrectOptions = Array.from(Array(options.length).keys())
-          .filter(index => index !== correctAnswer);
-        botAnswer = incorrectOptions[Math.floor(Math.random() * incorrectOptions.length)];
-      }
-      
-      // Determine response time within the difficulty's range
-      const [minTime, maxTime] = this.difficulty.responseTimeRange;
-      const responseTime = Math.floor(Math.random() * (maxTime - minTime)) + minTime;
-      
-      // Simulate "thinking" time
-      await new Promise(resolve => setTimeout(resolve, responseTime));
-      
-      // Update bot stats
-      this.totalResponseTime += responseTime;
-      if (botAnswer === correctAnswer) {
-        this.score += 1;
-      }
-      
-      this.answersGiven.push({
-        questionIndex: this.currentQuestionIndex++,
-        answer: botAnswer,
-        isCorrect: botAnswer === correctAnswer,
-        responseTime
-      });
-      
-      return {
-        answer: botAnswer,
-        responseTime,
-        isCorrect: botAnswer === correctAnswer
-      };
+        // Determine if the bot will answer correctly based on difficulty
+        const willAnswerCorrectly = Math.random() < this.difficulty.correctRate;
+        
+        // Choose answer
+        let botAnswer;
+        if (willAnswerCorrectly) {
+            botAnswer = correctAnswer;
+        } else {
+            // Select a random incorrect answer
+            const incorrectOptions = Array.from(Array(options.length).keys())
+                .filter(index => index !== correctAnswer);
+            botAnswer = incorrectOptions[Math.floor(Math.random() * incorrectOptions.length)];
+        }
+        
+        // Determine response time within the difficulty's range
+        const [minTime, maxTime] = this.difficulty.responseTimeRange;
+        const responseTime = Math.floor(Math.random() * (maxTime - minTime)) + minTime;
+        
+        // Simulate "thinking" time
+        await new Promise(resolve => setTimeout(resolve, responseTime));
+        
+        // Update bot stats
+        this.totalResponseTime += responseTime;
+        if (botAnswer === correctAnswer) {
+            this.score += 1;
+        }
+        
+        this.answersGiven.push({
+            questionIndex: this.currentQuestionIndex++,
+            answer: botAnswer,
+            isCorrect: botAnswer === correctAnswer,
+            responseTime
+        });
+        
+        return {
+            answer: botAnswer,
+            responseTime,
+            isCorrect: botAnswer === correctAnswer
+        };
     }
     
     // For analytics and fun facts
     getStats() {
-      return {
-        totalQuestionsAnswered: this.answersGiven.length,
-        correctAnswers: this.score,
-        averageResponseTime: this.totalResponseTime / Math.max(1, this.answersGiven.length),
-        answersGiven: this.answersGiven
-      };
+        return {
+            totalQuestionsAnswered: this.answersGiven.length,
+            correctAnswers: this.score,
+            averageResponseTime: this.totalResponseTime / Math.max(1, this.answersGiven.length),
+            answersGiven: this.answersGiven
+        };
     }
-  }
+}
 
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
@@ -850,21 +849,17 @@ function chooseBotName() {
 // Determine bot difficulty based on player stats or other factors
 async function determineBotDifficulty(playerUsername) {
     try {
-        // You could look up player stats and match difficulty
         const player = await User.findOne({ walletAddress: playerUsername });
         
-        if (!player || player.gamesPlayed < 5) {
-            return 'EASY'; // For new players
+        if (!player || player.gamesPlayed < 3) {
+            return 'MEDIUM';
         }
         
         const winRate = player.wins / player.gamesPlayed;
-        
-        if (winRate < 0.4) return 'EASY';
-        if (winRate > 0.7) return 'HARD';
-        return 'MEDIUM';
+        return winRate < 0.4 ? 'MEDIUM' : 'HARD';
     } catch (error) {
         console.error('Error determining bot difficulty:', error);
-        return 'MEDIUM'; // Default to medium difficulty on error
+        return 'HARD';
     }
 }
 
@@ -923,7 +918,8 @@ async function completeQuestion(roomId) {
         // If human player won, process payout
         if (winner && !sortedPlayers.find(p => p.username === winner)?.isBot) {
             try {
-                const payoutSignature = await sendWinnings(winner, room.betAmount);
+                const botOpponent = room.players.some(p => p.isBot);
+                const payoutSignature = await sendWinnings(winner, room.betAmount, botOpponent);
                 io.to(roomId).emit('gameOver', {
                     players: room.players.map(p => ({ 
                         username: p.username, 
@@ -934,7 +930,7 @@ async function completeQuestion(roomId) {
                     winner: winner,
                     betAmount: room.betAmount,
                     payoutSignature,
-                    botOpponent: room.hasBot
+                    botOpponent: botOpponent
                 });
             } catch (error) {
                 console.error('Error processing payout:', error);
@@ -1155,14 +1151,14 @@ function addPlayerToRoom(roomId, socketId, walletAddress) {
     }
 }
 
-async function sendWinnings(winnerAddress, betAmount) {
+async function sendWinnings(winnerAddress, betAmount, botOpponent = false) {
     try {
         const winnerPublicKey = new PublicKey(winnerAddress);
+        const multiplier = botOpponent ? 1.5 : 1.8;
+        const winningAmount = betAmount * multiplier;
         
-        // Calculate winnings (80% profit)
-        const winningAmount = betAmount * 1.8;
+        console.log(`Sending winnings: ${winningAmount} USDC to ${winnerAddress} (vs bot: ${botOpponent})`);
         
-        // Get token accounts
         const treasuryTokenAccount = await findAssociatedTokenAddress(
             config.TREASURY_WALLET,
             config.USDC_MINT
@@ -1173,26 +1169,23 @@ async function sendWinnings(winnerAddress, betAmount) {
             config.USDC_MINT
         );
 
-        // Create transfer instruction
         const transferIx = createTransferCheckedInstruction(
             treasuryTokenAccount,
             config.USDC_MINT,
             winnerTokenAccount,
             config.TREASURY_WALLET,
-            Math.floor(winningAmount * Math.pow(10, 6)), // Convert to USDC decimals
+            Math.floor(winningAmount * Math.pow(10, 6)),
             6
         );
 
-        // Create and send transaction
         const transaction = new Transaction().add(transferIx);
         transaction.feePayer = config.TREASURY_WALLET;
         transaction.recentBlockhash = (await config.connection.getRecentBlockhash()).blockhash;
 
-        // Sign and send transaction
         const signature = await sendAndConfirmTransaction(
             config.connection,
             transaction,
-            [config.TREASURY_KEYPAIR] // Use the treasury keypair for signing
+            [config.TREASURY_KEYPAIR]
         );
 
         console.log('Payout successful:', signature);
@@ -1314,7 +1307,7 @@ async function handleGameOverEmit(room, players, winner, roomId) {
       // If there's a winner and they're not a bot, send winnings
       if (winner && !players.find(p => p.username === winner)?.isBot) {
         try {
-          const payoutSignature = await sendWinnings(winner, room.betAmount);
+          const payoutSignature = await sendWinnings(winner, room.betAmount, hasBot);
           io.to(roomId).emit('gameOver', {
             players: players.map(p => ({ 
               username: p.username, 
