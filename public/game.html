@@ -895,12 +895,13 @@
             questionDiv.textContent = 'Game Over!';
             submitAnswerBtn.style.display = 'none';
             
+            // Calculate the correct multiplier based on game type
+            const multiplier = botOpponent ? 1.5 : 1.8;
+            const winnings = betAmount * multiplier;
+            
             if (singlePlayerMode) {
                 const player = players[0];
                 if (winner) {
-                    const multiplier = botOpponent ? 1.5 : 1.8;
-                    const winnings = betAmount * multiplier;
-                    
                     waitingMessage.textContent = `Congratulations! You won with ${player.score} correct answers! You won ${winnings.toFixed(2)} USDC!`;
                     if (payoutSignature) {
                         const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
@@ -914,11 +915,10 @@
 
                 if (winner) {
                     const winnerPlayer = players.find(p => p.username === winner);
-                    const winnings = betAmount * 1.8;
                     waitingMessage.textContent = `The winner is ${winner} with a score of ${winnerPlayer.score}!`;
                     
                     if (winner === connectedWallet) {
-                        waitingMessage.textContent += ` You won ${winnings} USDC!`;
+                        waitingMessage.textContent += ` You won ${winnings.toFixed(2)} USDC!`;
                         if (payoutSignature) {
                             waitingMessage.textContent += ` Winnings have been sent to your wallet!`;
                             const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
@@ -937,7 +937,6 @@
                         
                         const tiebreakWinner = players[0].totalResponseTime <= players[1].totalResponseTime ? players[0].username : players[1].username;
                         if (tiebreakWinner === connectedWallet) {
-                            const winnings = betAmount ? parseFloat(betAmount) * 1.8 : 0;
                             waitingMessage.textContent += ` You won ${winnings.toFixed(2)} USDC!`;
                             if (payoutSignature) {
                                 const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
