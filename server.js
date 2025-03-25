@@ -566,11 +566,9 @@ io.on('connection', (socket) => {
             if (playerIndex !== -1) {
                 const disconnectedPlayer = room.players[playerIndex];
                 
-                // Handle bot rooms specially - if a player leaves a bot room, 
-                // we should clean up both the player and bot
                 if (room.roomMode === 'bot') {
                     console.log(`Player ${disconnectedPlayer.username} left bot room ${roomId}`);
-                    gameRooms.delete(roomId); // Just delete the whole room
+                    gameRooms.delete(roomId);
                     return;
                 }
                 
