@@ -967,9 +967,159 @@
         });
 
         socket.on('playerLeft', (username) => {
-            alert(`${username} left the game. The game will end.`);
-            resetGame();
+            waitingMessage.textContent = `${username} left the game. Waiting for forfeit resolution...`;
+            
+            // Add a visual indicator that the game is being resolved
+            const loadingIndicator = document.createElement('div');
+            loadingIndicator.className = 'loading-spinner';
+            loadingIndicator.innerHTML = '⌛';
+            waitingMessage.appendChild(loadingIndicator);
+            
+            // Play notification sound if available
+            if (typeof playSound === 'function') {
+                playSound('notification');
+            }
         });
+
+        socket.on('gameOverForfeit', (data) => {
+            console.log('Forfeit game over:', data);
+            const { winner, disconnectedPlayer, betAmount, payoutSignature, botOpponent, message } = data;
+            
+            // Clear the game UI
+            questionDiv.textContent = 'Game Over - Player Left!';
+            submitAnswerBtn.style.display = 'none';
+            
+            // Calculate the appropriate winnings
+            const multiplier = botOpponent ? 1.5 : 1.8;
+            const winnings = betAmount * multiplier;
+            
+            // Generate the forfeit message
+            waitingMessage.textContent = message;
+            
+            // If this client is the winner, show additional details
+            if (winner === connectedWallet) {
+                waitingMessage.textContent += ` You've been awarded ${winnings.toFixed(2)} USDC for the win!`;
+                
+                if (payoutSignature) {
+                    waitingMessage.textContent += ` Winnings have been sent to your wallet!`;
+                    const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
+                    waitingMessage.innerHTML += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
+                }
+                
+                // Display a celebration effect if available
+                if (typeof celebrateWin === 'function') {
+                    celebrateWin('forfeit');
+                }
+            }
+            
+            // Update UI after forfeit
+            setTimeout(() => {
+                playersDiv.innerHTML = '<h2>Game Ended Early</h2>';
+                joinGameBtn.style.display = 'inline-block';
+                optionsDiv.innerHTML = '';
+                
+                // Create a special message about the forfeit
+                const forfeitDiv = document.createElement('div');
+                forfeitDiv.className = 'forfeit-message';
+                forfeitDiv.innerHTML = `
+                    <p>${disconnectedPlayer} left the game.</p>
+                    <p>${winner} is the winner.</p>
+                `;
+                playersDiv.appendChild(forfeitDiv);
+                
+                // Update balance after forfeit win
+                updateBalance();
+            }, 3000);
+        });
+
+        const forfeitStyles = document.createElement('style');
+        forfeitStyles.textContent = `
+            .loading-spinner {
+                display: inline-block;
+                animation: spin 2s infinite linear;
+                margin-left: 10px;
+                font-size: 20px;
+            }
+            
+            @keyframes spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+            
+            .forfeit-message {
+                background-color: rgba(255, 152, 0, 0.2);
+                border-left: 4px solid #ff9800;
+                padding: 10px 15px;
+                margin: 15px 0;
+                border-radius: 4px;
+            }
+            
+            .dark-theme .forfeit-message {
+                background-color: rgba(255, 152, 0, 0.1);
+            }
+        `;
+        document.head.appendChild(forfeitStyles);
+
+        // Optional celebration effect
+        function celebrateWin(type) {
+            // Simple confetti effect for win celebration
+            const confettiContainer = document.createElement('div');
+            confettiContainer.className = 'confetti-container';
+            document.body.appendChild(confettiContainer);
+            
+            // Create 50 confetti pieces
+            for (let i = 0; i < 50; i++) {
+                const confetti = document.createElement('div');
+                confetti.className = 'confetti';
+                confetti.style.left = `${Math.random() * 100}%`;
+                confetti.style.animationDelay = `${Math.random() * 3}s`;
+                confetti.style.backgroundColor = `hsl(${Math.random() * 360}, 80%, 60%)`;
+                confettiContainer.appendChild(confetti);
+            }
+            
+            // Remove confetti after animation completes
+            setTimeout(() => {
+                confettiContainer.remove();
+            }, 6000);
+        }
+
+    // Add the confetti CSS
+        const confettiStyles = document.createElement('style');
+        confettiStyles.textContent = `
+            .confetti-container {
+                position: fixed;
+                width: 100%;
+                height: 100%;
+                top: 0;
+                left: 0;
+                pointer-events: none;
+                z-index: 9999;
+            }
+            
+            .confetti {
+                position: absolute;
+                width: 10px;
+                height: 10px;
+                background-color: #f00;
+                top: -10px;
+                animation: confetti-fall 5s linear forwards;
+            }
+            
+            @keyframes confetti-fall {
+                0% {
+                    transform: translateY(0) rotate(0deg);
+                    opacity: 1;
+                }
+                80% {
+                    opacity: 1;
+                }
+                100% {
+                    transform: translateY(100vh) rotate(720deg);
+                    opacity: 0;
+                }
+            }
+        `;
+        document.head.appendChild(confettiStyles);
 
         socket.on('updateScores', (players) => {
             updatePlayers(players);

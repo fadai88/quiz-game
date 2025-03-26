@@ -565,21 +565,41 @@ io.on('connection', (socket) => {
             const playerIndex = room.players.findIndex(p => p.id === socket.id);
             if (playerIndex !== -1) {
                 const disconnectedPlayer = room.players[playerIndex];
+                console.log(`Player ${disconnectedPlayer.username} left room ${roomId}`);
                 
+                // Handle bot rooms specially
                 if (room.roomMode === 'bot') {
-                    console.log(`Player ${disconnectedPlayer.username} left bot room ${roomId}`);
+                    console.log(`Bot room ${roomId} abandoned - cleaning up`);
                     gameRooms.delete(roomId);
                     return;
                 }
                 
+                // Remove the disconnected player
                 room.players.splice(playerIndex, 1);
-                console.log(`Player ${disconnectedPlayer.username} left room ${roomId}`);
                 
-                if (room.players.length === 0) {
+                // If the game has started and there's a remaining player, declare them the winner
+                if (room.gameStarted && room.players.length === 1) {
+                    const remainingPlayer = room.players[0];
+                    
+                    // Don't award a win if the remaining player is a bot
+                    if (remainingPlayer.isBot) {
+                        console.log(`Only a bot remained in room ${roomId} - cleaning up`);
+                        gameRooms.delete(roomId);
+                        return;
+                    }
+                    
+                    console.log(`Player ${disconnectedPlayer.username} left during active game. Declaring ${remainingPlayer.username} the winner.`);
+                    
+                    // Process the payout for the remaining player
+                    const botOpponent = room.players.some(p => p.isBot);
+                    handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, botOpponent);
+                } else if (room.players.length === 0) {
+                    // If no players left, delete the room
                     console.log(`Deleting empty room ${roomId}`);
                     gameRooms.delete(roomId);
                 } else {
-                    console.log(`Notifying remaining player in room ${roomId}`);
+                    // Notify the remaining player that the other player left
+                    console.log(`Notifying remaining player in room ${roomId} about departure`);
                     io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
                 }
                 break;
@@ -1353,3 +1373,58 @@ async function handleGameOverEmit(room, players, winner, roomId) {
       io.to(roomId).emit('gameError', 'An error occurred while ending the game.');
     }
   }
+
+  async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, betAmount, botOpponent) {
+    try {
+        // Calculate winnings using the appropriate multiplier
+        const multiplier = botOpponent ? 1.5 : 1.8;
+        
+        // Process payout for the remaining player
+        const payoutSignature = await sendWinnings(remainingPlayer.username, betAmount, botOpponent);
+        
+        // Emit game over event with forfeit information
+        io.to(roomId).emit('gameOverForfeit', {
+            winner: remainingPlayer.username,
+            disconnectedPlayer: disconnectedPlayer.username,
+            betAmount: betAmount,
+            payoutSignature,
+            botOpponent,
+            message: `${disconnectedPlayer.username} left the game. ${remainingPlayer.username} wins by forfeit!`
+        });
+        
+        // Update player stats in database
+        try {
+            await User.findOneAndUpdate(
+                { walletAddress: remainingPlayer.username },
+                { 
+                    $inc: { 
+                        wins: 1,
+                        gamesPlayed: 1,
+                        forfeitsWon: 1 // Track this separately if desired
+                    } 
+                }
+            );
+            
+            // Also track the forfeit for the disconnected player
+            await User.findOneAndUpdate(
+                { walletAddress: disconnectedPlayer.username },
+                { 
+                    $inc: { 
+                        losses: 1,
+                        gamesPlayed: 1,
+                        forfeits: 1 // Track forfeits separately
+                    } 
+                }
+            );
+        } catch (error) {
+            console.error('Error updating player stats after forfeit:', error);
+        }
+        
+        // Clean up the room
+        gameRooms.delete(roomId);
+    } catch (error) {
+        console.error('Error processing player left win:', error);
+        io.to(roomId).emit('gameError', 'Error processing win after player left. Please contact support.');
+        gameRooms.delete(roomId);
+    }
+}
