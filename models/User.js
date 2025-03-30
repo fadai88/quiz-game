@@ -48,10 +48,22 @@ const UserSchema = new mongoose.Schema({
         type: Number,
         default: 0
     },
-    totalPoints: {
+    wins: {
         type: Number,
         default: 0
-    }
+    },
+    losses: {
+        type: Number,
+        default: 0
+    },
+    correctAnswers: {
+        type: Number,
+        default: 0
+    },
+    totalWinnings: {
+        type: Number,
+        default: 0
+    },
 }, {
     timestamps: true
 });

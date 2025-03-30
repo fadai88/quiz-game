@@ -549,9 +549,10 @@ io.on('connection', (socket) => {
 
     socket.on('getLeaderboard', async () => {
         try {
-            const leaderboard = await User.find({}, 'username correctAnswers gamesPlayed totalPoints')
-                .sort({ totalPoints: -1 })
-                .limit(10);
+            const leaderboard = await User.find({}, 'walletAddress gamesPlayed totalWinnings')
+                .sort({ totalWinnings: -1 }) // Sort by winnings instead of points
+                .limit(20); // Show more entries
+            
             socket.emit('leaderboardData', leaderboard);
         } catch (error) {
             console.error('Error fetching leaderboard:', error);
@@ -1175,6 +1176,25 @@ async function sendWinnings(winnerAddress, betAmount, botOpponent = false) {
         
         console.log(`Sending winnings: ${winningAmount} USDC to ${winnerAddress} (vs bot: ${botOpponent})`);
         
+        // Add this to update the user's total winnings
+        try {
+            await User.findOneAndUpdate(
+                { walletAddress: winnerAddress },
+                { 
+                    $inc: { 
+                        totalWinnings: winningAmount,
+                        wins: 1,
+                        gamesPlayed: 1
+                    } 
+                },
+                { upsert: false }
+            );
+        } catch (dbError) {
+            console.error('Error updating user winnings:', dbError);
+            // Continue with the payout even if the database update fails
+        }
+        
+        // Rest of the sendWinnings function remains the same
         const treasuryTokenAccount = await findAssociatedTokenAddress(
             config.TREASURY_WALLET,
             config.USDC_MINT
@@ -1378,6 +1398,7 @@ async function handleGameOverEmit(room, players, winner, roomId) {
     try {
         // Calculate winnings using the appropriate multiplier
         const multiplier = botOpponent ? 1.5 : 1.8;
+        const winningAmount = betAmount * multiplier;
         
         // Process payout for the remaining player
         const payoutSignature = await sendWinnings(remainingPlayer.username, betAmount, botOpponent);
@@ -1394,18 +1415,7 @@ async function handleGameOverEmit(room, players, winner, roomId) {
         
         // Update player stats in database
         try {
-            await User.findOneAndUpdate(
-                { walletAddress: remainingPlayer.username },
-                { 
-                    $inc: { 
-                        wins: 1,
-                        gamesPlayed: 1,
-                        forfeitsWon: 1 // Track this separately if desired
-                    } 
-                }
-            );
-            
-            // Also track the forfeit for the disconnected player
+            // For the player who left, just increment gamesPlayed and losses
             await User.findOneAndUpdate(
                 { walletAddress: disconnectedPlayer.username },
                 { 

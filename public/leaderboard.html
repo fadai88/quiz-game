@@ -5,49 +5,202 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Leaderboard - Trivia Game</title>
     <link rel="stylesheet" href="styles.css">
+    <style>
+        #leaderboardTable {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        
+        #leaderboardTable th, #leaderboardTable td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        #leaderboardTable th {
+            background-color: var(--primary-color, #4a90e2);
+            color: white;
+            font-weight: bold;
+        }
+        
+        #leaderboardTable tr:nth-child(even) {
+            background-color: var(--row-alt-bg, #f8f8f8);
+        }
+        
+        #leaderboardTable tr:hover {
+            background-color: var(--row-hover-bg, #f1f1f1);
+        }
+        
+        .truncated-address {
+            font-family: monospace;
+        }
+        
+        .winnings {
+            font-weight: bold;
+            color: var(--success-color, #2e7d32);
+        }
+        
+        .medal {
+            display: inline-block;
+            width: 24px;
+            height: 24px;
+            line-height: 24px;
+            text-align: center;
+            border-radius: 50%;
+            margin-right: 10px;
+            font-weight: bold;
+        }
+        
+        .gold { background-color: #ffd700; color: #5d4037; }
+        .silver { background-color: #c0c0c0; color: #455a64; }
+        .bronze { background-color: #cd7f32; color: #3e2723; }
+        
+        .dark-theme #leaderboardTable th {
+            background-color: #2c3e50;
+        }
+        
+        .dark-theme #leaderboardTable tr:nth-child(even) {
+            background-color: #283747;
+        }
+        
+        .dark-theme #leaderboardTable tr:hover {
+            background-color: #34495e;
+        }
+        
+        .dark-theme .winnings {
+            color: #81c784;
+        }
+        
+        #refreshBtn {
+            margin-bottom: 15px;
+            padding: 8px 16px;
+            background-color: var(--primary-color, #4a90e2);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        
+        #refreshBtn:hover {
+            background-color: var(--primary-color-dark, #3a7bc8);
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255,255,255,.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+            margin-left: 10px;
+            vertical-align: middle;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
 </head>
 <body>
     <header>
-        <h1>Leaderboard</h1>
+        <h1>Brainy Battle Leaderboard</h1>
         <nav>
-            <a href="index.html">Home</a>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="game.html">Play Game</a></li>
+            </ul>
         </nav>
+        <button onclick="toggleTheme()" id="themeToggle">Toggle Theme</button>
     </header>
     <main>
         <div id="leaderboardContainer">
-            <h2>Top Players</h2>
+            <h2>Top Winners</h2>
+            <button id="refreshBtn" onclick="refreshLeaderboard()">Refresh Leaderboard</button>
             <table id="leaderboardTable">
                 <thead>
                     <tr>
                         <th>Rank</th>
-                        <th>Username</th>
-                        <th>Correct Answers</th>
+                        <th>Wallet Address</th>
                         <th>Games Played</th>
-                        <th>Total Points</th>
+                        <th>Total Winnings (USDC)</th>
                     </tr>
                 </thead>
                 <tbody id="leaderboardBody"></tbody>
             </table>
+            <div id="noDataMessage" style="display: none; margin-top: 20px; text-align: center;">
+                No leaderboard data available yet. Be the first to play and win!
+            </div>
         </div>
     </main>
     <script src="/socket.io/socket.io.js"></script>
     <script>
         const socket = io();
         const leaderboardBody = document.getElementById('leaderboardBody');
-
+        const noDataMessage = document.getElementById('noDataMessage');
+        
+        // Function to format wallet address
+        function formatWalletAddress(address) {
+            if (!address) return 'Unknown';
+            if (address.length <= 12) return address;
+            return `${address.slice(0, 6)}...${address.slice(-4)}`;
+        }
+        
         // Fetch leaderboard data on page load
-        socket.emit('getLeaderboard');
-
+        function refreshLeaderboard() {
+            const refreshBtn = document.getElementById('refreshBtn');
+            refreshBtn.disabled = true;
+            refreshBtn.innerHTML = 'Refreshing... <span class="loading"></span>';
+            
+            socket.emit('getLeaderboard');
+            
+            // Re-enable the button after a delay
+            setTimeout(() => {
+                refreshBtn.disabled = false;
+                refreshBtn.innerHTML = 'Refresh Leaderboard';
+            }, 2000);
+        }
+        
+        // Load leaderboard on page load
+        document.addEventListener('DOMContentLoaded', refreshLeaderboard);
+        
         socket.on('leaderboardData', (leaderboard) => {
             leaderboardBody.innerHTML = '';
+            
+            if (leaderboard.length === 0) {
+                noDataMessage.style.display = 'block';
+                leaderboardTable.style.display = 'none';
+                return;
+            }
+            
+            noDataMessage.style.display = 'none';
+            leaderboardTable.style.display = 'table';
+            
             leaderboard.forEach((user, index) => {
                 const row = document.createElement('tr');
+                
+                // Create medal for top 3
+                let rankDisplay = `${index + 1}`;
+                if (index < 3) {
+                    const medalClass = ['gold', 'silver', 'bronze'][index];
+                    rankDisplay = `<span class="medal ${medalClass}">${index + 1}</span>`;
+                }
+                
+                // Format wallet address
+                const formattedAddress = formatWalletAddress(user.walletAddress || user.username);
+                
+                // Format total winnings
+                const winnings = user.totalWinnings || 0;
+                const formattedWinnings = winnings.toFixed(2);
+                
                 row.innerHTML = `
-                    <td>${index + 1}</td>
-                    <td>${user.username}</td>
-                    <td>${user.correctAnswers}</td>
-                    <td>${user.gamesPlayed}</td>
-                    <td>${user.totalPoints}</td>
+                    <td>${rankDisplay}</td>
+                    <td class="truncated-address">${formattedAddress}</td>
+                    <td>${user.gamesPlayed || 0}</td>
+                    <td class="winnings">${formattedWinnings}</td>
                 `;
                 leaderboardBody.appendChild(row);
             });
@@ -55,6 +208,22 @@
 
         socket.on('leaderboardError', (message) => {
             alert(`Error fetching leaderboard: ${message}`);
+            document.getElementById('refreshBtn').disabled = false;
+            document.getElementById('refreshBtn').innerHTML = 'Refresh Leaderboard';
+        });
+        
+        // Theme toggle functionality
+        function toggleTheme() {
+            document.body.classList.toggle('dark-theme');
+            localStorage.setItem('theme', document.body.classList.contains('dark-theme') ? 'dark' : 'light');
+        }
+        
+        // Set theme on load
+        document.addEventListener('DOMContentLoaded', () => {
+            const savedTheme = localStorage.getItem('theme');
+            if (savedTheme === 'dark') {
+                document.body.classList.add('dark-theme');
+            }
         });
     </script>
 </body>
