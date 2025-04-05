@@ -6,8 +6,12 @@
     <title>Trivia Game - Connect Wallet</title>
     <link rel="stylesheet" href="styles.css">
     <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
-    <!-- Add reCAPTCHA v3 -->
-    <script src="https://www.google.com/recaptcha/api.js?render=YOUR_SITE_KEY"></script>
+    <script>
+        window.recaptchaEnabled = true;
+        window.recaptchaSiteKey = "6LeDS1IqAAAAAMx338dPnRkVkj75ggf6Yq4OYu8i";
+        console.log("reCAPTCHA config loaded:", { enabled: window.recaptchaEnabled, siteKey: window.recaptchaSiteKey });
+    </script>
+    <script src="https://www.google.com/recaptcha/api.js?render=6LeDS1IqAAAAAMx338dPnRkVkj75ggf6Yq4OYu8i"></script>
     <style>
         .container {
             max-width: 600px;
@@ -197,9 +201,19 @@
                 // Get reCAPTCHA token if enabled
                 let recaptchaToken = null;
                 if (window.recaptchaEnabled && window.grecaptcha) {
+                    console.log('reCAPTCHA is enabled, attempting to get token');
                     try {
-                        await grecaptcha.ready();
-                        recaptchaToken = await grecaptcha.execute(window.recaptchaSiteKey, {action: 'wallet_connect'});
+                        // Use a promise with the correct callback pattern
+                        recaptchaToken = await new Promise((resolve) => {
+                            grecaptcha.ready(function() {
+                                grecaptcha.execute(window.recaptchaSiteKey, {action: 'wallet_connect'})
+                                    .then(function(token) {
+                                        resolve(token);
+                                    });
+                            });
+                        });
+                        
+                        console.log('Got reCAPTCHA token:', recaptchaToken ? recaptchaToken.substring(0, 10) + '...' : null);
                     } catch (error) {
                         console.error('reCAPTCHA error:', error);
                         showError('Verification service unavailable. Please try again.');

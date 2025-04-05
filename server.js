@@ -276,30 +276,27 @@ io.on('connection', (socket) => {
 
     socket.on('walletLogin', async ({ walletAddress, signature, message, recaptchaToken, clientData }) => {
         try {
-            console.log('Wallet login attempt:', { walletAddress, message });
+            console.log('Wallet login attempt:', { walletAddress, recaptchaToken: !!recaptchaToken });
             
-            // 1. Rate limiting check
+            // Rate limiting check
             if (redisClient) {
-                const clientIP = connectionData.ip;
+                const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                 const loginLimitKey = `login:${clientIP}`;
-                try {
-                    const loginAttempts = await redisClient.get(loginLimitKey) || 0;
-                            // DECREASE THE THRESHOLD WHEN THE GAME IS LIVE!!!
-                    if (loginAttempts > 100) {
-                        console.warn(`Rate limit exceeded for IP ${clientIP}`);
-                        return socket.emit('loginFailure', 'Too many login attempts. Please try again later.');
-                    }
-                    
-                    await redisClient.set(loginLimitKey, parseInt(loginAttempts) + 1, 'EX', 3600);
-                } catch (error) {
-                    console.error('Redis rate limiting error:', error);
+                const loginAttempts = await redisClient.get(loginLimitKey) || 0;
+                
+                if (loginAttempts > 100) {
+                    console.warn(`Rate limit exceeded for IP ${clientIP}`);
+                    return socket.emit('loginFailure', 'Too many login attempts. Please try again later.');
                 }
+                await redisClient.set(loginLimitKey, parseInt(loginAttempts) + 1, 'EX', 3600);
             }
             
-            // 2. reCAPTCHA verification (if enabled)
+            // reCAPTCHA verification
             if (process.env.ENABLE_RECAPTCHA && recaptchaToken) {
+                console.log('reCAPTCHA enabled, attempting verification');
                 try {
                     const recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                    console.log('reCAPTCHA verification result:', recaptchaResult);
                     if (!recaptchaResult.success) {
                         console.warn(`reCAPTCHA verification failed for wallet ${walletAddress}`);
                         return socket.emit('loginFailure', 'Verification failed. Please try again.');
@@ -308,8 +305,15 @@ io.on('connection', (socket) => {
                     console.error('reCAPTCHA verification error:', error);
                     return socket.emit('loginFailure', 'Verification service unavailable. Please try again later.');
                 }
+            } else {
+                console.log('reCAPTCHA disabled or token missing', { 
+                    enabled: process.env.ENABLE_RECAPTCHA === 'true', 
+                    tokenProvided: !!recaptchaToken 
+                });
             }
             
+            // Continue with rest of login process...
+
             // 3. Signature verification
             try {
                 const publicKey = new PublicKey(walletAddress);
@@ -637,14 +641,19 @@ app.get('/login.html', (req, res) => {
     const recaptchaEnabled = process.env.ENABLE_RECAPTCHA === 'true';
     const recaptchaSiteKey = process.env.RECAPTCHA_SITE_KEY || '';
     
-    // Replace both the site key and add the enabled flag
+    // Replace the site key placeholder
     loginHtml = loginHtml.replace('YOUR_SITE_KEY', recaptchaSiteKey);
-    loginHtml = loginHtml.replace(
-        '<script>',
-        `<script>
-        window.recaptchaEnabled = ${recaptchaEnabled};
-        window.recaptchaSiteKey = "${recaptchaSiteKey}";`
-    );
+    
+    // Add a custom script tag with the reCAPTCHA configuration
+    const recaptchaConfigScript = `<script>
+    // reCAPTCHA configuration 
+    window.recaptchaEnabled = ${recaptchaEnabled};
+    window.recaptchaSiteKey = "${recaptchaSiteKey}";
+    console.log("reCAPTCHA config loaded:", { enabled: window.recaptchaEnabled, siteKey: window.recaptchaSiteKey });
+    </script>`;
+    
+    // Insert the script right before the closing </head> tag
+    loginHtml = loginHtml.replace('</head>', `${recaptchaConfigScript}\n</head>`);
     
     // Send the modified HTML
     res.send(loginHtml);
