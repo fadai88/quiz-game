@@ -688,9 +688,28 @@
             waitingMessage.textContent = '';
         }
 
-        
+        function resetUIAfterError() {
+            resetJoinUI();
+            
+            // Clear the waiting message
+            waitingMessage.textContent = '';
+            
+            // Make sure the game choice modal is closed
+            const modal = document.getElementById('gameChoiceModal');
+            if (modal.style.display === 'flex') {
+                modal.style.display = 'none';
+            }
+            
+            // Clear any pending timeouts
+            if (waitingTimeout) {
+                clearTimeout(waitingTimeout);
+            }
+            
+            // Reset the room ID
+            currentRoomId = null;
+        }
 
-        // Update the USDC payment section in the joinGameBtn event listener
+        
         joinGameBtn.addEventListener('click', async () => {
             try {
                 if (!connectedWallet || !window.solana?.isConnected) {
@@ -707,6 +726,13 @@
                 const balanceResult = await usdcManager.getUSDCBalance(connectedWallet);
                 console.log('Current USDC balance:', balanceResult.balance);
 
+                // Ensure player has enough balance
+                if (balanceResult.balance < betAmount) {
+                    resetJoinUI();
+                    alert(`Not enough USDC. You have ${balanceResult.balance} but need ${betAmount}`);
+                    return;
+                }
+
                 console.log('Creating transfer transaction...');
                 const transaction = await usdcManager.createTransferTransaction(connectedWallet, betAmount);
                 
@@ -717,6 +743,8 @@
                 const txSignature = await connection.sendRawTransaction(signed.serialize());
                 
                 console.log('Waiting for transaction confirmation...');
+                waitingMessage.textContent = 'Waiting for transaction confirmation...';
+                
                 // Wait for confirmation with specific commitment
                 const confirmation = await connection.confirmTransaction({
                     signature: txSignature,
@@ -732,20 +760,18 @@
                 await new Promise(resolve => setTimeout(resolve, 2000));
 
                 console.log('Transaction confirmed:', txSignature);
+                waitingMessage.textContent = 'Transaction confirmed. Joining game...';
 
                 // Join game with confirmed transaction
                 socket.emit('joinGame', {
                     walletAddress: connectedWallet,
                     betAmount,
-                    transactionSignature: txSignature,
-                    preferBot: false // Initial value, will be changed based on user selection
+                    transactionSignature: txSignature
                 });
 
                 joinGameBtn.style.display = 'none';
-                showGameChoiceModal();
-
-                joinGameBtn.style.display = 'none';
-                waitingMessage.textContent = 'Waiting for another player...';
+                
+                // Wait for server to respond with 'gameJoined' event - the modal will be shown there
 
             } catch (error) {
                 console.error('Join game error:', error);
@@ -815,10 +841,8 @@
             currentRoomId = roomId;
             console.log(`Joined room ${roomId}`);
             
-            // Don't show waiting message yet, the modal will handle it
-            if (!document.getElementById('gameChoiceModal').style.display === 'flex') {
-                showGameChoiceModal();
-            }
+            // Always show the game choice modal when joining a room
+            showGameChoiceModal();
         });
 
         socket.on('botGameReady', (data) => {
@@ -1031,6 +1055,12 @@
             }, 3000);
         });
 
+        socket.on('gameError', (errorMessage) => {
+            console.error('Game error:', errorMessage);
+            alert(`Game error: ${errorMessage}`);
+            resetUIAfterError();
+        });
+
         const forfeitStyles = document.createElement('style');
         forfeitStyles.textContent = `
             .loading-spinner {
@@ -1193,20 +1223,26 @@
         }
 
         function showGameChoiceModal() {
+            console.log('Showing game choice modal');
             const modal = document.getElementById('gameChoiceModal');
             modal.style.display = 'flex';
             
             document.getElementById('waitForPlayerBtn').onclick = function() {
+                console.log('Player chose to play against human');
                 waitingForPlayer = true;
                 modal.style.display = 'none';
-                waitingMessage.textContent = 'Waiting for game to start...';
+                waitingMessage.textContent = 'Waiting for another player...';
                 
-                // Signal to the server that this player is ready
+                // Signal to the server that this player is ready for human opponent
                 if (currentRoomId) {
-                    socket.emit('playerReady', { roomId: currentRoomId });
+                    socket.emit('playerReady', { roomId: currentRoomId, preferredMode: 'human' });
                 }
                 
                 // Set a timeout to switch to bot mode if no player joins
+                if (waitingTimeout) {
+                    clearTimeout(waitingTimeout);
+                }
+                
                 waitingTimeout = setTimeout(() => {
                     if (waitingForPlayer && currentRoomId) {
                         waitingMessage.textContent = 'No players found. Would you like to play against a bot instead?';
@@ -1234,24 +1270,48 @@
             };
             
             document.getElementById('playAgainstBotBtn').onclick = function() {
-                switchToBotMode();
+                console.log('Player chose to play against bot');
+                
+                // Instead of using the current room, create a new bot-specific room
+                // Leave the current room first
+                if (currentRoomId) {
+                    socket.emit('leaveRoom', { roomId: currentRoomId });
+                }
+                
+                // Request a bot-specific room from the server
+                const betAmount = parseInt(document.getElementById('betAmount').value) || 3;
+                socket.emit('requestBotRoom', { 
+                    walletAddress: connectedWallet,
+                    betAmount: betAmount
+                });
+                
+                modal.style.display = 'none';
+                waitingMessage.textContent = 'Creating a game with a bot opponent...';
             };
         }
 
         function switchToBotMode() {
+            console.log('Switching to bot mode');
             waitingForPlayer = false;
             if (waitingTimeout) {
                 clearTimeout(waitingTimeout);
             }
             
             const modal = document.getElementById('gameChoiceModal');
-            modal.style.display = 'none';
+            if (modal.style.display === 'flex') {
+                modal.style.display = 'none';
+            }
             
             waitingMessage.textContent = 'Starting game against bot...';
             
-            // Send message to server to start bot game
+            // Send message to server to start bot game in the current room
             if (currentRoomId) {
+                console.log('Requesting bot for room:', currentRoomId);
                 socket.emit('requestBotGame', { roomId: currentRoomId });
+            } else {
+                console.error('No room ID available when trying to switch to bot mode');
+                waitingMessage.textContent = 'Error starting bot game. Please try again.';
+                resetJoinUI();
             }
         }
 
@@ -1284,6 +1344,28 @@
         const notification = document.getElementById('notification');
 
         socket.on('playerJoined', (username) => {
+            console.log(`Player ${username} joined the game`);
+            
+            // Clear any waiting timeout
+            if (waitingTimeout) {
+                clearTimeout(waitingTimeout);
+            }
+            
+            // Make sure game choice modal is closed
+            const modal = document.getElementById('gameChoiceModal');
+            if (modal.style.display === 'flex') {
+                modal.style.display = 'none';
+            }
+            
+            waitingMessage.textContent = `${username} joined. Game is starting...`;
+            
+            // Play sound if available
+            const joinSound = document.getElementById('joinSound');
+            if (joinSound) {
+                joinSound.play();
+            }
+            
+            // Show notification
             notification.textContent = `${username} has joined the lobby!`;
             notification.style.display = 'block';
             joinSound.play();
@@ -1291,6 +1373,7 @@
                 notification.style.display = 'none';
             }, 3000);
         });
+
 
         questionDiv.addEventListener('contextmenu', (event) => {
             event.preventDefault();
@@ -1333,6 +1416,44 @@
                         `${username} ran out of time!` : 
                         `${username} has submitted their answer`;
                 }
+            }
+        });
+
+        socket.on('botRoomCreated', (roomId) => {
+            console.log(`Bot room created: ${roomId}`);
+            currentRoomId = roomId;
+            
+            // Now request the bot game in this dedicated room
+            switchToBotMode();
+        });
+
+        socket.on('leftRoom', (data) => {
+            console.log(`Left room ${data.roomId}`);
+            // Reset the current room ID if it matches the one we left
+            if (currentRoomId === data.roomId) {
+                currentRoomId = null;
+            }
+        });
+
+        socket.on('matchFound', ({ newRoomId }) => {
+            console.log(`Match found! Moved to room ${newRoomId}`);
+            
+            // Update our current room ID
+            currentRoomId = newRoomId;
+            
+            // Update the UI
+            waitingMessage.textContent = 'Match found! Game is starting...';
+            
+            // Close the game choice modal if it's open
+            const modal = document.getElementById('gameChoiceModal');
+            if (modal.style.display === 'flex') {
+                modal.style.display = 'none';
+            }
+            
+            // Clear any waiting timeout
+            if (waitingTimeout) {
+                clearTimeout(waitingTimeout);
+                waitingTimeout = null;
             }
         });
 

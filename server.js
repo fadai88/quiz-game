@@ -395,21 +395,29 @@ io.on('connection', (socket) => {
             const { walletAddress, betAmount, transactionSignature } = data;
             console.log('Join game request:', { walletAddress, betAmount, transactionSignature });
     
-            // Transaction verification code remains the same...
+            // Transaction verification code would go here
+            // (Keeping existing verification logic unchanged)
     
             // Create or join game room
             let roomId;
             let joinedExistingRoom = false;
     
             // Look for an existing room with same bet amount
+            // (Keeping the same room matching logic, but we'll handle game mode selection later)
             for (const [id, room] of gameRooms.entries()) {
-                // Skip rooms that have explicitly chosen a bot opponent
-                if (room.roomMode === 'bot') {
-                    console.log(`Skipping room ${id} because it has requested a bot opponent`);
+                // Skip rooms that are in bot mode or already have a game in progress
+                if (room.roomMode === 'bot' || room.gameStarted || room.players.some(p => p.isBot)) {
+                    console.log(`Skipping room ${id} because it's in bot mode or game already started`);
                     continue;
                 }
                 
-                if (room.players.length < 2 && room.betAmount === betAmount) {
+                // Skip rooms that already have 2 or more players
+                if (room.players.length >= 2) {
+                    console.log(`Skipping room ${id} because it already has ${room.players.length} players`);
+                    continue;
+                }
+                
+                if (room.betAmount === betAmount) {
                     roomId = id;
                     joinedExistingRoom = true;
                     break;
@@ -418,6 +426,7 @@ io.on('connection', (socket) => {
     
             if (!roomId) {
                 roomId = generateRoomId();
+                console.log(`Creating new room ${roomId} for player ${walletAddress}`);
                 gameRooms.set(roomId, {
                     players: [],
                     questions: [],
@@ -426,11 +435,22 @@ io.on('connection', (socket) => {
                     betAmount: betAmount,
                     waitingTimeout: null,
                     gameStarted: false,
-                    roomMode: 'waiting' // Default mode: waiting for another player
+                    roomMode: 'waiting' // Default mode: waiting for player to choose
                 });
+            } else {
+                console.log(`Joining existing room ${roomId} with bet amount ${betAmount}`);
             }
     
             const room = gameRooms.get(roomId);
+            
+            // Check if this wallet is already in the room
+            const existingPlayer = room.players.find(p => p.username === walletAddress);
+            if (existingPlayer) {
+                console.log(`Player ${walletAddress} is already in room ${roomId}`);
+                socket.emit('joinGameFailure', 'You are already in this game');
+                return;
+            }
+            
             room.players.push({
                 id: socket.id,
                 username: walletAddress,
@@ -439,12 +459,17 @@ io.on('connection', (socket) => {
             });
     
             socket.join(roomId);
+            console.log(`Player ${walletAddress} joined room ${roomId}`);
             socket.emit('gameJoined', roomId);
     
-            // Notify the first player that a second player has joined
+            // Notify existing players if joining an existing room
             if (joinedExistingRoom) {
+                console.log(`Notifying existing players in room ${roomId} about new player ${walletAddress}`);
                 socket.to(roomId).emit('playerJoined', walletAddress);
             }
+    
+            console.log('Game rooms state AFTER joining:');
+            logGameRoomsState();
     
         } catch (error) {
             console.error('Join game error:', error);
@@ -452,33 +477,180 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('playerReady', ({ roomId }) => {
-        console.log(`Player ${socket.id} ready in room ${roomId}`);
+    socket.on('playerReady', ({ roomId, preferredMode }) => {
+        console.log(`Player ${socket.id} ready in room ${roomId}, preferred mode: ${preferredMode || 'not specified'}`);
         const room = gameRooms.get(roomId);
         
         if (!room) {
+            console.error(`Room ${roomId} not found when player ${socket.id} marked ready`);
             return socket.emit('gameError', 'Room not found');
         }
         
-        // If this room is explicitly set for bot play, don't allow starting with two human players
+        // If this room is explicitly set for bot play, don't allow starting with human players
         if (room.roomMode === 'bot') {
             console.log(`Room ${roomId} is set for bot play, not starting regular game`);
             return;
         }
         
-        // Only start the game if there are 2 players and game hasn't started yet
+        // Set preferred game mode if specified
+        if (preferredMode === 'human') {
+            room.roomMode = 'human';
+            console.log(`Room ${roomId} marked for human vs human play`);
+            
+            // First check if we should try to find a match in another room
+            if (room.players.length === 1) {
+                // Try to find another player waiting for human opponent
+                let matchFound = false;
+                
+                for (const [otherRoomId, otherRoom] of gameRooms.entries()) {
+                    // Skip current room and invalid matches
+                    if (otherRoomId === roomId || 
+                        otherRoom.roomMode !== 'human' || 
+                        otherRoom.gameStarted || 
+                        otherRoom.betAmount !== room.betAmount ||
+                        otherRoom.players.length !== 1) {
+                        continue;
+                    }
+                    
+                    // Found a match! Move the current player to the other room
+                    console.log(`Found matching room ${otherRoomId} for player in room ${roomId}`);
+                    
+                    const player = room.players[0]; // The current player
+                    
+                    // Add player to the match room
+                    otherRoom.players.push(player);
+                    socket.leave(roomId);
+                    socket.join(otherRoomId);
+                    
+                    // Notify both players
+                    socket.emit('matchFound', { newRoomId: otherRoomId });
+                    io.to(otherRoomId).emit('playerJoined', player.username);
+                    
+                    // Start the game
+                    otherRoom.gameStarted = true;
+                    startGame(otherRoomId);
+                    
+                    // Delete the original room since it's now empty
+                    gameRooms.delete(roomId);
+                    
+                    matchFound = true;
+                    break;
+                }
+                
+                if (!matchFound) {
+                    console.log(`No match found for player in room ${roomId}, waiting for others`);
+                }
+            }
+        }
+        
+        // Handle the case where there are already 2 players in the room
         if (room.players.length === 2 && !room.gameStarted) {
+            console.log(`Starting multiplayer game in room ${roomId} with 2 players`);
             room.gameStarted = true;
             room.roomMode = 'multiplayer'; // Explicitly mark as multiplayer mode
             startGame(roomId);
+        } else {
+            console.log(`Room ${roomId} has ${room.players.length} players, waiting for more to join`);
         }
+        
+        // Log room state
+        console.log('Current room state:');
+        logGameRoomsState();
+    });
+    
+    // Add socket handler for match found
+    socket.on('matchFound', ({ newRoomId }) => {
+        console.log(`Match found, player ${socket.id} moved to room ${newRoomId}`);
+        currentRoomId = newRoomId;
+        // Additional handling if needed
+    });
+
+    socket.on('leaveRoom', ({ roomId }) => {
+        console.log(`Player ${socket.id} requested to leave room ${roomId}`);
+        
+        const room = gameRooms.get(roomId);
+        if (!room) {
+            console.log(`Room ${roomId} not found when player tried to leave`);
+            socket.emit('leftRoom', { roomId });
+            return;
+        }
+        
+        // If the game has already started, handle as a disconnect/forfeit
+        if (room.gameStarted) {
+            console.log(`Game already started in room ${roomId}, handling as disconnect`);
+            // The existing disconnect handler will take care of this
+            return;
+        }
+        
+        // Remove the player from the room
+        const playerIndex = room.players.findIndex(p => p.id === socket.id);
+        if (playerIndex !== -1) {
+            const player = room.players[playerIndex];
+            console.log(`Removing player ${player.username} from room ${roomId}`);
+            room.players.splice(playerIndex, 1);
+            
+            // Leave the socket.io room
+            socket.leave(roomId);
+            
+            // If the room is now empty, delete it
+            if (room.players.length === 0) {
+                console.log(`Room ${roomId} is now empty, deleting it`);
+                gameRooms.delete(roomId);
+            } else {
+                // Notify remaining players
+                console.log(`Notifying remaining players in room ${roomId}`);
+                io.to(roomId).emit('playerLeft', player.username);
+            }
+        }
+        
+        // Confirm to the client they've left
+        socket.emit('leftRoom', { roomId });
+    });
+    
+    socket.on('requestBotRoom', async ({ walletAddress, betAmount }) => {
+        console.log(`Player ${walletAddress} requesting dedicated bot room with bet ${betAmount}`);
+        
+        // Create a new room specifically for this player and a bot
+        const roomId = generateRoomId();
+        console.log(`Creating new bot room ${roomId} for ${walletAddress}`);
+        
+        gameRooms.set(roomId, {
+            players: [{
+                id: socket.id,
+                username: walletAddress,
+                score: 0,
+                totalResponseTime: 0
+            }],
+            questions: [],
+            currentQuestionIndex: 0,
+            answersReceived: 0,
+            betAmount: betAmount,
+            waitingTimeout: null,
+            gameStarted: false,
+            roomMode: 'bot' // Mark as bot mode from the start
+        });
+        
+        // Join the socket to this room
+        socket.join(roomId);
+        
+        // Notify the client
+        socket.emit('botRoomCreated', roomId);
+        
+        // Log the state
+        logGameRoomsState();
     });
 
     socket.on('requestBotGame', async ({ roomId }) => {
         console.log(`Bot game requested for room ${roomId}`);
+        
+        // Log game rooms state before bot request
+        console.log('Game rooms state BEFORE bot request:');
+        logGameRoomsState();
+        
         const room = gameRooms.get(roomId);
         
         if (!room) {
+            console.error(`Room ${roomId} not found when requesting bot game`);
             socket.emit('gameError', 'Room not found');
             return;
         }
@@ -488,11 +660,34 @@ io.on('connection', (socket) => {
             clearTimeout(room.waitingTimeout);
         }
         
+        // Check if room already has multiple human players
+        const humanPlayers = room.players.filter(p => !p.isBot);
+        
+        if (humanPlayers.length > 1) {
+            // This shouldn't happen - room should only have the requesting player
+            console.error(`Room ${roomId} already has ${humanPlayers.length} human players, can't add bot`);
+            socket.emit('gameError', 'Cannot add bot to a room with multiple players');
+            return;
+        }
+        
+        // Check if this player is actually in this room
+        const playerInRoom = room.players.find(p => p.id === socket.id);
+        if (!playerInRoom) {
+            console.error(`Player ${socket.id} not found in room ${roomId}`);
+            socket.emit('gameError', 'You are not in this room');
+            return;
+        }
+        
+        console.log(`Setting room ${roomId} to bot mode`);
         // Set room mode to bot - this explicitly marks the room for bot play
         room.roomMode = 'bot';
         
         // Start single player game with bot
         await startSinglePlayerGame(roomId);
+        
+        // Log game rooms state after bot request
+        console.log('Game rooms state AFTER bot request:');
+        logGameRoomsState();
     });
 
     socket.on('submitAnswer', async ({ roomId, answer, responseTime, username }) => {
@@ -1090,13 +1285,30 @@ async function startSinglePlayerGame(roomId) {
         // Get questions
         room.questions = await Quiz.aggregate([{ $sample: { size: 7 } }]);
         
-        // Make sure there's a human player to play against the bot
-        if (room.players.length === 0) {
-            console.log(`Room ${roomId} has no human players for the bot to play against`);
+        // Count human players
+        const humanPlayers = room.players.filter(p => !p.isBot);
+        
+        // Make sure there's exactly one human player to play against the bot
+        if (humanPlayers.length !== 1) {
+            console.log(`Room ${roomId} has ${humanPlayers.length} human players, expected exactly 1`);
+            if (humanPlayers.length === 0) {
+                // No players, delete the room
+                gameRooms.delete(roomId);
+            } else {
+                // Multiple human players, switch to multiplayer mode
+                room.roomMode = 'multiplayer';
+                io.to(roomId).emit('gameStart', { 
+                    players: room.players,
+                    questionCount: room.questions.length,
+                    singlePlayerMode: false
+                });
+                room.gameStarted = true;
+                startNextQuestion(roomId);
+            }
             return;
         }
         
-        const humanPlayer = room.players[0];
+        const humanPlayer = humanPlayers[0];
         console.log('Human player:', humanPlayer.username);
         
         // Check if there's already a bot (shouldn't happen, but just in case)
@@ -1446,4 +1658,25 @@ async function handleGameOverEmit(room, players, winner, roomId) {
         io.to(roomId).emit('gameError', 'Error processing win after player left. Please contact support.');
         gameRooms.delete(roomId);
     }
+}
+
+function logGameRoomsState() {
+    console.log('Current game rooms state:');
+    console.log(`Total rooms: ${gameRooms.size}`);
+    
+    gameRooms.forEach((room, roomId) => {
+        console.log(`Room ID: ${roomId}`);
+        console.log(`  Mode: ${room.roomMode}`);
+        console.log(`  Game started: ${room.gameStarted}`);
+        console.log(`  Bet amount: ${room.betAmount}`);
+        console.log(`  Players (${room.players.length}):`);
+        
+        room.players.forEach(player => {
+            console.log(`    - ${player.username}${player.isBot ? ' (BOT)' : ''}`);
+        });
+        
+        console.log(`  Questions: ${room.questions?.length || 0}`);
+        console.log(`  Current question index: ${room.currentQuestionIndex}`);
+        console.log('-------------------');
+    });
 }
