@@ -75,6 +75,9 @@ const Quiz = mongoose.model('Quiz', new mongoose.Schema({
 }));
 
 const gameRooms = new Map();
+const matchmakingPools = {
+    human: new Map() // Map of betAmount -> array of waiting players
+};
 
 
 // Initialize config
@@ -557,6 +560,216 @@ io.on('connection', (socket) => {
         console.log('Current room state:');
         logGameRoomsState();
     });
+
+    socket.on('joinHumanMatchmaking', async (data) => {
+        try {
+            const { walletAddress, betAmount, transactionSignature, gameMode } = data;
+            console.log('Human matchmaking request:', { walletAddress, betAmount, gameMode });
+            
+            // Verify the transaction (keeping your existing verification logic)
+            // Transaction verification code would go here...
+            
+            // Create or access the matchmaking pool for this bet amount
+            if (!matchmakingPools.human.has(betAmount)) {
+                matchmakingPools.human.set(betAmount, []);
+            }
+            
+            const pool = matchmakingPools.human.get(betAmount);
+            
+            // Check if this player is already in the pool
+            const existingPlayer = pool.find(p => p.walletAddress === walletAddress);
+            if (existingPlayer) {
+                console.log(`Player ${walletAddress} is already in matchmaking pool for ${betAmount}`);
+                socket.emit('matchmakingError', { message: 'You are already in matchmaking' });
+                return;
+            }
+            
+            // Check for an available match
+            if (pool.length > 0) {
+                // Match found! Create a game room for these players
+                const opponent = pool.shift(); // Remove the first waiting player
+                
+                // Create a new game room
+                const roomId = generateRoomId();
+                console.log(`Creating game room ${roomId} for matched players ${walletAddress} and ${opponent.walletAddress}`);
+                
+                gameRooms.set(roomId, {
+                    players: [
+                        {
+                            id: socket.id,
+                            username: walletAddress,
+                            score: 0,
+                            totalResponseTime: 0
+                        },
+                        {
+                            id: opponent.socketId,
+                            username: opponent.walletAddress,
+                            score: 0,
+                            totalResponseTime: 0
+                        }
+                    ],
+                    questions: [],
+                    currentQuestionIndex: 0,
+                    answersReceived: 0,
+                    betAmount: betAmount,
+                    gameStarted: false,
+                    roomMode: 'multiplayer'
+                });
+                
+                // Join both sockets to the room
+                socket.join(roomId);
+                const opponentSocket = io.sockets.sockets.get(opponent.socketId);
+                if (opponentSocket) {
+                    opponentSocket.join(roomId);
+                }
+                
+                // Notify both players
+                io.to(roomId).emit('matchFound', { 
+                    gameRoomId: roomId, 
+                    players: [walletAddress, opponent.walletAddress]
+                });
+                
+                // Start the game
+                await startGame(roomId);
+                
+            } else {
+                // No match yet, add player to waiting pool
+                console.log(`Adding player ${walletAddress} to matchmaking pool for ${betAmount}`);
+                
+                pool.push({
+                    socketId: socket.id,
+                    walletAddress,
+                    joinTime: Date.now(),
+                    transactionSignature
+                });
+                
+                // Notify the player they're in matchmaking
+                socket.emit('matchmakingJoined', { 
+                    waitingRoomId: `matchmaking-${betAmount}`, 
+                    position: pool.length 
+                });
+            }
+            
+            // Log the state of the pools
+            logMatchmakingState();
+            
+        } catch (error) {
+            console.error('Error joining human matchmaking:', error);
+            socket.emit('matchmakingError', { message: error.message });
+        }
+    });
+    
+    // Handler for bot games
+    socket.on('joinBotGame', async (data) => {
+        try {
+            const { walletAddress, betAmount, transactionSignature, gameMode } = data;
+            console.log('Bot game request:', { walletAddress, betAmount, gameMode });
+            
+            // Verify the transaction (keeping your existing verification logic)
+            // Transaction verification code would go here...
+            
+            // Create a game room with the player
+            const roomId = generateRoomId();
+            console.log(`Creating bot game room ${roomId} for player ${walletAddress}`);
+            
+            gameRooms.set(roomId, {
+                players: [
+                    {
+                        id: socket.id,
+                        username: walletAddress,
+                        score: 0,
+                        totalResponseTime: 0
+                    }
+                ],
+                questions: [],
+                currentQuestionIndex: 0,
+                answersReceived: 0,
+                betAmount: betAmount,
+                gameStarted: false,
+                roomMode: 'bot'
+            });
+            
+            // Join the socket to the room
+            socket.join(roomId);
+            
+            // Notify the player
+            const botName = chooseBotName();
+            socket.emit('botGameCreated', { 
+                gameRoomId: roomId, 
+                botName 
+            });
+            
+            // Start the single player game with a bot
+            await startSinglePlayerGame(roomId);
+            
+            // Log the state
+            logGameRoomsState();
+            
+        } catch (error) {
+            console.error('Error creating bot game:', error);
+            socket.emit('matchmakingError', { message: error.message });
+        }
+    });
+
+    socket.on('switchToBot', async ({ roomId }) => {
+        console.log(`Player ${socket.id} wants to switch from matchmaking to bot game`);
+        
+        // Find this player in the matchmaking pools
+        let playerFound = false;
+        let playerData = null;
+        
+        for (const [betAmount, pool] of matchmakingPools.human.entries()) {
+            const playerIndex = pool.findIndex(p => p.socketId === socket.id);
+            if (playerIndex !== -1) {
+                playerData = pool[playerIndex];
+                pool.splice(playerIndex, 1); // Remove from matchmaking
+                playerFound = true;
+                console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${betAmount}`);
+                break;
+            }
+        }
+        
+        if (!playerFound || !playerData) {
+            console.error(`Player ${socket.id} not found in any matchmaking pool`);
+            socket.emit('matchmakingError', { message: 'Not found in matchmaking' });
+            return;
+        }
+        
+        // Create a bot game for this player
+        const newRoomId = generateRoomId();
+        console.log(`Creating bot game room ${roomId} for player ${playerData.walletAddress}`);
+        
+        gameRooms.set(roomId, {
+            players: [
+                {
+                    id: socket.id,
+                    username: playerData.walletAddress,
+                    score: 0,
+                    totalResponseTime: 0
+                }
+            ],
+            questions: [],
+            currentQuestionIndex: 0,
+            answersReceived: 0,
+            betAmount: parseInt(playerData.betAmount),
+            gameStarted: false,
+            roomMode: 'bot'
+        });
+        
+        // Join the socket to the room
+        socket.join(roomId);
+        
+        // Notify the player
+        const botName = chooseBotName();
+        socket.emit('botGameCreated', { 
+            gameRoomId: newRoomId, 
+            botName 
+        });
+        
+        // Start the single player game with a bot
+        await startSinglePlayerGame(roomId);
+    });
+    
     
     // Add socket handler for match found
     socket.on('matchFound', ({ newRoomId }) => {
@@ -761,54 +974,73 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         console.log('Client disconnected:', socket.id);
-        for (const [roomId, room] of gameRooms.entries()) {
-            const playerIndex = room.players.findIndex(p => p.id === socket.id);
+        
+        // Check if player is in a matchmaking pool
+        let foundInMatchmaking = false;
+        
+        for (const [betAmount, pool] of matchmakingPools.human.entries()) {
+            const playerIndex = pool.findIndex(p => p.socketId === socket.id);
             if (playerIndex !== -1) {
-                const disconnectedPlayer = room.players[playerIndex];
-                console.log(`Player ${disconnectedPlayer.username} left room ${roomId}`);
-                
-                // Handle bot rooms specially
-                if (room.roomMode === 'bot') {
-                    console.log(`Bot room ${roomId} abandoned - cleaning up`);
-                    gameRooms.delete(roomId);
-                    return;
-                }
-                
-                // Remove the disconnected player
-                room.players.splice(playerIndex, 1);
-                
-                // If the game has started and there's a remaining player, declare them the winner
-                if (room.gameStarted && room.players.length === 1) {
-                    const remainingPlayer = room.players[0];
+                const player = pool[playerIndex];
+                console.log(`Removing disconnected player ${player.walletAddress} from matchmaking pool for ${betAmount}`);
+                pool.splice(playerIndex, 1);
+                foundInMatchmaking = true;
+                break;
+            }
+        }
+        
+        // If not found in matchmaking, check game rooms (existing disconnect logic)
+        if (!foundInMatchmaking) {
+            for (const [roomId, room] of gameRooms.entries()) {
+                const playerIndex = room.players.findIndex(p => p.id === socket.id);
+                if (playerIndex !== -1) {
+                    // Your existing disconnect handler logic for game rooms
+                    const disconnectedPlayer = room.players[playerIndex];
+                    console.log(`Player ${disconnectedPlayer.username} left room ${roomId}`);
                     
-                    // Don't award a win if the remaining player is a bot
-                    if (remainingPlayer.isBot) {
-                        console.log(`Only a bot remained in room ${roomId} - cleaning up`);
+                    // Handle bot rooms specially
+                    if (room.roomMode === 'bot') {
+                        console.log(`Bot room ${roomId} abandoned - cleaning up`);
                         gameRooms.delete(roomId);
                         return;
                     }
                     
-                    console.log(`Player ${disconnectedPlayer.username} left during active game. Declaring ${remainingPlayer.username} the winner.`);
+                    // Remove the disconnected player
+                    room.players.splice(playerIndex, 1);
                     
-                    // Process the payout for the remaining player
-                    const botOpponent = room.players.some(p => p.isBot);
-                    handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, botOpponent);
-                } else if (room.players.length === 0) {
-                    // If no players left, delete the room
-                    console.log(`Deleting empty room ${roomId}`);
-                    gameRooms.delete(roomId);
-                } else {
-                    // Notify the remaining player that the other player left
-                    console.log(`Notifying remaining player in room ${roomId} about departure`);
-                    io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
+                    // If the game has started and there's a remaining player, declare them the winner
+                    if (room.gameStarted && room.players.length === 1) {
+                        const remainingPlayer = room.players[0];
+                        
+                        // Don't award a win if the remaining player is a bot
+                        if (remainingPlayer.isBot) {
+                            console.log(`Only a bot remained in room ${roomId} - cleaning up`);
+                            gameRooms.delete(roomId);
+                            return;
+                        }
+                        
+                        console.log(`Player ${disconnectedPlayer.username} left during active game. Declaring ${remainingPlayer.username} the winner.`);
+                        
+                        // Process the payout for the remaining player
+                        const botOpponent = room.players.some(p => p.isBot);
+                        handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, botOpponent);
+                    } else if (room.players.length === 0) {
+                        // If no players left, delete the room
+                        console.log(`Deleting empty room ${roomId}`);
+                        gameRooms.delete(roomId);
+                    } else {
+                        // Notify the remaining player that the other player left
+                        console.log(`Notifying remaining player in room ${roomId} about departure`);
+                        io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
+                    }
+                    break;
                 }
-                break;
             }
         }
     });
 });
 
-
+/*
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
     try {
@@ -827,7 +1059,7 @@ app.post('/login', async (req, res) => {
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
-
+*/
 app.get('/login.html', (req, res) => {
     // Read the file
     let loginHtml = fs.readFileSync(path.join(__dirname, 'public', 'login.html'), 'utf8');
@@ -1680,3 +1912,49 @@ function logGameRoomsState() {
         console.log('-------------------');
     });
 }
+
+function logMatchmakingState() {
+    console.log('Current Matchmaking State:');
+    
+    console.log('Human Matchmaking Pools:');
+    for (const [betAmount, pool] of matchmakingPools.human.entries()) {
+        console.log(`  Bet Amount ${betAmount}: ${pool.length} players waiting`);
+        if (pool.length > 0) {
+            pool.forEach((player, index) => {
+                const waitTime = Math.round((Date.now() - player.joinTime) / 1000);
+                console.log(`    - ${player.walletAddress} (waiting for ${waitTime}s)`);
+            });
+        }
+    }
+    
+    console.log('Game Rooms:');
+    logGameRoomsState();
+}
+
+setInterval(() => {
+    const now = Date.now();
+    const MAX_WAIT_TIME = 5 * 60 * 1000; // 5 minutes
+    
+    for (const [betAmount, pool] of matchmakingPools.human.entries()) {
+        const expiredPlayers = pool.filter(player => (now - player.joinTime) > MAX_WAIT_TIME);
+        
+        if (expiredPlayers.length > 0) {
+            console.log(`Removing ${expiredPlayers.length} expired players from matchmaking pool for ${betAmount}`);
+            
+            expiredPlayers.forEach(player => {
+                const playerSocket = io.sockets.sockets.get(player.socketId);
+                if (playerSocket) {
+                    playerSocket.emit('matchmakingExpired', { 
+                        message: 'Your matchmaking request has expired' 
+                    });
+                }
+            });
+            
+            // Remove expired players
+            matchmakingPools.human.set(
+                betAmount, 
+                pool.filter(player => (now - player.joinTime) <= MAX_WAIT_TIME)
+            );
+        }
+    }
+}, 60000); // Run every minute

@@ -252,6 +252,8 @@
         let loggedInUser = null;
         let phantomProvider = null;
         let balanceUpdateInterval;
+        let gameTransactionInfo = null;
+
 
         const joinGameBtn = document.getElementById('joinGameBtn');
         const waitingMessage = document.getElementById('waitingMessage');
@@ -726,7 +728,6 @@
                 const balanceResult = await usdcManager.getUSDCBalance(connectedWallet);
                 console.log('Current USDC balance:', balanceResult.balance);
 
-                // Ensure player has enough balance
                 if (balanceResult.balance < betAmount) {
                     resetJoinUI();
                     alert(`Not enough USDC. You have ${balanceResult.balance} but need ${betAmount}`);
@@ -745,7 +746,6 @@
                 console.log('Waiting for transaction confirmation...');
                 waitingMessage.textContent = 'Waiting for transaction confirmation...';
                 
-                // Wait for confirmation with specific commitment
                 const confirmation = await connection.confirmTransaction({
                     signature: txSignature,
                     blockhash: transaction.recentBlockhash,
@@ -760,18 +760,19 @@
                 await new Promise(resolve => setTimeout(resolve, 2000));
 
                 console.log('Transaction confirmed:', txSignature);
-                waitingMessage.textContent = 'Transaction confirmed. Joining game...';
+                waitingMessage.textContent = 'Transaction confirmed. Choose game mode...';
 
-                // Join game with confirmed transaction
-                socket.emit('joinGame', {
+                // Store transaction information for later
+                gameTransactionInfo = {
                     walletAddress: connectedWallet,
                     betAmount,
                     transactionSignature: txSignature
-                });
+                };
 
                 joinGameBtn.style.display = 'none';
                 
-                // Wait for server to respond with 'gameJoined' event - the modal will be shown there
+                // Show game mode selection immediately
+                showGameChoiceModal();
 
             } catch (error) {
                 console.error('Join game error:', error);
@@ -1229,66 +1230,51 @@
             
             document.getElementById('waitForPlayerBtn').onclick = function() {
                 console.log('Player chose to play against human');
-                waitingForPlayer = true;
                 modal.style.display = 'none';
-                waitingMessage.textContent = 'Waiting for another player...';
                 
-                // Signal to the server that this player is ready for human opponent
-                if (currentRoomId) {
-                    socket.emit('playerReady', { roomId: currentRoomId, preferredMode: 'human' });
+                if (!gameTransactionInfo) {
+                    console.error('No transaction info available');
+                    waitingMessage.textContent = 'Error starting game. Please try again.';
+                    resetJoinUI();
+                    return;
                 }
                 
-                // Set a timeout to switch to bot mode if no player joins
-                if (waitingTimeout) {
-                    clearTimeout(waitingTimeout);
-                }
+                waitingMessage.textContent = 'Looking for another player...';
                 
-                waitingTimeout = setTimeout(() => {
-                    if (waitingForPlayer && currentRoomId) {
-                        waitingMessage.textContent = 'No players found. Would you like to play against a bot instead?';
-                        const playBotBtn = document.createElement('button');
-                        playBotBtn.textContent = 'Play Against Bot';
-                        playBotBtn.className = 'bot-option-btn';
-                        playBotBtn.onclick = switchToBotMode;
-                        waitingMessage.appendChild(document.createElement('br'));
-                        waitingMessage.appendChild(playBotBtn);
-                        
-                        const keepWaitingBtn = document.createElement('button');
-                        keepWaitingBtn.textContent = 'Keep Waiting';
-                        keepWaitingBtn.className = 'bot-option-btn';
-                        keepWaitingBtn.onclick = () => {
-                            waitingMessage.textContent = 'Continuing to wait for another player...';
-                            // Reset the timeout
-                            waitingTimeout = setTimeout(() => {
-                                keepWaitingBtn.onclick();
-                            }, WAITING_TIMEOUT_DURATION);
-                        };
-                        waitingMessage.appendChild(document.createTextNode(' '));
-                        waitingMessage.appendChild(keepWaitingBtn);
-                    }
-                }, WAITING_TIMEOUT_DURATION);
+                // Join matchmaking pool for human opponents
+                socket.emit('joinHumanMatchmaking', {
+                    ...gameTransactionInfo,
+                    gameMode: 'human'
+                });
+                
+                // Reset transaction info as it's been sent
+                gameTransactionInfo = null;
             };
             
             document.getElementById('playAgainstBotBtn').onclick = function() {
                 console.log('Player chose to play against bot');
+                modal.style.display = 'none';
                 
-                // Instead of using the current room, create a new bot-specific room
-                // Leave the current room first
-                if (currentRoomId) {
-                    socket.emit('leaveRoom', { roomId: currentRoomId });
+                if (!gameTransactionInfo) {
+                    console.error('No transaction info available');
+                    waitingMessage.textContent = 'Error starting game. Please try again.';
+                    resetJoinUI();
+                    return;
                 }
                 
-                // Request a bot-specific room from the server
-                const betAmount = parseInt(document.getElementById('betAmount').value) || 3;
-                socket.emit('requestBotRoom', { 
-                    walletAddress: connectedWallet,
-                    betAmount: betAmount
+                waitingMessage.textContent = 'Creating a game with a bot opponent...';
+                
+                // Request a bot game directly
+                socket.emit('joinBotGame', {
+                    ...gameTransactionInfo,
+                    gameMode: 'bot'
                 });
                 
-                modal.style.display = 'none';
-                waitingMessage.textContent = 'Creating a game with a bot opponent...';
+                // Reset transaction info as it's been sent
+                gameTransactionInfo = null;
             };
         }
+
 
         function switchToBotMode() {
             console.log('Switching to bot mode');
@@ -1435,26 +1421,59 @@
             }
         });
 
-        socket.on('matchFound', ({ newRoomId }) => {
-            console.log(`Match found! Moved to room ${newRoomId}`);
+        socket.on('matchmakingJoined', (data) => {
+            console.log('Joined matchmaking pool:', data);
+            currentRoomId = data.waitingRoomId;
+            waitingMessage.textContent = 'Waiting for another player...';
             
-            // Update our current room ID
-            currentRoomId = newRoomId;
-            
-            // Update the UI
-            waitingMessage.textContent = 'Match found! Game is starting...';
-            
-            // Close the game choice modal if it's open
-            const modal = document.getElementById('gameChoiceModal');
-            if (modal.style.display === 'flex') {
-                modal.style.display = 'none';
-            }
-            
-            // Clear any waiting timeout
+            // Start a timeout for bot suggestion
             if (waitingTimeout) {
                 clearTimeout(waitingTimeout);
-                waitingTimeout = null;
             }
+            
+            waitingTimeout = setTimeout(() => {
+                if (currentRoomId) {
+                    waitingMessage.textContent = 'No players found. Would you like to play against a bot instead?';
+                    const playBotBtn = document.createElement('button');
+                    playBotBtn.textContent = 'Play Against Bot';
+                    playBotBtn.className = 'bot-option-btn';
+                    playBotBtn.onclick = () => {
+                        socket.emit('switchToBot', { roomId: currentRoomId });
+                        waitingMessage.textContent = 'Starting game against bot...';
+                    };
+                    waitingMessage.appendChild(document.createElement('br'));
+                    waitingMessage.appendChild(playBotBtn);
+                    
+                    const keepWaitingBtn = document.createElement('button');
+                    keepWaitingBtn.textContent = 'Keep Waiting';
+                    keepWaitingBtn.className = 'bot-option-btn';
+                    keepWaitingBtn.onclick = () => {
+                        waitingMessage.textContent = 'Continuing to wait for another player...';
+                        // Reset the timeout
+                        waitingTimeout = setTimeout(() => {
+                            keepWaitingBtn.onclick();
+                        }, WAITING_TIMEOUT_DURATION);
+                    };
+                    waitingMessage.appendChild(document.createTextNode(' '));
+                    waitingMessage.appendChild(keepWaitingBtn);
+                }
+            }, WAITING_TIMEOUT_DURATION);
+        });
+
+        socket.on('matchFound', (data) => {
+            console.log('Match found:', data);
+            currentRoomId = data.gameRoomId;
+            waitingMessage.textContent = 'Match found! Game is starting...';
+            
+            if (waitingTimeout) {
+                clearTimeout(waitingTimeout);
+            }
+        });
+
+        socket.on('botGameCreated', (data) => {
+            console.log('Bot game created:', data);
+            currentRoomId = data.gameRoomId;
+            waitingMessage.textContent = `Starting game against ${data.botName}...`;
         });
 
         socket.on('roundComplete', (data) => {
