@@ -5,7 +5,6 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 require('dotenv').config();
 const moment = require('moment');
-const crypto = require('crypto'); // For generating verification tokens
 const User = require('./models/User');
 const axios = require('axios');
 const fs = require('fs');
@@ -399,7 +398,6 @@ io.on('connection', (socket) => {
             console.log('Join game request:', { walletAddress, betAmount, transactionSignature });
     
             // Transaction verification code would go here
-            // (Keeping existing verification logic unchanged)
     
             // Create or join game room
             let roomId;
@@ -961,9 +959,10 @@ io.on('connection', (socket) => {
 
     socket.on('getLeaderboard', async () => {
         try {
-            const leaderboard = await User.find({}, 'walletAddress gamesPlayed totalWinnings')
-                .sort({ totalWinnings: -1 }) // Sort by winnings instead of points
-                .limit(20); // Show more entries
+            const leaderboard = await User.find({})
+                .select('walletAddress gamesPlayed totalWinnings wins correctAnswers')
+                .sort({ totalWinnings: -1 })
+                .limit(20);
             
             socket.emit('leaderboardData', leaderboard);
         } catch (error) {
@@ -976,90 +975,70 @@ io.on('connection', (socket) => {
         console.log('Client disconnected:', socket.id);
         
         // Check if player is in a matchmaking pool
-        let foundInMatchmaking = false;
+        // (Keep your existing matchmaking pool code unchanged)
         
-        for (const [betAmount, pool] of matchmakingPools.human.entries()) {
-            const playerIndex = pool.findIndex(p => p.socketId === socket.id);
+        // Look through all game rooms
+        for (const [roomId, room] of gameRooms.entries()) {
+            const playerIndex = room.players.findIndex(p => p.id === socket.id);
             if (playerIndex !== -1) {
-                const player = pool[playerIndex];
-                console.log(`Removing disconnected player ${player.walletAddress} from matchmaking pool for ${betAmount}`);
-                pool.splice(playerIndex, 1);
-                foundInMatchmaking = true;
-                break;
-            }
-        }
-        
-        // If not found in matchmaking, check game rooms (existing disconnect logic)
-        if (!foundInMatchmaking) {
-            for (const [roomId, room] of gameRooms.entries()) {
-                const playerIndex = room.players.findIndex(p => p.id === socket.id);
-                if (playerIndex !== -1) {
-                    // Your existing disconnect handler logic for game rooms
-                    const disconnectedPlayer = room.players[playerIndex];
-                    console.log(`Player ${disconnectedPlayer.username} left room ${roomId}`);
+                const disconnectedPlayer = room.players[playerIndex];
+                console.log(`Player ${disconnectedPlayer.username} left room ${roomId}`);
+                
+                // Handle bot rooms specially
+                if (room.roomMode === 'bot') {
+                    console.log(`Bot room ${roomId} abandoned - cleaning up`);
+                    gameRooms.delete(roomId);
+                    return;
+                }
+                
+                // Remove the disconnected player
+                room.players.splice(playerIndex, 1);
+                
+                // If the game has started, it should end immediately
+                if (room.gameStarted && room.players.length > 0) {
+                    const remainingPlayer = room.players[0];
                     
-                    // Handle bot rooms specially
-                    if (room.roomMode === 'bot') {
-                        console.log(`Bot room ${roomId} abandoned - cleaning up`);
+                    // Don't award a win if the remaining player is a bot
+                    if (remainingPlayer.isBot) {
+                        console.log(`Only a bot remained in room ${roomId} - cleaning up`);
                         gameRooms.delete(roomId);
                         return;
                     }
                     
-                    // Remove the disconnected player
-                    room.players.splice(playerIndex, 1);
+                    console.log(`Player ${disconnectedPlayer.username} left during active game. Declaring ${remainingPlayer.username} the winner.`);
                     
-                    // If the game has started and there's a remaining player, declare them the winner
-                    if (room.gameStarted && room.players.length === 1) {
-                        const remainingPlayer = room.players[0];
-                        
-                        // Don't award a win if the remaining player is a bot
-                        if (remainingPlayer.isBot) {
-                            console.log(`Only a bot remained in room ${roomId} - cleaning up`);
-                            gameRooms.delete(roomId);
-                            return;
-                        }
-                        
-                        console.log(`Player ${disconnectedPlayer.username} left during active game. Declaring ${remainingPlayer.username} the winner.`);
-                        
-                        // Process the payout for the remaining player
-                        const botOpponent = room.players.some(p => p.isBot);
-                        handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, botOpponent);
-                    } else if (room.players.length === 0) {
-                        // If no players left, delete the room
-                        console.log(`Deleting empty room ${roomId}`);
-                        gameRooms.delete(roomId);
-                    } else {
-                        // Notify the remaining player that the other player left
-                        console.log(`Notifying remaining player in room ${roomId} about departure`);
-                        io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
+                    // Flag the room as having a player leave mid-game
+                    room.playerLeft = true;
+                    
+                    // Cancel any ongoing question timer
+                    if (room.questionTimeout) {
+                        clearTimeout(room.questionTimeout);
                     }
-                    break;
+                    
+                    // Notify remaining players and end the game
+                    io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
+                    
+                    // Process the payout for the remaining player
+                    const botOpponent = room.players.some(p => p.isBot);
+                    handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, botOpponent);
+                    
+                    // The room will be deleted in handlePlayerLeftWin
+                } else if (room.players.length === 0) {
+                    // If no players left, delete the room
+                    console.log(`Deleting empty room ${roomId}`);
+                    gameRooms.delete(roomId);
+                } else {
+                    // Notify the remaining player that the other player left
+                    console.log(`Notifying remaining player in room ${roomId} about departure`);
+                    io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
                 }
+                break;
             }
         }
     });
 });
 
-/*
-app.post('/login', async (req, res) => {
-    const { username, password } = req.body;
-    try {
-        const user = await User.findOne({ username });
-        if (user && await user.matchPassword(password)) {
-            res.json({ 
-                success: true, 
-                message: 'Login successful', 
-                username: user.username,
-                virtualBalance: user.virtualBalance
-            });
-        } else {
-            res.json({ success: false, message: 'Invalid credentials' });
-        }
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
-});
-*/
+
 app.get('/login.html', (req, res) => {
     // Read the file
     let loginHtml = fs.readFileSync(path.join(__dirname, 'public', 'login.html'), 'utf8');
@@ -1315,42 +1294,72 @@ async function completeQuestion(roomId) {
     room.currentQuestionIndex += 1;
     room.answersReceived = 0;
 
+    // Check if any player has left mid-game
+    if (room.playerLeft) {
+        console.log(`Game in room ${roomId} ending early because a player left`);
+        await handleGameOver(room, roomId);
+        return;
+    }
+
     if (room.currentQuestionIndex < room.questions.length) {
         setTimeout(() => {
             startNextQuestion(roomId);
         }, 2000); // Slightly longer pause between questions for better UX
     } else {
-        // Game over logic remains similar, just ensure bot is properly included
+        // Game over logic
         console.log(`Game over in room ${roomId}`);
-        const sortedPlayers = [...room.players].sort((a, b) => {
-            if (b.score !== a.score) {
-                return b.score - a.score;
-            }
-            return (a.totalResponseTime || 0) - (b.totalResponseTime || 0);
-        });
+        await handleGameOver(room, roomId);
+    }
+}
 
-        // Log detailed game results
-        console.log('Game Results:');
-        sortedPlayers.forEach(player => {
-            console.log(`Player ${player.username}${player.isBot ? ' (BOT)' : ''}: ${player.score} correct answers, Response time: ${player.totalResponseTime}ms`);
-        });
+// Helper function to handle game over logic
+async function handleGameOver(room, roomId) {
+    const sortedPlayers = [...room.players].sort((a, b) => {
+        if (b.score !== a.score) {
+            return b.score - a.score;
+        }
+        return (a.totalResponseTime || 0) - (b.totalResponseTime || 0);
+    });
 
-        // Determine winner
-        let winner = null;
+    // Log detailed game results
+    console.log('Game Results:');
+    sortedPlayers.forEach(player => {
+        console.log(`Player ${player.username}${player.isBot ? ' (BOT)' : ''}: ${player.score} correct answers, Response time: ${player.totalResponseTime}ms`);
+    });
+
+    // Determine winner
+    let winner = null;
+    
+    // Handle different player count scenarios
+    if (sortedPlayers.length === 1) {
+        // If only one player is left (the other left mid-game)
+        winner = sortedPlayers[0].username;
+    } else if (sortedPlayers.length > 1) {
         if (sortedPlayers[0].score > sortedPlayers[1].score) {
             winner = sortedPlayers[0].username;
         } else if (sortedPlayers[0].score === sortedPlayers[1].score) {
             winner = sortedPlayers[0].totalResponseTime <= sortedPlayers[1].totalResponseTime ? 
                 sortedPlayers[0].username : sortedPlayers[1].username;
         }
+    }
 
-        // If human player won, process payout
+    const botOpponent = room.players.some(p => p.isBot);
+    const isSinglePlayer = room.players.length === 1;
+
+    try {
+        // Update player stats FIRST - this is the only place stats are updated
+        await updatePlayerStats(room.players, {
+            winner: winner,
+            botOpponent: botOpponent,
+            betAmount: room.betAmount
+        });
+        
+        // If there's a winner and they're not a bot, send winnings (transaction only)
         if (winner && !sortedPlayers.find(p => p.username === winner)?.isBot) {
             try {
-                const botOpponent = room.players.some(p => p.isBot);
                 const payoutSignature = await sendWinnings(winner, room.betAmount, botOpponent);
                 io.to(roomId).emit('gameOver', {
-                    players: room.players.map(p => ({ 
+                    players: sortedPlayers.map(p => ({ 
                         username: p.username, 
                         score: p.score, 
                         totalResponseTime: p.totalResponseTime || 0,
@@ -1359,13 +1368,14 @@ async function completeQuestion(roomId) {
                     winner: winner,
                     betAmount: room.betAmount,
                     payoutSignature,
+                    singlePlayerMode: isSinglePlayer,
                     botOpponent: botOpponent
                 });
             } catch (error) {
                 console.error('Error processing payout:', error);
                 io.to(roomId).emit('gameOver', {
                     error: 'Error processing payout. Please contact support.',
-                    players: room.players.map(p => ({ 
+                    players: sortedPlayers.map(p => ({ 
                         username: p.username, 
                         score: p.score, 
                         totalResponseTime: p.totalResponseTime || 0,
@@ -1373,13 +1383,14 @@ async function completeQuestion(roomId) {
                     })),
                     winner: winner,
                     betAmount: room.betAmount,
-                    botOpponent: room.hasBot
+                    singlePlayerMode: isSinglePlayer,
+                    botOpponent: botOpponent
                 });
             }
         } else {
-            // No payout if bot won
+            // No payout (no winner or bot won)
             io.to(roomId).emit('gameOver', {
-                players: room.players.map(p => ({ 
+                players: sortedPlayers.map(p => ({ 
                     username: p.username, 
                     score: p.score, 
                     totalResponseTime: p.totalResponseTime || 0,
@@ -1387,37 +1398,18 @@ async function completeQuestion(roomId) {
                 })),
                 winner: winner,
                 betAmount: room.betAmount,
-                botOpponent: room.hasBot
+                singlePlayerMode: isSinglePlayer,
+                botOpponent: botOpponent
             });
         }
 
+        // Finally, clean up the room
+        gameRooms.delete(roomId);
+    } catch (error) {
+        console.error('Error handling game over:', error);
+        io.to(roomId).emit('gameError', 'An error occurred while ending the game.');
         gameRooms.delete(roomId);
     }
-}
-
-// Helper function to handle game over logic
-async function handleGameOver(room, roomId) {
-    console.log(`Game over in room ${roomId}`);
-    
-    const sortedPlayers = [...room.players].sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
-        return (a.totalResponseTime || 0) - (b.totalResponseTime || 0);
-    });
-
-    // Log detailed results
-    console.log('Game Results:');
-    sortedPlayers.forEach(player => {
-        console.log(`Player ${player.username}${player.isBot ? ' (BOT)' : ''}: ${player.score} correct answers, Response time: ${player.totalResponseTime || 0}ms`);
-    });
-
-    // Determine winner
-    const winner = determineWinner(sortedPlayers);
-
-    // Handle payout and emit game over event
-    await handleGameOverEmit(room, sortedPlayers, winner, roomId);
-
-    // Cleanup
-    gameRooms.delete(roomId);
 }
 
 
@@ -1429,27 +1421,6 @@ function generateRoomId() {
     return Math.random().toString(36).substring(7);
 }
 
-
-// Email verification endpoint
-app.get('/verify-email', async (req, res) => {
-    const { token } = req.query;
-
-    try {
-        const user = await User.findOne({ verificationToken: token });
-        if (!user) {
-            return res.status(400).send('Invalid verification token');
-        }
-
-        user.isVerified = true;
-        user.verificationToken = undefined; // Clear the token
-        await user.save();
-
-        console.log(`User verified successfully: ${user.username}`); // Log verification
-        res.send('Email verified successfully! You can now join the game.');
-    } catch (error) {
-        res.status(500).send('Error verifying email');
-    }
-});
 
 
 // Function to verify reCAPTCHA token
@@ -1629,25 +1600,10 @@ async function sendWinnings(winnerAddress, betAmount, botOpponent = false) {
         
         console.log(`Sending winnings: ${winningAmount} USDC to ${winnerAddress} (vs bot: ${botOpponent})`);
         
-        // Add this to update the user's total winnings
-        try {
-            await User.findOneAndUpdate(
-                { walletAddress: winnerAddress },
-                { 
-                    $inc: { 
-                        totalWinnings: winningAmount,
-                        wins: 1,
-                        gamesPlayed: 1
-                    } 
-                },
-                { upsert: false }
-            );
-        } catch (dbError) {
-            console.error('Error updating user winnings:', dbError);
-            // Continue with the payout even if the database update fails
-        }
+        // REMOVE the database update completely from here
+        // All stats will be updated in updatePlayerStats() only
         
-        // Rest of the sendWinnings function remains the same
+        // Just handle the blockchain transaction
         const treasuryTokenAccount = await findAssociatedTokenAddress(
             config.TREASURY_WALLET,
             config.USDC_MINT
@@ -1853,7 +1809,7 @@ async function handleGameOverEmit(room, players, winner, roomId) {
         const multiplier = botOpponent ? 1.5 : 1.8;
         const winningAmount = betAmount * multiplier;
         
-        // Process payout for the remaining player
+        // Process payout for the remaining player - transaction only
         const payoutSignature = await sendWinnings(remainingPlayer.username, betAmount, botOpponent);
         
         // Emit game over event with forfeit information
@@ -1866,22 +1822,22 @@ async function handleGameOverEmit(room, players, winner, roomId) {
             message: `${disconnectedPlayer.username} left the game. ${remainingPlayer.username} wins by forfeit!`
         });
         
-        // Update player stats in database
-        try {
-            // For the player who left, just increment gamesPlayed and losses
-            await User.findOneAndUpdate(
-                { walletAddress: disconnectedPlayer.username },
-                { 
-                    $inc: { 
-                        losses: 1,
-                        gamesPlayed: 1,
-                        forfeits: 1 // Track forfeits separately
-                    } 
-                }
-            );
-        } catch (error) {
-            console.error('Error updating player stats after forfeit:', error);
-        }
+        // Create players array with both remaining player and disconnected player
+        const allPlayers = [
+            remainingPlayer,
+            {
+                username: disconnectedPlayer.username,
+                score: disconnectedPlayer.score || 0,
+                isBot: disconnectedPlayer.isBot || false
+            }
+        ];
+        
+        // Update ALL player stats in one place only
+        await updatePlayerStats(allPlayers, {
+            winner: remainingPlayer.username,
+            botOpponent: botOpponent,
+            betAmount: betAmount
+        });
         
         // Clean up the room
         gameRooms.delete(roomId);
@@ -1958,3 +1914,71 @@ setInterval(() => {
         }
     }
 }, 60000); // Run every minute
+
+async function updatePlayerStats(players, roomData) {
+    console.log('Updating stats for all players');
+    const winner = roomData.winner;
+    const multiplier = roomData.botOpponent ? 1.5 : 1.8;
+    const winningAmount = roomData.betAmount * multiplier;
+    
+    console.log(`Game stats: winner=${winner}, betAmount=${roomData.betAmount}, winnings=${winningAmount}`);
+    
+    try {
+        // Loop through all players and update their stats
+        for (const player of players) {
+            // Skip bots
+            if (player.isBot) {
+                console.log(`Skipping stats update for bot: ${player.username}`);
+                continue;
+            }
+            
+            if (!player.username) {
+                console.log(`Skipping player with no username:`, player);
+                continue;
+            }
+            
+            const isWinner = player.username === winner;
+            console.log(`Updating stats for player: ${player.username} (winner: ${isWinner})`);
+            
+            try {
+                // Build the update object
+                const updateObj = {
+                    $inc: {
+                        gamesPlayed: 1,
+                        correctAnswers: player.score || 0
+                    }
+                };
+                
+                // Only add wins and winnings for the winner
+                if (isWinner) {
+                    updateObj.$inc.wins = 1;
+                    updateObj.$inc.totalWinnings = winningAmount;
+                }
+                
+                // Log the exact update we're applying
+                console.log(`Update for ${player.username}:`, JSON.stringify(updateObj));
+                
+                // Perform the update
+                const result = await User.findOneAndUpdate(
+                    { walletAddress: player.username },
+                    updateObj,
+                    { 
+                        upsert: true, // Create if doesn't exist
+                        new: true // Return the updated document
+                    }
+                );
+                
+                console.log(`Stats updated for ${player.username}:`, {
+                    gamesPlayed: result.gamesPlayed,
+                    correctAnswers: result.correctAnswers,
+                    wins: result.wins,
+                    totalWinnings: result.totalWinnings
+                });
+            } catch (error) {
+                console.error(`Error updating player ${player.username} stats:`, error);
+            }
+        }
+    } catch (error) {
+        console.error('Error in updatePlayerStats:', error);
+    }
+}

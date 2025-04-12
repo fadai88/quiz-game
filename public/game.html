@@ -916,14 +916,26 @@
             console.log('Received game over data:', data);
             const { players, winner, betAmount, winnerBalance, singlePlayerMode, payoutSignature, botOpponent } = data;
             
+            // Clear any timers
+            if (questionTimer) {
+                clearTimeout(questionTimer);
+            }
+            
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+            }
+            
+            // Update the UI
             questionDiv.textContent = 'Game Over!';
             submitAnswerBtn.style.display = 'none';
+            countdownTimer.style.display = 'none';
             
             // Calculate the correct multiplier based on game type
             const multiplier = botOpponent ? 1.5 : 1.8;
             const winnings = betAmount * multiplier;
             
             if (singlePlayerMode) {
+                // Handle single player mode
                 const player = players[0];
                 if (winner) {
                     waitingMessage.textContent = `Congratulations! You won with ${player.score} correct answers! You won ${winnings.toFixed(2)} USDC!`;
@@ -935,6 +947,7 @@
                     waitingMessage.textContent = `Game Over! You got ${player.score} correct answers. You need at least 5 correct answers to win.`;
                 }
             } else {
+                // Handle multiplayer mode
                 players.sort((a, b) => b.score - a.score || a.totalResponseTime - b.totalResponseTime);
 
                 if (winner) {
@@ -948,8 +961,16 @@
                             const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
                             waitingMessage.innerHTML += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
                         }
+                        
+                        // Show win celebration
+                        if (typeof celebrateWin === 'function') {
+                            celebrateWin('normal');
+                        }
+                    } else {
+                        waitingMessage.textContent += ` Better luck next time!`;
                     }
                 } else {
+                    // Handle tied scores
                     if (players[0].score === players[1].score) {
                         if (players[0].totalResponseTime < players[1].totalResponseTime) {
                             waitingMessage.textContent = `It's a draw based on score! ${players[0].username} wins due to faster total response time (${players[0].totalResponseTime}ms vs ${players[1].totalResponseTime}ms).`;
@@ -965,6 +986,11 @@
                             if (payoutSignature) {
                                 const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
                                 waitingMessage.innerHTML += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
+                            }
+                            
+                            // Show win celebration
+                            if (typeof celebrateWin === 'function') {
+                                celebrateWin('tiebreak');
                             }
                         } else {
                             waitingMessage.textContent += ` Better luck next time!`;
@@ -991,13 +1017,33 @@
         });
 
         socket.on('playerLeft', (username) => {
+            console.log(`Player ${username} left the game`);
+            
+            // Clear any active game elements
+            if (questionTimer) {
+                clearTimeout(questionTimer);
+            }
+            
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+            }
+            
+            // Hide the submit button and stop the countdown
+            submitAnswerBtn.style.display = 'none';
+            countdownTimer.style.display = 'none';
+            
+            // Update message to indicate game is ending
             waitingMessage.textContent = `${username} left the game. Waiting for forfeit resolution...`;
             
-            // Add a visual indicator that the game is being resolved
+            // Show a visual indicator of processing
             const loadingIndicator = document.createElement('div');
             loadingIndicator.className = 'loading-spinner';
             loadingIndicator.innerHTML = '⌛';
             waitingMessage.appendChild(loadingIndicator);
+            
+            // Show pending resolution status
+            questionDiv.textContent = 'Game Over - Player Left';
+            optionsDiv.innerHTML = '<p>Your opponent left the game. The game is ending and winnings will be awarded shortly.</p>';
             
             // Play notification sound if available
             if (typeof playSound === 'function') {
@@ -1009,9 +1055,10 @@
             console.log('Forfeit game over:', data);
             const { winner, disconnectedPlayer, betAmount, payoutSignature, botOpponent, message } = data;
             
-            // Clear the game UI
+            // Clear game UI completely
             questionDiv.textContent = 'Game Over - Player Left!';
             submitAnswerBtn.style.display = 'none';
+            countdownTimer.style.display = 'none';
             
             // Calculate the appropriate winnings
             const multiplier = botOpponent ? 1.5 : 1.8;
@@ -1059,7 +1106,16 @@
         socket.on('gameError', (errorMessage) => {
             console.error('Game error:', errorMessage);
             alert(`Game error: ${errorMessage}`);
-            resetUIAfterError();
+            
+            resetGame();
+        });
+
+        socket.on('disconnect', () => {
+            console.log('Disconnected from server');
+            alert('You have been disconnected from the game server. Please refresh the page to reconnect.');
+            
+            // Reset game UI
+            resetGame();
         });
 
         const forfeitStyles = document.createElement('style');
@@ -1210,8 +1266,28 @@
             submitAnswerBtn.style.display = 'none';
             waitingMessage.textContent = '';
             joinGameBtn.style.display = 'block';
-            clearInterval(countdownInterval);
+            
+            if (questionTimer) {
+                clearTimeout(questionTimer);
+            }
+            
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+            }
+            
             countdownTimer.style.display = 'none';
+            
+            // Reset any modal that might be open
+            const modal = document.getElementById('gameChoiceModal');
+            if (modal && modal.style.display === 'flex') {
+                modal.style.display = 'none';
+            }
+            
+            // Reset any waiting timeout
+            if (waitingTimeout) {
+                clearTimeout(waitingTimeout);
+                waitingTimeout = null;
+            }
         }
 
         function toggleTheme() {

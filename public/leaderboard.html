@@ -126,6 +126,8 @@
                         <th>Rank</th>
                         <th>Wallet Address</th>
                         <th>Games Played</th>
+                        <th>Wins</th>
+                        <th>Correct Answers</th>
                         <th>Total Winnings (USDC)</th>
                     </tr>
                 </thead>
@@ -196,10 +198,17 @@
                 const winnings = user.totalWinnings || 0;
                 const formattedWinnings = winnings.toFixed(2);
                 
+                // Calculate win rate
+                const gamesPlayed = user.gamesPlayed || 0;
+                const wins = user.wins || 0;
+                const winRate = gamesPlayed > 0 ? (wins / gamesPlayed * 100).toFixed(1) + '%' : '0%';
+                
                 row.innerHTML = `
                     <td>${rankDisplay}</td>
                     <td class="truncated-address">${formattedAddress}</td>
-                    <td>${user.gamesPlayed || 0}</td>
+                    <td>${gamesPlayed}</td>
+                    <td>${wins} (${winRate})</td>
+                    <td>${user.correctAnswers || 0}</td>
                     <td class="winnings">${formattedWinnings}</td>
                 `;
                 leaderboardBody.appendChild(row);
