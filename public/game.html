@@ -808,6 +808,13 @@
             const responseTime = moment().diff(moment(questionStartTime), 'milliseconds');
             const selectedAnswer = parseInt(selectedOption.value);
             
+            console.log('Submitting answer:', {
+                roomId: currentRoomId,
+                answer: selectedAnswer,
+                responseTime,
+                username: connectedWallet
+            });
+            
             socket.emit('submitAnswer', { 
                 roomId: currentRoomId, 
                 answer: selectedAnswer, 
@@ -833,7 +840,6 @@
                 }
             } catch (error) {
                 console.error('Error highlighting answer:', error);
-                // Even if highlighting fails, the answer was still submitted
             }
         });
 

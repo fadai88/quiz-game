@@ -733,17 +733,19 @@ io.on('connection', (socket) => {
             return;
         }
         
-        // Create a bot game for this player
+        // Create a new bot game room
         const newRoomId = generateRoomId();
-        console.log(`Creating bot game room ${roomId} for player ${playerData.walletAddress}`);
+        console.log(`Creating bot game room ${newRoomId} for player ${playerData.walletAddress}`);
         
-        gameRooms.set(roomId, {
+        gameRooms.set(newRoomId, {
             players: [
                 {
                     id: socket.id,
                     username: playerData.walletAddress,
                     score: 0,
-                    totalResponseTime: 0
+                    totalResponseTime: 0,
+                    answered: false,
+                    lastAnswer: null
                 }
             ],
             questions: [],
@@ -754,8 +756,8 @@ io.on('connection', (socket) => {
             roomMode: 'bot'
         });
         
-        // Join the socket to the room
-        socket.join(roomId);
+        // Join the socket to the new room
+        socket.join(newRoomId);
         
         // Notify the player
         const botName = chooseBotName();
@@ -765,11 +767,10 @@ io.on('connection', (socket) => {
         });
         
         // Start the single player game with a bot
-        await startSinglePlayerGame(roomId);
+        await startSinglePlayerGame(newRoomId);
     });
     
-    
-    // Add socket handler for match found
+
     socket.on('matchFound', ({ newRoomId }) => {
         console.log(`Match found, player ${socket.id} moved to room ${newRoomId}`);
         currentRoomId = newRoomId;
@@ -902,23 +903,33 @@ io.on('connection', (socket) => {
     });
 
     socket.on('submitAnswer', async ({ roomId, answer, responseTime, username }) => {
+        console.log(`Received answer from ${username} in room ${roomId}:`, { answer, responseTime });
+        
         const room = gameRooms.get(roomId);
-        if (!room) return;
-
-        const player = room.players.find(p => p.username === username);
-        if (!player) return;
-
+        if (!room) {
+            console.error(`Room ${roomId} not found for answer submission`);
+            return;
+        }
+    
+        const player = room.players.find(p => p.username === username && !p.isBot);
+        if (!player) {
+            console.error(`Player ${username} not found in room ${roomId} or is a bot`);
+            return;
+        }
+    
         player.totalResponseTime = (player.totalResponseTime || 0) + responseTime;
-        player.lastAnswer = answer; // Store the player's answer
-
+        player.lastAnswer = answer;
+        player.answered = true;
+    
         const currentQuestion = room.questions[room.currentQuestionIndex];
         const isCorrect = answer === currentQuestion.correctAnswer;
-
+    
         if (isCorrect) {
-            player.score += 1;
+            player.score = (player.score || 0) + 1;
+            console.log(`Correct answer from ${username}. New score: ${player.score}`);
             try {
                 await User.findOneAndUpdate(
-                    { username },
+                    { walletAddress: username },
                     { 
                         $inc: { 
                             correctAnswers: 1,
@@ -929,31 +940,38 @@ io.on('connection', (socket) => {
             } catch (error) {
                 console.error('Error updating user stats:', error);
             }
+        } else {
+            console.log(`Incorrect answer from ${username}. Score unchanged: ${player.score}`);
         }
-
-        player.answered = true;
-
+    
         // Send result only to the player who answered
         socket.emit('answerResult', {
             username: player.username,
             isCorrect,
             correctAnswer: currentQuestion.correctAnswer
         });
-
+    
+        // Check if all players (human and bot) have answered
         if (room.players.every(p => p.answered)) {
+            console.log(`All players answered in room ${roomId}`);
             // When all players have answered, send the complete results to everyone
             io.to(roomId).emit('roundComplete', {
                 correctAnswer: currentQuestion.correctAnswer,
                 playerResults: room.players.map(p => ({
                     username: p.username,
                     isCorrect: p.lastAnswer === currentQuestion.correctAnswer,
-                    answer: p.lastAnswer
+                    answer: p.lastAnswer,
+                    isBot: p.isBot || false
                 }))
             });
             await completeQuestion(roomId);
         } else {
             // Just update that a player has answered without revealing the answer
-            socket.to(roomId).emit('playerAnswered', username);
+            socket.to(roomId).emit('playerAnswered', {
+                username,
+                isBot: false,
+                responseTime
+            });
         }
     });
 
@@ -1514,6 +1532,12 @@ async function startSinglePlayerGame(roomId) {
         const humanPlayer = humanPlayers[0];
         console.log('Human player:', humanPlayer.username);
         
+        // Ensure human player's state is properly initialized
+        humanPlayer.score = 0;
+        humanPlayer.totalResponseTime = 0;
+        humanPlayer.answered = false;
+        humanPlayer.lastAnswer = null;
+        
         // Check if there's already a bot (shouldn't happen, but just in case)
         if (room.players.some(p => p.isBot)) {
             console.log(`Room ${roomId} already has a bot player`);
@@ -1549,7 +1573,7 @@ async function startSinglePlayerGame(roomId) {
                 difficulty: p.isBot ? difficulty : undefined
             })),
             questionCount: room.questions.length,
-            singlePlayerMode: false,
+            singlePlayerMode: true, // Indicate single player mode
             botOpponent: bot.username
         });
 
@@ -1599,9 +1623,6 @@ async function sendWinnings(winnerAddress, betAmount, botOpponent = false) {
         const winningAmount = betAmount * multiplier;
         
         console.log(`Sending winnings: ${winningAmount} USDC to ${winnerAddress} (vs bot: ${botOpponent})`);
-        
-        // REMOVE the database update completely from here
-        // All stats will be updated in updatePlayerStats() only
         
         // Just handle the blockchain transaction
         const treasuryTokenAccount = await findAssociatedTokenAddress(

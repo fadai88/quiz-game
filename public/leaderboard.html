@@ -127,7 +127,6 @@
                         <th>Wallet Address</th>
                         <th>Games Played</th>
                         <th>Wins</th>
-                        <th>Correct Answers</th>
                         <th>Total Winnings (USDC)</th>
                     </tr>
                 </thead>
@@ -208,7 +207,6 @@
                     <td class="truncated-address">${formattedAddress}</td>
                     <td>${gamesPlayed}</td>
                     <td>${wins} (${winRate})</td>
-                    <td>${user.correctAnswers || 0}</td>
                     <td class="winnings">${formattedWinnings}</td>
                 `;
                 leaderboardBody.appendChild(row);
