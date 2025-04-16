@@ -1024,6 +1024,14 @@
 
         socket.on('playerLeft', (username) => {
             console.log(`Player ${username} left the game`);
+            waitingMessage.textContent = `${username} left the game. Waiting for game resolution...`;
+        });
+        // The playerLeft handler should be minimal since gameOverForfeit handles the main logic. 
+        // Update it to avoid redundant UI updates.
+
+        /*
+        socket.on('playerLeft', (username) => {
+            console.log(`Player ${username} left the game`);
             
             // Clear any active game elements
             if (questionTimer) {
@@ -1056,22 +1064,21 @@
                 playSound('notification');
             }
         });
+        */
 
         socket.on('gameOverForfeit', (data) => {
             console.log('Forfeit game over:', data);
             const { winner, disconnectedPlayer, betAmount, payoutSignature, botOpponent, message } = data;
             
-            // Clear game UI completely
-            questionDiv.textContent = 'Game Over - Player Left!';
-            submitAnswerBtn.style.display = 'none';
-            countdownTimer.style.display = 'none';
+            // Clear all game-related UI
+            resetGame();
+            
+            // Update message
+            waitingMessage.textContent = message;
             
             // Calculate the appropriate winnings
             const multiplier = botOpponent ? 1.5 : 1.8;
             const winnings = betAmount * multiplier;
-            
-            // Generate the forfeit message
-            waitingMessage.textContent = message;
             
             // If this client is the winner, show additional details
             if (winner === connectedWallet) {
@@ -1087,24 +1094,25 @@
                 if (typeof celebrateWin === 'function') {
                     celebrateWin('forfeit');
                 }
+            } else if (botOpponent) {
+                waitingMessage.textContent += ` You left the game and lost to the bot.`;
             }
             
             // Update UI after forfeit
             setTimeout(() => {
                 playersDiv.innerHTML = '<h2>Game Ended Early</h2>';
                 joinGameBtn.style.display = 'inline-block';
-                optionsDiv.innerHTML = '';
                 
                 // Create a special message about the forfeit
                 const forfeitDiv = document.createElement('div');
                 forfeitDiv.className = 'forfeit-message';
                 forfeitDiv.innerHTML = `
                     <p>${disconnectedPlayer} left the game.</p>
-                    <p>${winner} is the winner.</p>
+                    <p>${botOpponent ? 'Bot' : winner} is the winner.</p>
                 `;
                 playersDiv.appendChild(forfeitDiv);
                 
-                // Update balance after forfeit win
+                // Update balance after forfeit
                 updateBalance();
             }, 3000);
         });
@@ -1275,10 +1283,12 @@
             
             if (questionTimer) {
                 clearTimeout(questionTimer);
+                questionTimer = null;
             }
             
             if (countdownInterval) {
                 clearInterval(countdownInterval);
+                countdownInterval = null;
             }
             
             countdownTimer.style.display = 'none';

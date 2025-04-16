@@ -993,7 +993,14 @@ io.on('connection', (socket) => {
         console.log('Client disconnected:', socket.id);
         
         // Check if player is in a matchmaking pool
-        // (Keep your existing matchmaking pool code unchanged)
+        for (const [betAmount, pool] of matchmakingPools.human.entries()) {
+            const playerIndex = pool.findIndex(p => p.socketId === socket.id);
+            if (playerIndex !== -1) {
+                console.log(`Removing player ${pool[playerIndex].walletAddress} from matchmaking pool`);
+                pool.splice(playerIndex, 1);
+                break;
+            }
+        }
         
         // Look through all game rooms
         for (const [roomId, room] of gameRooms.entries()) {
@@ -1002,53 +1009,83 @@ io.on('connection', (socket) => {
                 const disconnectedPlayer = room.players[playerIndex];
                 console.log(`Player ${disconnectedPlayer.username} left room ${roomId}`);
                 
-                // Handle bot rooms specially
+                // Remove the disconnected player
+                room.players.splice(playerIndex, 1);
+                
+                // Mark room as having a player leave
+                room.playerLeft = true;
+                
+                // Clear any ongoing question timer
+                if (room.questionTimeout) {
+                    clearTimeout(room.questionTimeout);
+                }
+                
+                // Handle bot game specially
                 if (room.roomMode === 'bot') {
-                    console.log(`Bot room ${roomId} abandoned - cleaning up`);
+                    console.log(`Player left bot game in room ${roomId}`);
+                    // Update stats for human player (bot doesn't get stats)
+                    const humanPlayer = room.players.find(p => !p.isBot) || disconnectedPlayer;
+                    const allPlayers = [
+                        {
+                            username: humanPlayer.username,
+                            score: humanPlayer.score || 0,
+                            isBot: false
+                        }
+                    ];
+                    
+                    // Update stats (no winner since player left)
+                    updatePlayerStats(allPlayers, {
+                        winner: null, // Bot wins, but we don't award winnings
+                        botOpponent: true,
+                        betAmount: room.betAmount
+                    });
+                    
+                    // Emit game over event to client (if they're still connected)
+                    io.to(roomId).emit('gameOverForfeit', {
+                        winner: 'Bot', // Bot wins by default
+                        disconnectedPlayer: disconnectedPlayer.username,
+                        betAmount: room.betAmount,
+                        message: `You left the game. The bot wins by default.`
+                    });
+                    
+                    // Clean up the room
                     gameRooms.delete(roomId);
                     return;
                 }
                 
-                // Remove the disconnected player
-                room.players.splice(playerIndex, 1);
-                
-                // If the game has started, it should end immediately
-                if (room.gameStarted && room.players.length > 0) {
+                // Handle human vs. human game
+                if (room.players.length > 0) {
                     const remainingPlayer = room.players[0];
                     
-                    // Don't award a win if the remaining player is a bot
+                    // Don't proceed if the remaining player is a bot
                     if (remainingPlayer.isBot) {
                         console.log(`Only a bot remained in room ${roomId} - cleaning up`);
                         gameRooms.delete(roomId);
                         return;
                     }
                     
-                    console.log(`Player ${disconnectedPlayer.username} left during active game. Declaring ${remainingPlayer.username} the winner.`);
+                    console.log(`Player ${disconnectedPlayer.username} left during game. Declaring ${remainingPlayer.username} the winner.`);
                     
-                    // Flag the room as having a player leave mid-game
-                    room.playerLeft = true;
+                    // Create players array with both remaining and disconnected player
+                    const allPlayers = [
+                        {
+                            username: remainingPlayer.username,
+                            score: remainingPlayer.score || 0,
+                            isBot: false
+                        },
+                        {
+                            username: disconnectedPlayer.username,
+                            score: disconnectedPlayer.score || 0,
+                            isBot: false
+                        }
+                    ];
                     
-                    // Cancel any ongoing question timer
-                    if (room.questionTimeout) {
-                        clearTimeout(room.questionTimeout);
-                    }
-                    
-                    // Notify remaining players and end the game
-                    io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
-                    
-                    // Process the payout for the remaining player
-                    const botOpponent = room.players.some(p => p.isBot);
-                    handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, botOpponent);
-                    
-                    // The room will be deleted in handlePlayerLeftWin
-                } else if (room.players.length === 0) {
+                    // Process the win and update stats
+                    handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, false, allPlayers);
+                } else {
                     // If no players left, delete the room
                     console.log(`Deleting empty room ${roomId}`);
                     gameRooms.delete(roomId);
-                } else {
-                    // Notify the remaining player that the other player left
-                    console.log(`Notifying remaining player in room ${roomId} about departure`);
-                    io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
                 }
                 break;
             }
@@ -1824,14 +1861,17 @@ async function handleGameOverEmit(room, players, winner, roomId) {
     }
   }
 
-  async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, betAmount, botOpponent) {
+  async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, betAmount, botOpponent, allPlayers) {
     try {
         // Calculate winnings using the appropriate multiplier
         const multiplier = botOpponent ? 1.5 : 1.8;
         const winningAmount = betAmount * multiplier;
         
         // Process payout for the remaining player - transaction only
-        const payoutSignature = await sendWinnings(remainingPlayer.username, betAmount, botOpponent);
+        let payoutSignature = null;
+        if (!botOpponent) {
+            payoutSignature = await sendWinnings(remainingPlayer.username, betAmount, botOpponent);
+        }
         
         // Emit game over event with forfeit information
         io.to(roomId).emit('gameOverForfeit', {
@@ -1843,17 +1883,7 @@ async function handleGameOverEmit(room, players, winner, roomId) {
             message: `${disconnectedPlayer.username} left the game. ${remainingPlayer.username} wins by forfeit!`
         });
         
-        // Create players array with both remaining player and disconnected player
-        const allPlayers = [
-            remainingPlayer,
-            {
-                username: disconnectedPlayer.username,
-                score: disconnectedPlayer.score || 0,
-                isBot: disconnectedPlayer.isBot || false
-            }
-        ];
-        
-        // Update ALL player stats in one place only
+        // Update stats for all players
         await updatePlayerStats(allPlayers, {
             winner: remainingPlayer.username,
             botOpponent: botOpponent,
@@ -1867,7 +1897,7 @@ async function handleGameOverEmit(room, players, winner, roomId) {
         io.to(roomId).emit('gameError', 'Error processing win after player left. Please contact support.');
         gameRooms.delete(roomId);
     }
-}
+ }
 
 function logGameRoomsState() {
     console.log('Current game rooms state:');
@@ -1937,7 +1967,7 @@ setInterval(() => {
 }, 60000); // Run every minute
 
 async function updatePlayerStats(players, roomData) {
-    console.log('Updating stats for all players');
+    console.log('Updating stats for all players:', players);
     const winner = roomData.winner;
     const multiplier = roomData.botOpponent ? 1.5 : 1.8;
     const winningAmount = roomData.betAmount * multiplier;
@@ -1945,7 +1975,6 @@ async function updatePlayerStats(players, roomData) {
     console.log(`Game stats: winner=${winner}, betAmount=${roomData.betAmount}, winnings=${winningAmount}`);
     
     try {
-        // Loop through all players and update their stats
         for (const player of players) {
             // Skip bots
             if (player.isBot) {
@@ -1971,12 +2000,12 @@ async function updatePlayerStats(players, roomData) {
                 };
                 
                 // Only add wins and winnings for the winner
-                if (isWinner) {
+                if (isWinner && !roomData.botOpponent) {
                     updateObj.$inc.wins = 1;
                     updateObj.$inc.totalWinnings = winningAmount;
                 }
                 
-                // Log the exact update we're applying
+                // Log the exact update
                 console.log(`Update for ${player.username}:`, JSON.stringify(updateObj));
                 
                 // Perform the update
@@ -1984,8 +2013,8 @@ async function updatePlayerStats(players, roomData) {
                     { walletAddress: player.username },
                     updateObj,
                     { 
-                        upsert: true, // Create if doesn't exist
-                        new: true // Return the updated document
+                        upsert: true,
+                        new: true
                     }
                 );
                 
