@@ -86,9 +86,9 @@ const config = {
     TREASURY_KEYPAIR: Keypair.fromSecretKey(
         Buffer.from(JSON.parse(process.env.TREASURY_SECRET_KEY))
     ),
-    HOUSE_FEE_PERCENT: 2.5,
-    MIN_BET_AMOUNT: 1,
-    MAX_BET_AMOUNT: 100,
+    // HOUSE_FEE_PERCENT: 2.5,
+    // MIN_BET_AMOUNT: 1,
+    // MAX_BET_AMOUNT: 100,
     connection: new Connection('https://api.devnet.solana.com', 'confirmed')
 };
 
@@ -136,8 +136,11 @@ const verifyUSDCTransaction = async (transactionSignature, expectedAmount, sende
     try {
         const connection = new Connection(process.env.SOLANA_RPC_URL, 'confirmed');
         
-        // Get transaction details
-        const transaction = await connection.getTransaction(transactionSignature);
+        const transaction = await connection.getTransaction(transactionSignature, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0 // Support legacy and versioned transactions
+        });
+        
         if (!transaction) {
             console.error('Transaction not found');
             return false;
@@ -239,7 +242,6 @@ class TriviaBot {
         };
     }
     
-    // For analytics and fun facts
     getStats() {
         return {
             totalQuestionsAnswered: this.answersGiven.length,
@@ -403,8 +405,6 @@ io.on('connection', (socket) => {
             let roomId;
             let joinedExistingRoom = false;
     
-            // Look for an existing room with same bet amount
-            // (Keeping the same room matching logic, but we'll handle game mode selection later)
             for (const [id, room] of gameRooms.entries()) {
                 // Skip rooms that are in bot mode or already have a game in progress
                 if (room.roomMode === 'bot' || room.gameStarted || room.players.some(p => p.isBot)) {
@@ -412,7 +412,6 @@ io.on('connection', (socket) => {
                     continue;
                 }
                 
-                // Skip rooms that already have 2 or more players
                 if (room.players.length >= 2) {
                     console.log(`Skipping room ${id} because it already has ${room.players.length} players`);
                     continue;
@@ -487,7 +486,6 @@ io.on('connection', (socket) => {
             return socket.emit('gameError', 'Room not found');
         }
         
-        // If this room is explicitly set for bot play, don't allow starting with human players
         if (room.roomMode === 'bot') {
             console.log(`Room ${roomId} is set for bot play, not starting regular game`);
             return;
@@ -498,9 +496,7 @@ io.on('connection', (socket) => {
             room.roomMode = 'human';
             console.log(`Room ${roomId} marked for human vs human play`);
             
-            // First check if we should try to find a match in another room
             if (room.players.length === 1) {
-                // Try to find another player waiting for human opponent
                 let matchFound = false;
                 
                 for (const [otherRoomId, otherRoom] of gameRooms.entries()) {
@@ -518,20 +514,16 @@ io.on('connection', (socket) => {
                     
                     const player = room.players[0]; // The current player
                     
-                    // Add player to the match room
                     otherRoom.players.push(player);
                     socket.leave(roomId);
                     socket.join(otherRoomId);
                     
-                    // Notify both players
                     socket.emit('matchFound', { newRoomId: otherRoomId });
                     io.to(otherRoomId).emit('playerJoined', player.username);
                     
-                    // Start the game
                     otherRoom.gameStarted = true;
                     startGame(otherRoomId);
                     
-                    // Delete the original room since it's now empty
                     gameRooms.delete(roomId);
                     
                     matchFound = true;
@@ -876,7 +868,6 @@ io.on('connection', (socket) => {
         const humanPlayers = room.players.filter(p => !p.isBot);
         
         if (humanPlayers.length > 1) {
-            // This shouldn't happen - room should only have the requesting player
             console.error(`Room ${roomId} already has ${humanPlayers.length} human players, can't add bot`);
             socket.emit('gameError', 'Cannot add bot to a room with multiple players');
             return;
@@ -891,13 +882,10 @@ io.on('connection', (socket) => {
         }
         
         console.log(`Setting room ${roomId} to bot mode`);
-        // Set room mode to bot - this explicitly marks the room for bot play
         room.roomMode = 'bot';
         
-        // Start single player game with bot
         await startSinglePlayerGame(roomId);
         
-        // Log game rooms state after bot request
         console.log('Game rooms state AFTER bot request:');
         logGameRoomsState();
     });
@@ -1002,20 +990,15 @@ io.on('connection', (socket) => {
             }
         }
         
-        // Look through all game rooms
         for (const [roomId, room] of gameRooms.entries()) {
             const playerIndex = room.players.findIndex(p => p.id === socket.id);
             if (playerIndex !== -1) {
                 const disconnectedPlayer = room.players[playerIndex];
                 console.log(`Player ${disconnectedPlayer.username} left room ${roomId}`);
                 
-                // Remove the disconnected player
                 room.players.splice(playerIndex, 1);
-                
-                // Mark room as having a player leave
                 room.playerLeft = true;
                 
-                // Clear any ongoing question timer
                 if (room.questionTimeout) {
                     clearTimeout(room.questionTimeout);
                 }
@@ -1033,7 +1016,6 @@ io.on('connection', (socket) => {
                         }
                     ];
                     
-                    // Update stats (no winner since player left)
                     updatePlayerStats(allPlayers, {
                         winner: null, // Bot wins, but we don't award winnings
                         botOpponent: true,
@@ -1385,9 +1367,7 @@ async function handleGameOver(room, roomId) {
     // Determine winner
     let winner = null;
     
-    // Handle different player count scenarios
     if (sortedPlayers.length === 1) {
-        // If only one player is left (the other left mid-game)
         winner = sortedPlayers[0].username;
     } else if (sortedPlayers.length > 1) {
         if (sortedPlayers[0].score > sortedPlayers[1].score) {
@@ -1524,7 +1504,6 @@ const suspiciousActivity = {
     wallets: {}
 };
 
-// Add new function for single player mode
 async function startSinglePlayerGame(roomId) {
     console.log('Starting single player game with bot for room:', roomId);
     const room = gameRooms.get(roomId);
@@ -1533,7 +1512,6 @@ async function startSinglePlayerGame(roomId) {
         return;
     }
     
-    // Make sure the room is still set for bot mode
     if (room.roomMode !== 'bot') {
         console.log(`Room ${roomId} is no longer in bot mode, not adding bot`);
         return;
@@ -1622,7 +1600,6 @@ async function startSinglePlayerGame(roomId) {
     }
 }
 
-// Add helper functions if they don't exist
 function findAvailableRoom(betAmount) {
     for (const [roomId, room] of gameRooms.entries()) {
         if (room.players.length < 2 && room.betAmount === betAmount) {
@@ -1661,7 +1638,7 @@ async function sendWinnings(winnerAddress, betAmount, botOpponent = false) {
         
         console.log(`Sending winnings: ${winningAmount} USDC to ${winnerAddress} (vs bot: ${botOpponent})`);
         
-        // Just handle the blockchain transaction
+        // Handle the blockchain transaction
         const treasuryTokenAccount = await findAssociatedTokenAddress(
             config.TREASURY_WALLET,
             config.USDC_MINT
@@ -1683,7 +1660,11 @@ async function sendWinnings(winnerAddress, betAmount, botOpponent = false) {
 
         const transaction = new Transaction().add(transferIx);
         transaction.feePayer = config.TREASURY_WALLET;
-        transaction.recentBlockhash = (await config.connection.getRecentBlockhash()).blockhash;
+        
+        // Use getLatestBlockhash instead of getRecentBlockhash
+        const { blockhash, lastValidBlockHeight } = await config.connection.getLatestBlockhash('confirmed');
+        transaction.recentBlockhash = blockhash;
+        transaction.lastValidBlockHeight = lastValidBlockHeight;
 
         const signature = await sendAndConfirmTransaction(
             config.connection,
@@ -1702,7 +1683,8 @@ async function sendWinnings(winnerAddress, betAmount, botOpponent = false) {
 async function verifyPayout(signature, expectedAmount, recipientAddress) {
     try {
         const transaction = await connection.getTransaction(signature, {
-            commitment: 'confirmed'
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0
         });
 
         if (!transaction || transaction.meta.err) {
@@ -1781,18 +1763,15 @@ function determineWinner(players) {
     if (!players || players.length === 0) {
       return null;
     }
-    
+    /*
     if (players.length === 1) {
       // Single player mode - win if score is 5 or more (or use your threshold logic)
       return players[0].score >= 5 ? players[0].username : null;
     }
-    
-    // For multiplayer (including bot play)
+    */
     if (players[0].score > players[1].score) {
-      // Clear winner by score
       return players[0].username;
     } else if (players[0].score === players[1].score) {
-      // Tie on score, use response time as tiebreaker
       return players[0].totalResponseTime <= players[1].totalResponseTime ? 
         players[0].username : players[1].username;
     }
@@ -1801,7 +1780,6 @@ function determineWinner(players) {
     return null;
   }
 
-// Helper function to handle game over emit logic
 async function handleGameOverEmit(room, players, winner, roomId) {
     try {
       const isSinglePlayer = room.players.length === 1;
