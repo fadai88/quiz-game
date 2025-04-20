@@ -86,13 +86,10 @@ const config = {
     TREASURY_KEYPAIR: Keypair.fromSecretKey(
         Buffer.from(JSON.parse(process.env.TREASURY_SECRET_KEY))
     ),
-    // HOUSE_FEE_PERCENT: 2.5,
-    // MIN_BET_AMOUNT: 1,
-    // MAX_BET_AMOUNT: 100,
-    connection: new Connection('https://api.devnet.solana.com', 'confirmed')
+    connection: new Connection(process.env.SOLANA_RPC_URL, 'confirmed')
 };
 
-// Initialize connection
+
 const connection = config.connection;
 
 // Initialize programId
@@ -131,7 +128,6 @@ try {
     };
 }
 
-// Add the verification function
 const verifyUSDCTransaction = async (transactionSignature, expectedAmount, senderAddress, recipientAddress) => {
     try {
         const connection = new Connection(process.env.SOLANA_RPC_URL, 'confirmed');
@@ -315,10 +311,7 @@ io.on('connection', (socket) => {
                     tokenProvided: !!recaptchaToken 
                 });
             }
-            
-            // Continue with rest of login process...
 
-            // 3. Signature verification
             try {
                 const publicKey = new PublicKey(walletAddress);
                 const signatureBytes = Uint8Array.from(atob(signature), c => c.charCodeAt(0));
@@ -399,7 +392,60 @@ io.on('connection', (socket) => {
             const { walletAddress, betAmount, transactionSignature } = data;
             console.log('Join game request:', { walletAddress, betAmount, transactionSignature });
     
-            // Transaction verification code would go here
+            let transaction = null;
+            let retries = 10;
+            while (retries > 0 && !transaction) {
+                try {
+                    transaction = await connection.getTransaction(transactionSignature, {
+                        commitment: 'confirmed',
+                        maxSupportedTransactionVersion: 0
+                    });
+                    if (transaction) break;
+                } catch (error) {
+                    console.log(`Retry ${11 - retries}: Transaction not found yet`);
+                    retries--;
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+    
+            if (!transaction) {
+                throw new Error('Transaction verification failed after retries');
+            }
+    
+            // Verify transaction success
+            if (transaction.meta.err) {
+                throw new Error('Transaction failed on chain');
+            }
+    
+            // Verify amount (if needed)
+            const postTokenBalances = transaction.meta.postTokenBalances;
+            const preTokenBalances = transaction.meta.preTokenBalances;
+    
+            if (!postTokenBalances || !preTokenBalances) {
+                throw new Error('Transaction token balances not found');
+            }
+    
+            // Find treasury token account changes
+            const treasuryPostBalance = postTokenBalances.find(b => 
+                b.owner === config.TREASURY_WALLET.toString()
+            );
+    
+            const treasuryPreBalance = preTokenBalances.find(b => 
+                b.owner === config.TREASURY_WALLET.toString()
+            );
+    
+            if (!treasuryPostBalance || !treasuryPreBalance) {
+                throw new Error('Treasury balance change not found in transaction');
+            }
+    
+            const balanceChange = (treasuryPostBalance.uiTokenAmount.uiAmount || 0) -
+                                (treasuryPreBalance.uiTokenAmount.uiAmount || 0);
+    
+            if (Math.abs(balanceChange - betAmount) > 0.001) {
+                throw new Error('Transaction amount mismatch');
+            }
+    
+            console.log('Transaction verified successfully');
     
             // Create or join game room
             let roomId;
@@ -556,8 +602,60 @@ io.on('connection', (socket) => {
             const { walletAddress, betAmount, transactionSignature, gameMode } = data;
             console.log('Human matchmaking request:', { walletAddress, betAmount, gameMode });
             
-            // Verify the transaction (keeping your existing verification logic)
-            // Transaction verification code would go here...
+            let transaction = null;
+            let retries = 5;
+            while (retries > 0 && !transaction) {
+                try {
+                    transaction = await connection.getTransaction(transactionSignature, {
+                        commitment: 'confirmed',
+                        maxSupportedTransactionVersion: 0
+                    });
+                    if (transaction) break;
+                } catch (error) {
+                    console.log(`Retry ${6 - retries}: Transaction not found yet`);
+                    retries--;
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+    
+            if (!transaction) {
+                throw new Error('Transaction verification failed after retries');
+            }
+    
+            // Verify transaction success
+            if (transaction.meta.err) {
+                throw new Error('Transaction failed on chain');
+            }
+    
+            // Verify amount (if needed)
+            const postTokenBalances = transaction.meta.postTokenBalances;
+            const preTokenBalances = transaction.meta.preTokenBalances;
+    
+            if (!postTokenBalances || !preTokenBalances) {
+                throw new Error('Transaction token balances not found');
+            }
+    
+            // Find treasury token account changes
+            const treasuryPostBalance = postTokenBalances.find(b => 
+                b.owner === config.TREASURY_WALLET.toString()
+            );
+    
+            const treasuryPreBalance = preTokenBalances.find(b => 
+                b.owner === config.TREASURY_WALLET.toString()
+            );
+    
+            if (!treasuryPostBalance || !treasuryPreBalance) {
+                throw new Error('Treasury balance change not found in transaction');
+            }
+    
+            const balanceChange = (treasuryPostBalance.uiTokenAmount.uiAmount || 0) -
+                                (treasuryPreBalance.uiTokenAmount.uiAmount || 0);
+    
+            if (Math.abs(balanceChange - betAmount) > 0.001) {
+                throw new Error('Transaction amount mismatch');
+            }
+    
+            console.log('Transaction verified successfully');
             
             // Create or access the matchmaking pool for this bet amount
             if (!matchmakingPools.human.has(betAmount)) {
@@ -655,8 +753,60 @@ io.on('connection', (socket) => {
             const { walletAddress, betAmount, transactionSignature, gameMode } = data;
             console.log('Bot game request:', { walletAddress, betAmount, gameMode });
             
-            // Verify the transaction (keeping your existing verification logic)
-            // Transaction verification code would go here...
+            let transaction = null;
+            let retries = 5;
+            while (retries > 0 && !transaction) {
+                try {
+                    transaction = await connection.getTransaction(transactionSignature, {
+                        commitment: 'confirmed',
+                        maxSupportedTransactionVersion: 0
+                    });
+                    if (transaction) break;
+                } catch (error) {
+                    console.log(`Retry ${6 - retries}: Transaction not found yet`);
+                    retries--;
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+    
+            if (!transaction) {
+                throw new Error('Transaction verification failed after retries');
+            }
+    
+            // Verify transaction success
+            if (transaction.meta.err) {
+                throw new Error('Transaction failed on chain');
+            }
+    
+            // Verify amount (if needed)
+            const postTokenBalances = transaction.meta.postTokenBalances;
+            const preTokenBalances = transaction.meta.preTokenBalances;
+    
+            if (!postTokenBalances || !preTokenBalances) {
+                throw new Error('Transaction token balances not found');
+            }
+    
+            // Find treasury token account changes
+            const treasuryPostBalance = postTokenBalances.find(b => 
+                b.owner === config.TREASURY_WALLET.toString()
+            );
+    
+            const treasuryPreBalance = preTokenBalances.find(b => 
+                b.owner === config.TREASURY_WALLET.toString()
+            );
+    
+            if (!treasuryPostBalance || !treasuryPreBalance) {
+                throw new Error('Treasury balance change not found in transaction');
+            }
+    
+            const balanceChange = (treasuryPostBalance.uiTokenAmount.uiAmount || 0) -
+                                (treasuryPreBalance.uiTokenAmount.uiAmount || 0);
+    
+            if (Math.abs(balanceChange - betAmount) > 0.001) {
+                throw new Error('Transaction amount mismatch');
+            }
+    
+            console.log('Transaction verified successfully');
             
             // Create a game room with the player
             const roomId = generateRoomId();
@@ -1196,10 +1346,7 @@ function startNextQuestion(roomId) {
         });
     }
 
-    // Set a timeout for this question
     room.questionTimeout = setTimeout(async () => {
-        // If time's up and the human player hasn't answered,
-        // mark as incorrect and proceed
         room.players.forEach(player => {
             if (!player.isBot && !player.answered) {
                 player.answered = true;
@@ -1212,7 +1359,6 @@ function startNextQuestion(roomId) {
     }, 10000); // 10 seconds for each question
 }
 
-// Helper function to handle bot answers
 async function handleBotAnswer(room, bot, currentQuestion) {
     try {
         const botAnswer = await bot.answerQuestion(
@@ -1264,7 +1410,6 @@ async function handleQuestionTimeout(room, roomId) {
     }
 }
 
-// Helper function to emit round completion
 function emitRoundComplete(room, correctAnswer, botAnswer) {
     io.to(room.id).emit('roundComplete', {
         correctAnswer: correctAnswer,
