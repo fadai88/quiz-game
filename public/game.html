@@ -246,6 +246,7 @@
         const socket = io();
         let connectedWallet = null;
         let currentRoomId = null;
+        let currentBetAmount = null;
         let questionStartTime;
         let questionTimer;
         let correctAnswer;
@@ -692,23 +693,18 @@
 
         function resetUIAfterError() {
             resetJoinUI();
-            
-            // Clear the waiting message
             waitingMessage.textContent = '';
-            
-            // Make sure the game choice modal is closed
             const modal = document.getElementById('gameChoiceModal');
             if (modal.style.display === 'flex') {
                 modal.style.display = 'none';
             }
-            
-            // Clear any pending timeouts
             if (waitingTimeout) {
                 clearTimeout(waitingTimeout);
             }
-            
-            // Reset the room ID
             currentRoomId = null;
+            currentBetAmount = null;
+            gameTransactionInfo = null;
+            console.log('UI reset after error');
         }
 
         
@@ -718,66 +714,21 @@
                     alert('Please connect your wallet first');
                     return;
                 }
-
                 const betAmount = parseInt(document.getElementById('betAmount').value);
-                console.log('Attempting to bet:', betAmount, 'USDC');
-                
-                updateUIForJoining();
-
-                console.log('Checking USDC balance...');
-                const balanceResult = await usdcManager.getUSDCBalance(connectedWallet);
-                console.log('Current USDC balance:', balanceResult.balance);
-
-                if (balanceResult.balance < betAmount) {
-                    resetJoinUI();
-                    alert(`Not enough USDC. You have ${balanceResult.balance} but need ${betAmount}`);
+                if (isNaN(betAmount) || betAmount <= 0) {
+                    alert('Please enter a valid bet amount');
                     return;
                 }
-
-                console.log('Creating transfer transaction...');
-                const transaction = await usdcManager.createTransferTransaction(connectedWallet, betAmount);
-                
-                console.log('Requesting signature...');
-                const signed = await window.solana.signTransaction(transaction);
-                
-                console.log('Sending transaction...');
-                const txSignature = await connection.sendRawTransaction(signed.serialize());
-                
-                console.log('Waiting for transaction confirmation...');
-                waitingMessage.textContent = 'Waiting for transaction confirmation...';
-                
-                const confirmation = await connection.confirmTransaction({
-                    signature: txSignature,
-                    blockhash: transaction.recentBlockhash,
-                    lastValidBlockHeight: transaction.lastValidBlockHeight
-                }, 'confirmed');
-
-                if (confirmation.value?.err) {
-                    throw new Error(`Transaction failed: ${confirmation.value.err}`);
-                }
-
-                // Add a small delay to ensure transaction is fully processed
-                await new Promise(resolve => setTimeout(resolve, 2000));
-
-                console.log('Transaction confirmed:', txSignature);
-                waitingMessage.textContent = 'Transaction confirmed. Choose game mode...';
-
-                // Store transaction information for later
-                gameTransactionInfo = {
-                    walletAddress: connectedWallet,
-                    betAmount,
-                    transactionSignature: txSignature
-                };
-
-                joinGameBtn.style.display = 'none';
-                
-                // Show game mode selection immediately
-                showGameChoiceModal();
-
+                console.log('Selected bet amount:', betAmount, 'USDC');
+                currentBetAmount = betAmount; // Store bet amount
+                updateUIForJoining();
+                waitingMessage.textContent = 'Waiting for game mode selection...';
+                showGameChoiceModal(); // Show modal directly
             } catch (error) {
                 console.error('Join game error:', error);
-                resetJoinUI();
+                resetUIAfterError();
                 alert('Failed to join game: ' + error.message);
+                joinGameBtn.disabled = false;
             }
         });
 
@@ -796,6 +747,14 @@
             console.error('Failed to join game:', error);
             resetJoinUI();
             alert('Failed to join game: ' + error);
+            joinGameBtn.disabled = false;
+        });
+
+        socket.on('matchmakingError', ({ message }) => {
+            console.error('Matchmaking/bot game error:', message);
+            resetUIAfterError();
+            alert(`Game setup failed: ${message}`);
+            joinGameBtn.disabled = false;
         });
 
         submitAnswerBtn.addEventListener('click', () => {
@@ -841,15 +800,6 @@
             } catch (error) {
                 console.error('Error highlighting answer:', error);
             }
-        });
-
-
-        socket.on('gameJoined', (roomId) => {
-            currentRoomId = roomId;
-            console.log(`Joined room ${roomId}`);
-            
-            // Always show the game choice modal when joining a room
-            showGameChoiceModal();
         });
 
         socket.on('botGameReady', (data) => {
@@ -1026,45 +976,7 @@
             console.log(`Player ${username} left the game`);
             waitingMessage.textContent = `${username} left the game. Waiting for game resolution...`;
         });
-        // The playerLeft handler should be minimal since gameOverForfeit handles the main logic. 
-        // Update it to avoid redundant UI updates.
 
-        /*
-        socket.on('playerLeft', (username) => {
-            console.log(`Player ${username} left the game`);
-            
-            // Clear any active game elements
-            if (questionTimer) {
-                clearTimeout(questionTimer);
-            }
-            
-            if (countdownInterval) {
-                clearInterval(countdownInterval);
-            }
-            
-            // Hide the submit button and stop the countdown
-            submitAnswerBtn.style.display = 'none';
-            countdownTimer.style.display = 'none';
-            
-            // Update message to indicate game is ending
-            waitingMessage.textContent = `${username} left the game. Waiting for forfeit resolution...`;
-            
-            // Show a visual indicator of processing
-            const loadingIndicator = document.createElement('div');
-            loadingIndicator.className = 'loading-spinner';
-            loadingIndicator.innerHTML = '⌛';
-            waitingMessage.appendChild(loadingIndicator);
-            
-            // Show pending resolution status
-            questionDiv.textContent = 'Game Over - Player Left';
-            optionsDiv.innerHTML = '<p>Your opponent left the game. The game is ending and winnings will be awarded shortly.</p>';
-            
-            // Play notification sound if available
-            if (typeof playSound === 'function') {
-                playSound('notification');
-            }
-        });
-        */
 
         socket.on('gameOverForfeit', (data) => {
             console.log('Forfeit game over:', data);
@@ -1319,51 +1231,83 @@
             console.log('Showing game choice modal');
             const modal = document.getElementById('gameChoiceModal');
             modal.style.display = 'flex';
-            
-            document.getElementById('waitForPlayerBtn').onclick = function() {
-                console.log('Player chose to play against human');
-                modal.style.display = 'none';
-                
-                if (!gameTransactionInfo) {
-                    console.error('No transaction info available');
-                    waitingMessage.textContent = 'Error starting game. Please try again.';
-                    resetJoinUI();
-                    return;
+
+            document.getElementById('waitForPlayerBtn').onclick = async function() {
+                try {
+                    console.log('Player chose to play against human');
+                    modal.style.display = 'none';
+
+                    if (!connectedWallet || !window.solana?.isConnected) {
+                        throw new Error('Wallet disconnected. Please reconnect.');
+                    }
+                    if (!currentBetAmount) {
+                        throw new Error('No bet amount available. Please start a new game.');
+                    }
+                    
+                    waitingMessage.textContent = 'Preparing transaction for matchmaking...';
+                    const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount);
+                    const signedTransaction = await window.solana.signTransaction(transaction);
+                    const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
+                    console.log('Transaction signature for human matchmaking:', txSignature);
+                    
+                    //waitingMessage.textContent = 'Testing fake signature for human matchmaking...';
+                    //const fakeSignature = 'INVALID_SIGNATURE_12345'; // Fake signature
+                    //console.log('Using fake transaction signature:', fakeSignature);
+                    //waitingMessage.textContent = 'Testing reused signature for human matchmaking...';
+                    //const reusedSignature = '5chazeT2yF1vfYnJUGxFhSsJ9DVJAEtM937bkiiKuRPVzbZcSmjqaUphsoRPnv1j7SumrcxJS8n4abzbE1bWa6WA'; // Replace with your signature
+                    //console.log('Using reused transaction signature:', reusedSignature);
+                    socket.emit('joinHumanMatchmaking', {
+                        walletAddress: connectedWallet,
+                        betAmount: currentBetAmount,
+                        transactionSignature: txSignature,
+                        gameMode: 'human'
+                    });
+                    waitingMessage.textContent = 'Looking for another player...';
+                } catch (error) {
+                    console.error('Human matchmaking error:', error);
+                    waitingMessage.textContent = 'Error starting matchmaking. Please try again.';
+                    resetUIAfterError();
+                    alert('Failed to join human matchmaking: ' + error.message);
                 }
-                
-                waitingMessage.textContent = 'Looking for another player...';
-                
-                // Join matchmaking pool for human opponents
-                socket.emit('joinHumanMatchmaking', {
-                    ...gameTransactionInfo,
-                    gameMode: 'human'
-                });
-                
-                // Reset transaction info as it's been sent
-                gameTransactionInfo = null;
             };
-            
-            document.getElementById('playAgainstBotBtn').onclick = function() {
-                console.log('Player chose to play against bot');
-                modal.style.display = 'none';
-                
-                if (!gameTransactionInfo) {
-                    console.error('No transaction info available');
-                    waitingMessage.textContent = 'Error starting game. Please try again.';
-                    resetJoinUI();
-                    return;
+
+            document.getElementById('playAgainstBotBtn').onclick = async function() {
+                try {
+                    console.log('Player chose to play against bot');
+                    modal.style.display = 'none';
+
+                    if (!connectedWallet || !window.solana?.isConnected) {
+                        throw new Error('Wallet disconnected. Please reconnect.');
+                    }
+                    if (!currentBetAmount) {
+                        throw new Error('No bet amount available. Please start a new game.');
+                    }
+                    
+                    waitingMessage.textContent = 'Preparing transaction for bot game...';
+                    const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount);
+                    const signedTransaction = await window.solana.signTransaction(transaction);
+                    const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
+                    console.log('Transaction signature for bot game:', txSignature);
+                    
+                    //waitingMessage.textContent = 'Testing fake signature for bot game...';
+                    //const fakeBotSignature = 'INVALID_SIGNATURE_12345'; // Fake signature
+                    //console.log('Using fake transaction signature:', fakeBotSignature);
+                    //waitingMessage.textContent = 'Testing reused signature for human matchmaking...';
+                    //const reusedSignature = '5chazeT2yF1vfYnJUGxFhSsJ9DVJAEtM937bkiiKuRPVzbZcSmjqaUphsoRPnv1j7SumrcxJS8n4abzbE1bWa6WA'; // Replace with your signature
+                    //console.log('Using reused transaction signature:', reusedSignature);
+                    socket.emit('joinBotGame', {
+                        walletAddress: connectedWallet,
+                        betAmount: currentBetAmount,
+                        transactionSignature: txSignature,
+                        gameMode: 'bot'
+                    });
+                    waitingMessage.textContent = 'Creating a game with a bot opponent...';
+                } catch (error) {
+                    console.error('Bot game error:', error);
+                    waitingMessage.textContent = 'Error starting bot game. Please try again.';
+                    resetUIAfterError();
+                    alert('Failed to start bot game: ' + error.message);
                 }
-                
-                waitingMessage.textContent = 'Creating a game with a bot opponent...';
-                
-                // Request a bot game directly
-                socket.emit('joinBotGame', {
-                    ...gameTransactionInfo,
-                    gameMode: 'bot'
-                });
-                
-                // Reset transaction info as it's been sent
-                gameTransactionInfo = null;
             };
         }
 

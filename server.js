@@ -10,6 +10,14 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, Keypair } = require('@solana/web3.js');
+const Joi = require('joi');
+
+const transactionSchema = Joi.object({
+    walletAddress: Joi.string().required(),
+    betAmount: Joi.number().min(1).max(100).required(),
+    transactionSignature: Joi.string().required(),
+    gameMode: Joi.string().optional()
+});
 
 const { 
     createAssociatedTokenAccountInstruction, 
@@ -105,28 +113,29 @@ if (process.env.PROGRAM_ID) {
 const Redis = require('ioredis');
 let redisClient;
 
-try {
-    redisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
-    console.log('Redis connected for rate limiting');
-} catch (error) {
-    console.warn('Redis not available, using in-memory rate limiting');
-    // Simple in-memory storage for rate limiting if Redis isn't available
-    redisClient = {
-        rateLimits: {},
-        async get(key) {
-            return this.rateLimits[key] || 0;
-        },
-        async set(key, value, expType, expValue) {
-            this.rateLimits[key] = value;
-            // Simple expiration
-            if (expType === 'EX') {
-                setTimeout(() => {
-                    delete this.rateLimits[key];
-                }, expValue * 1000);
-            }
-        }
-    };
+async function initializeRedis() {
+    try {
+        redisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+        redisClient.on('connect', () => {
+            console.log('Redis connected successfully');
+        });
+        redisClient.on('error', (err) => {
+            console.error('Redis connection error:', err);
+        });
+        // Test Redis connection
+        await redisClient.set('test', '1', 'EX', 60);
+        const testValue = await redisClient.get('test');
+        console.log(`Redis test: ${testValue}`); // Should log "Redis test: 1"
+    } catch (error) {
+        console.error('Failed to initialize Redis:', error);
+        throw new Error('Redis is required for transaction replay protection');
+    }
 }
+
+initializeRedis().catch((err) => {
+    console.error(err.message);
+    process.exit(1); // Exit if Redis is unavailable
+});
 
 const verifyUSDCTransaction = async (transactionSignature, expectedAmount, senderAddress, recipientAddress) => {
     try {
@@ -178,9 +187,93 @@ const verifyUSDCTransaction = async (transactionSignature, expectedAmount, sende
     }
 };
 
+async function verifyAndValidateTransaction(signature, expectedAmount, senderAddress, recipientAddress, maxRetries = 3, retryDelay = 500) {
+    console.log(`Verifying transaction ${signature} for ${expectedAmount} USDC from ${senderAddress} to ${recipientAddress}`);
+
+    // Check for transaction reuse
+    const key = `tx:${signature}`;
+    const exists = await redisClient.get(key);
+    console.log(`Checked Redis for ${key}: ${exists ? 'Found' : 'Not found'}`);
+    if (exists) {
+        console.error(`Transaction ${signature} already used`);
+        throw new Error('This transaction has already been used');
+    }
+
+    let transaction;
+    try {
+        transaction = await verifyTransactionWithStatus(signature, maxRetries, retryDelay);
+    } catch (error) {
+        if (error.message.includes('Invalid param: Invalid')) {
+            console.error(`Invalid transaction signature: ${signature}`);
+            throw new Error('Invalid transaction signature');
+        }
+        console.error(`Error verifying transaction ${signature}: ${error.message}`);
+        throw new Error('Failed to verify transaction');
+    }
+
+    if (!transaction) {
+        console.error(`Transaction ${signature} not found after ${maxRetries} retries`);
+        throw new Error('Transaction could not be verified');
+    }
+    if (transaction.meta.err) {
+        console.error(`Transaction ${signature} failed on chain: ${JSON.stringify(transaction.meta.err)}`);
+        throw new Error('Transaction failed on the blockchain');
+    }
+
+    const postTokenBalances = transaction.meta.postTokenBalances;
+    const preTokenBalances = transaction.meta.preTokenBalances;
+    if (!postTokenBalances || !preTokenBalances) {
+        console.error(`Transaction ${signature} missing token balances`);
+        throw new Error('Transaction missing required balance information');
+    }
+
+    const treasuryPostBalance = postTokenBalances.find(b => b.owner === recipientAddress);
+    const treasuryPreBalance = preTokenBalances.find(b => b.owner === recipientAddress);
+    if (!treasuryPostBalance || !treasuryPreBalance) {
+        console.error(`Transaction ${signature} missing treasury balance change`);
+        throw new Error('Transaction does not include treasury balance change');
+    }
+
+    const balanceChange = (treasuryPostBalance.uiTokenAmount.uiAmount || 0) - (treasuryPreBalance.uiTokenAmount.uiAmount || 0);
+    if (Math.abs(balanceChange - expectedAmount) > 0.001) {
+        console.error(`Transaction ${signature} amount mismatch: expected ${expectedAmount}, got ${balanceChange}`);
+        throw new Error('Transaction amount does not match the expected bet');
+    }
+
+    await redisClient.set(key, 1, 'EX', 86400);
+    console.log(`Stored transaction signature ${signature} in Redis`);
+    console.log(`Transaction ${signature} verified successfully`);
+    return transaction;
+}
+
+async function verifyTransactionWithStatus(signature, maxRetries = 3, retryDelay = 500) {
+    for (let i = 0; i < maxRetries; i++) {
+        console.log(`Attempt ${i + 1} to verify transaction ${signature}`);
+        const statuses = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+        const status = statuses.value[0];
+        if (status && status.confirmationStatus === 'confirmed') {
+            console.log(`Transaction ${signature} confirmed`);
+            return await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+        }
+        console.log(`Transaction ${signature} not confirmed yet, retrying in ${retryDelay}ms`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
+    console.log(`Transaction ${signature} verification failed after ${maxRetries} retries`);
+    return null;
+}
+
+async function rateLimitEvent(walletAddress, eventName, maxRequests = 5, windowSeconds = 60) {
+    const key = `rate:${walletAddress}:${eventName}`;
+    const count = await redisClient.get(key) || 0;
+    if (count >= maxRequests) {
+        throw new Error(`Too many ${eventName} requests`);
+    }
+    await redisClient.set(key, parseInt(count) + 1, 'EX', windowSeconds);
+}
+
 const BOT_LEVELS = {
-    MEDIUM: { correctRate: 0.7, responseTimeRange: [1500, 4000] },  // 70% correct, 1.5-4 seconds
-    HARD: { correctRate: 0.9, responseTimeRange: [1000, 3000] }     // 90% correct, 1-3 seconds
+    MEDIUM: { correctRate: 0.4, responseTimeRange: [1500, 4000] },  // 70% correct, 1.5-4 seconds
+    HARD: { correctRate: 0.6, responseTimeRange: [1000, 3000] }     // 90% correct, 1-3 seconds
 };
 
 // Bot player class
@@ -387,136 +480,32 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('joinGame', async (data) => {
+    socket.on('joinGame', (data) => {
         try {
-            const { walletAddress, betAmount, transactionSignature } = data;
-            console.log('Join game request:', { walletAddress, betAmount, transactionSignature });
+            const { walletAddress, betAmount } = data;
+            console.log('Join game request:', { walletAddress, betAmount });
     
-            let transaction = null;
-            let retries = 10;
-            while (retries > 0 && !transaction) {
-                try {
-                    transaction = await connection.getTransaction(transactionSignature, {
-                        commitment: 'confirmed',
-                        maxSupportedTransactionVersion: 0
-                    });
-                    if (transaction) break;
-                } catch (error) {
-                    console.log(`Retry ${11 - retries}: Transaction not found yet`);
-                    retries--;
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
+            // Validate input
+            if (!walletAddress || typeof betAmount !== 'number' || betAmount <= 0) {
+                throw new Error('Invalid join game request');
             }
     
-            if (!transaction) {
-                throw new Error('Transaction verification failed after retries');
-            }
-    
-            // Verify transaction success
-            if (transaction.meta.err) {
-                throw new Error('Transaction failed on chain');
-            }
-    
-            // Verify amount (if needed)
-            const postTokenBalances = transaction.meta.postTokenBalances;
-            const preTokenBalances = transaction.meta.preTokenBalances;
-    
-            if (!postTokenBalances || !preTokenBalances) {
-                throw new Error('Transaction token balances not found');
-            }
-    
-            // Find treasury token account changes
-            const treasuryPostBalance = postTokenBalances.find(b => 
-                b.owner === config.TREASURY_WALLET.toString()
-            );
-    
-            const treasuryPreBalance = preTokenBalances.find(b => 
-                b.owner === config.TREASURY_WALLET.toString()
-            );
-    
-            if (!treasuryPostBalance || !treasuryPreBalance) {
-                throw new Error('Treasury balance change not found in transaction');
-            }
-    
-            const balanceChange = (treasuryPostBalance.uiTokenAmount.uiAmount || 0) -
-                                (treasuryPreBalance.uiTokenAmount.uiAmount || 0);
-    
-            if (Math.abs(balanceChange - betAmount) > 0.001) {
-                throw new Error('Transaction amount mismatch');
-            }
-    
-            console.log('Transaction verified successfully');
-    
-            // Create or join game room
-            let roomId;
-            let joinedExistingRoom = false;
-    
-            for (const [id, room] of gameRooms.entries()) {
-                // Skip rooms that are in bot mode or already have a game in progress
-                if (room.roomMode === 'bot' || room.gameStarted || room.players.some(p => p.isBot)) {
-                    console.log(`Skipping room ${id} because it's in bot mode or game already started`);
-                    continue;
-                }
-                
-                if (room.players.length >= 2) {
-                    console.log(`Skipping room ${id} because it already has ${room.players.length} players`);
-                    continue;
-                }
-                
-                if (room.betAmount === betAmount) {
-                    roomId = id;
-                    joinedExistingRoom = true;
-                    break;
-                }
-            }
-    
-            if (!roomId) {
-                roomId = generateRoomId();
-                console.log(`Creating new room ${roomId} for player ${walletAddress}`);
-                gameRooms.set(roomId, {
-                    players: [],
-                    questions: [],
-                    currentQuestionIndex: 0,
-                    answersReceived: 0,
-                    betAmount: betAmount,
-                    waitingTimeout: null,
-                    gameStarted: false,
-                    roomMode: 'waiting' // Default mode: waiting for player to choose
-                });
-            } else {
-                console.log(`Joining existing room ${roomId} with bet amount ${betAmount}`);
-            }
-    
-            const room = gameRooms.get(roomId);
-            
-            // Check if this wallet is already in the room
-            const existingPlayer = room.players.find(p => p.username === walletAddress);
-            if (existingPlayer) {
-                console.log(`Player ${walletAddress} is already in room ${roomId}`);
-                socket.emit('joinGameFailure', 'You are already in this game');
-                return;
-            }
-            
-            room.players.push({
-                id: socket.id,
-                username: walletAddress,
-                score: 0,
-                totalResponseTime: 0
+            // Create a temporary room
+            const roomId = generateRoomId();
+            gameRooms.set(roomId, {
+                mode: 'waiting',
+                gameStarted: false,
+                betAmount,
+                players: [{ username: walletAddress, score: 0, totalResponseTime: 0 }],
+                questions: [],
+                currentQuestionIndex: 0
             });
     
             socket.join(roomId);
-            console.log(`Player ${walletAddress} joined room ${roomId}`);
+            console.log(`Player ${walletAddress} joined temporary room ${roomId}`);
             socket.emit('gameJoined', roomId);
     
-            // Notify existing players if joining an existing room
-            if (joinedExistingRoom) {
-                console.log(`Notifying existing players in room ${roomId} about new player ${walletAddress}`);
-                socket.to(roomId).emit('playerJoined', walletAddress);
-            }
-    
-            console.log('Game rooms state AFTER joining:');
             logGameRoomsState();
-    
         } catch (error) {
             console.error('Join game error:', error);
             socket.emit('joinGameFailure', error.message);
@@ -599,71 +588,55 @@ io.on('connection', (socket) => {
 
     socket.on('joinHumanMatchmaking', async (data) => {
         try {
+            /*
+            await rateLimitEvent(data.walletAddress, 'joinGame');
+            const { error } = transactionSchema.validate(data);
+                if (error) {
+                    console.error('Validation error:', error.message);
+                    socket.emit('joinGameFailure', error.message);
+                    return;
+                }
+            */
             const { walletAddress, betAmount, transactionSignature, gameMode } = data;
             console.log('Human matchmaking request:', { walletAddress, betAmount, gameMode });
-            
-            let transaction = null;
-            let retries = 5;
-            while (retries > 0 && !transaction) {
-                try {
-                    transaction = await connection.getTransaction(transactionSignature, {
-                        commitment: 'confirmed',
-                        maxSupportedTransactionVersion: 0
-                    });
-                    if (transaction) break;
-                } catch (error) {
-                    console.log(`Retry ${6 - retries}: Transaction not found yet`);
-                    retries--;
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+            // Use environment variables for retries and delay
+            const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
+            const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
+    
+            // Verify and validate transaction
+            const transaction = await verifyAndValidateTransaction(
+                transactionSignature,
+                betAmount,
+                walletAddress,
+                config.TREASURY_WALLET.toString(),
+                maxRetries,
+                retryDelay
+            );
+    
+            console.log('Transaction verified successfully');
+
+            for (const [roomId, room] of gameRooms.entries()) {
+                const playerIndex = room.players.findIndex(p => p.username === walletAddress);
+                if (playerIndex !== -1) {
+                    room.players.splice(playerIndex, 1);
+                    socket.leave(roomId);
+                    console.log(`Player ${walletAddress} left room ${roomId} for matchmaking`);
+                    if (room.players.length === 0) {
+                        gameRooms.delete(roomId);
+                        console.log(`Deleted empty room ${roomId}`);
+                    }
+                    break;
                 }
             }
     
-            if (!transaction) {
-                throw new Error('Transaction verification failed after retries');
-            }
-    
-            // Verify transaction success
-            if (transaction.meta.err) {
-                throw new Error('Transaction failed on chain');
-            }
-    
-            // Verify amount (if needed)
-            const postTokenBalances = transaction.meta.postTokenBalances;
-            const preTokenBalances = transaction.meta.preTokenBalances;
-    
-            if (!postTokenBalances || !preTokenBalances) {
-                throw new Error('Transaction token balances not found');
-            }
-    
-            // Find treasury token account changes
-            const treasuryPostBalance = postTokenBalances.find(b => 
-                b.owner === config.TREASURY_WALLET.toString()
-            );
-    
-            const treasuryPreBalance = preTokenBalances.find(b => 
-                b.owner === config.TREASURY_WALLET.toString()
-            );
-    
-            if (!treasuryPostBalance || !treasuryPreBalance) {
-                throw new Error('Treasury balance change not found in transaction');
-            }
-    
-            const balanceChange = (treasuryPostBalance.uiTokenAmount.uiAmount || 0) -
-                                (treasuryPreBalance.uiTokenAmount.uiAmount || 0);
-    
-            if (Math.abs(balanceChange - betAmount) > 0.001) {
-                throw new Error('Transaction amount mismatch');
-            }
-    
-            console.log('Transaction verified successfully');
-            
             // Create or access the matchmaking pool for this bet amount
             if (!matchmakingPools.human.has(betAmount)) {
                 matchmakingPools.human.set(betAmount, []);
             }
-            
+    
             const pool = matchmakingPools.human.get(betAmount);
-            
+    
             // Check if this player is already in the pool
             const existingPlayer = pool.find(p => p.walletAddress === walletAddress);
             if (existingPlayer) {
@@ -671,13 +644,11 @@ io.on('connection', (socket) => {
                 socket.emit('matchmakingError', { message: 'You are already in matchmaking' });
                 return;
             }
-            
+    
             // Check for an available match
             if (pool.length > 0) {
-                // Match found! Create a game room for these players
-                const opponent = pool.shift(); // Remove the first waiting player
+                const opponent = pool.shift();
                 
-                // Create a new game room
                 const roomId = generateRoomId();
                 console.log(`Creating game room ${roomId} for matched players ${walletAddress} and ${opponent.walletAddress}`);
                 
@@ -704,24 +675,19 @@ io.on('connection', (socket) => {
                     roomMode: 'multiplayer'
                 });
                 
-                // Join both sockets to the room
                 socket.join(roomId);
                 const opponentSocket = io.sockets.sockets.get(opponent.socketId);
                 if (opponentSocket) {
                     opponentSocket.join(roomId);
                 }
                 
-                // Notify both players
                 io.to(roomId).emit('matchFound', { 
                     gameRoomId: roomId, 
                     players: [walletAddress, opponent.walletAddress]
                 });
                 
-                // Start the game
                 await startGame(roomId);
-                
             } else {
-                // No match yet, add player to waiting pool
                 console.log(`Adding player ${walletAddress} to matchmaking pool for ${betAmount}`);
                 
                 pool.push({
@@ -731,16 +697,14 @@ io.on('connection', (socket) => {
                     transactionSignature
                 });
                 
-                // Notify the player they're in matchmaking
                 socket.emit('matchmakingJoined', { 
                     waitingRoomId: `matchmaking-${betAmount}`, 
                     position: pool.length 
                 });
             }
-            
-            // Log the state of the pools
+    
             logMatchmakingState();
-            
+    
         } catch (error) {
             console.error('Error joining human matchmaking:', error);
             socket.emit('matchmakingError', { message: error.message });
@@ -750,64 +714,48 @@ io.on('connection', (socket) => {
     // Handler for bot games
     socket.on('joinBotGame', async (data) => {
         try {
+            /*
+            await rateLimitEvent(data.walletAddress, 'joinGame');
+            const { error } = transactionSchema.validate(data);
+                if (error) {
+                    console.error('Validation error:', error.message);
+                    socket.emit('joinGameFailure', error.message);
+                    return;
+                }
+            */
             const { walletAddress, betAmount, transactionSignature, gameMode } = data;
             console.log('Bot game request:', { walletAddress, betAmount, gameMode });
-            
-            let transaction = null;
-            let retries = 5;
-            while (retries > 0 && !transaction) {
-                try {
-                    transaction = await connection.getTransaction(transactionSignature, {
-                        commitment: 'confirmed',
-                        maxSupportedTransactionVersion: 0
-                    });
-                    if (transaction) break;
-                } catch (error) {
-                    console.log(`Retry ${6 - retries}: Transaction not found yet`);
-                    retries--;
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+            // Use environment variables for retries and delay
+            const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
+            const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
+    
+            // Verify and validate transaction
+            const transaction = await verifyAndValidateTransaction(
+                transactionSignature,
+                betAmount,
+                walletAddress,
+                config.TREASURY_WALLET.toString(),
+                maxRetries,
+                retryDelay
+            );
+    
+            console.log('Transaction verified successfully');
+
+            for (const [roomId, room] of gameRooms.entries()) {
+                const playerIndex = room.players.findIndex(p => p.username === walletAddress);
+                if (playerIndex !== -1) {
+                    room.players.splice(playerIndex, 1);
+                    socket.leave(roomId);
+                    console.log(`Player ${walletAddress} left room ${roomId} for matchmaking`);
+                    if (room.players.length === 0) {
+                        gameRooms.delete(roomId);
+                        console.log(`Deleted empty room ${roomId}`);
+                    }
+                    break;
                 }
             }
     
-            if (!transaction) {
-                throw new Error('Transaction verification failed after retries');
-            }
-    
-            // Verify transaction success
-            if (transaction.meta.err) {
-                throw new Error('Transaction failed on chain');
-            }
-    
-            // Verify amount (if needed)
-            const postTokenBalances = transaction.meta.postTokenBalances;
-            const preTokenBalances = transaction.meta.preTokenBalances;
-    
-            if (!postTokenBalances || !preTokenBalances) {
-                throw new Error('Transaction token balances not found');
-            }
-    
-            // Find treasury token account changes
-            const treasuryPostBalance = postTokenBalances.find(b => 
-                b.owner === config.TREASURY_WALLET.toString()
-            );
-    
-            const treasuryPreBalance = preTokenBalances.find(b => 
-                b.owner === config.TREASURY_WALLET.toString()
-            );
-    
-            if (!treasuryPostBalance || !treasuryPreBalance) {
-                throw new Error('Treasury balance change not found in transaction');
-            }
-    
-            const balanceChange = (treasuryPostBalance.uiTokenAmount.uiAmount || 0) -
-                                (treasuryPreBalance.uiTokenAmount.uiAmount || 0);
-    
-            if (Math.abs(balanceChange - betAmount) > 0.001) {
-                throw new Error('Transaction amount mismatch');
-            }
-    
-            console.log('Transaction verified successfully');
-            
             // Create a game room with the player
             const roomId = generateRoomId();
             console.log(`Creating bot game room ${roomId} for player ${walletAddress}`);
@@ -829,22 +777,18 @@ io.on('connection', (socket) => {
                 roomMode: 'bot'
             });
             
-            // Join the socket to the room
             socket.join(roomId);
             
-            // Notify the player
             const botName = chooseBotName();
             socket.emit('botGameCreated', { 
                 gameRoomId: roomId, 
                 botName 
             });
             
-            // Start the single player game with a bot
             await startSinglePlayerGame(roomId);
             
-            // Log the state
             logGameRoomsState();
-            
+    
         } catch (error) {
             console.error('Error creating bot game:', error);
             socket.emit('matchmakingError', { message: error.message });
@@ -1503,16 +1447,22 @@ async function handleGameOver(room, roomId) {
         return (a.totalResponseTime || 0) - (b.totalResponseTime || 0);
     });
 
-    // Log detailed game results
-    console.log('Game Results:');
-    sortedPlayers.forEach(player => {
-        console.log(`Player ${player.username}${player.isBot ? ' (BOT)' : ''}: ${player.score} correct answers, Response time: ${player.totalResponseTime}ms`);
-    });
-
-    // Determine winner
     let winner = null;
-    
-    if (sortedPlayers.length === 1) {
+    const botOpponent = room.players.some(p => p.isBot);
+    const isSinglePlayer = room.players.length === 1;
+
+    if (botOpponent && sortedPlayers.length === 2) {
+        const humanPlayer = sortedPlayers.find(p => !p.isBot);
+        const botPlayer = sortedPlayers.find(p => p.isBot);
+        if (humanPlayer && botPlayer) {
+            if (humanPlayer.score > botPlayer.score) {
+                winner = humanPlayer.username;
+            } else if (humanPlayer.score === botPlayer.score) {
+                winner = humanPlayer.totalResponseTime <= botPlayer.totalResponseTime ? 
+                    humanPlayer.username : botPlayer.username;
+            }
+        }
+    } else if (sortedPlayers.length === 1) {
         winner = sortedPlayers[0].username;
     } else if (sortedPlayers.length > 1) {
         if (sortedPlayers[0].score > sortedPlayers[1].score) {
@@ -1523,18 +1473,13 @@ async function handleGameOver(room, roomId) {
         }
     }
 
-    const botOpponent = room.players.some(p => p.isBot);
-    const isSinglePlayer = room.players.length === 1;
-
     try {
-        // Update player stats FIRST - this is the only place stats are updated
         await updatePlayerStats(room.players, {
             winner: winner,
             botOpponent: botOpponent,
             betAmount: room.betAmount
         });
         
-        // If there's a winner and they're not a bot, send winnings (transaction only)
         if (winner && !sortedPlayers.find(p => p.username === winner)?.isBot) {
             try {
                 const payoutSignature = await sendWinnings(winner, room.betAmount, botOpponent);
@@ -1568,7 +1513,6 @@ async function handleGameOver(room, roomId) {
                 });
             }
         } else {
-            // No payout (no winner or bot won)
             io.to(roomId).emit('gameOver', {
                 players: sortedPlayers.map(p => ({ 
                     username: p.username, 
@@ -1583,7 +1527,6 @@ async function handleGameOver(room, roomId) {
             });
         }
 
-        // Finally, clean up the room
         gameRooms.delete(roomId);
     } catch (error) {
         console.error('Error handling game over:', error);
@@ -2099,7 +2042,6 @@ async function updatePlayerStats(players, roomData) {
     
     try {
         for (const player of players) {
-            // Skip bots
             if (player.isBot) {
                 console.log(`Skipping stats update for bot: ${player.username}`);
                 continue;
@@ -2114,7 +2056,6 @@ async function updatePlayerStats(players, roomData) {
             console.log(`Updating stats for player: ${player.username} (winner: ${isWinner})`);
             
             try {
-                // Build the update object
                 const updateObj = {
                     $inc: {
                         gamesPlayed: 1,
@@ -2122,23 +2063,17 @@ async function updatePlayerStats(players, roomData) {
                     }
                 };
                 
-                // Only add wins and winnings for the winner
-                if (isWinner && !roomData.botOpponent) {
+                if (isWinner) {
                     updateObj.$inc.wins = 1;
                     updateObj.$inc.totalWinnings = winningAmount;
                 }
                 
-                // Log the exact update
                 console.log(`Update for ${player.username}:`, JSON.stringify(updateObj));
                 
-                // Perform the update
                 const result = await User.findOneAndUpdate(
                     { walletAddress: player.username },
                     updateObj,
-                    { 
-                        upsert: true,
-                        new: true
-                    }
+                    { upsert: true, new: true }
                 );
                 
                 console.log(`Stats updated for ${player.username}:`, {
