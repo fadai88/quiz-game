@@ -124,8 +124,6 @@
     </style>
     <script>
         const splToken = window.SplToken;
-        
-        // Initialize Buffer from polyfill
         window.Buffer = buffer.Buffer;
         
         const TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
@@ -499,7 +497,7 @@
                     
                 // Initialize balance updates
                 await updateBalance();
-                balanceUpdateInterval = setInterval(updateBalance, 10000);
+                balanceUpdateInterval = setInterval(updateBalance, 30000);
                 
                 // After basic initialization, try to initialize the wallet connection
                 await initializeWallet();
@@ -572,6 +570,7 @@
                         const signed = await window.solana.signTransaction(transaction);
                         await connection.sendRawTransaction(signed.serialize());
                         console.log('Created USDC token account');
+                        await updateBalance();
                     } catch (error) {
                         console.error('Error creating token account:', error);
                     }
@@ -603,7 +602,7 @@
                         recaptchaToken = await grecaptcha.execute(window.recaptchaSiteKey, {action: 'wallet_connect'});
                     } catch (error) {
                         console.error('reCAPTCHA error:', error);
-                        // Continue without reCAPTCHA if there's an error
+                        // Continue without reCAPTCHA if there's an error.    LOOK AT THIS!!!!!
                     }
                 }
 
@@ -638,7 +637,7 @@
                 
                 // Update balance immediately after connecting
                 await updateBalance();
-                
+                balanceUpdateInterval = setInterval(updateBalance, 30000);
                 return connectedWallet;
             } catch (err) {
                 console.error('Error connecting to wallet:', err);
@@ -1263,6 +1262,7 @@
                         gameMode: 'human'
                     });
                     waitingMessage.textContent = 'Looking for another player...';
+                    await updateBalance();
                 } catch (error) {
                     console.error('Human matchmaking error:', error);
                     waitingMessage.textContent = 'Error starting matchmaking. Please try again.';
@@ -1302,6 +1302,7 @@
                         gameMode: 'bot'
                     });
                     waitingMessage.textContent = 'Creating a game with a bot opponent...';
+                    await updateBalance();
                 } catch (error) {
                     console.error('Bot game error:', error);
                     waitingMessage.textContent = 'Error starting bot game. Please try again.';

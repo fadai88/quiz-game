@@ -86,8 +86,6 @@ const matchmakingPools = {
     human: new Map() // Map of betAmount -> array of waiting players
 };
 
-
-// Initialize config
 const config = {
     USDC_MINT: new PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
     TREASURY_WALLET: new PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
@@ -100,7 +98,6 @@ const config = {
 
 const connection = config.connection;
 
-// Initialize programId
 let programId;
 if (process.env.PROGRAM_ID) {
     programId = new PublicKey(process.env.PROGRAM_ID);
@@ -480,9 +477,17 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('joinGame', (data) => {
+    socket.on('joinGame', async(data) => {
         try {
+            await rateLimitEvent(walletAddress, 'joinGame', 5, 60);
+            const { error } = transactionSchema.validate(data);
+            if (error) {
+                console.error('Validation error:', error.message);
+                socket.emit('joinGameFailure', error.message);
+                return;
+            }
             const { walletAddress, betAmount } = data;
+            
             console.log('Join game request:', { walletAddress, betAmount });
     
             // Validate input
@@ -588,7 +593,6 @@ io.on('connection', (socket) => {
 
     socket.on('joinHumanMatchmaking', async (data) => {
         try {
-            /*
             await rateLimitEvent(data.walletAddress, 'joinGame');
             const { error } = transactionSchema.validate(data);
                 if (error) {
@@ -596,7 +600,7 @@ io.on('connection', (socket) => {
                     socket.emit('joinGameFailure', error.message);
                     return;
                 }
-            */
+            
             const { walletAddress, betAmount, transactionSignature, gameMode } = data;
             console.log('Human matchmaking request:', { walletAddress, betAmount, gameMode });
     
@@ -714,7 +718,6 @@ io.on('connection', (socket) => {
     // Handler for bot games
     socket.on('joinBotGame', async (data) => {
         try {
-            /*
             await rateLimitEvent(data.walletAddress, 'joinGame');
             const { error } = transactionSchema.validate(data);
                 if (error) {
@@ -722,7 +725,7 @@ io.on('connection', (socket) => {
                     socket.emit('joinGameFailure', error.message);
                     return;
                 }
-            */
+            
             const { walletAddress, betAmount, transactionSignature, gameMode } = data;
             console.log('Bot game request:', { walletAddress, betAmount, gameMode });
     
@@ -985,75 +988,82 @@ io.on('connection', (socket) => {
     });
 
     socket.on('submitAnswer', async ({ roomId, answer, responseTime, username }) => {
-        console.log(`Received answer from ${username} in room ${roomId}:`, { answer, responseTime });
-        
-        const room = gameRooms.get(roomId);
-        if (!room) {
-            console.error(`Room ${roomId} not found for answer submission`);
-            return;
-        }
+        try {
+            await rateLimitEvent(username, 'submitAnswer', 20, 60); // Allow 20 submissions per minute
     
-        const player = room.players.find(p => p.username === username && !p.isBot);
-        if (!player) {
-            console.error(`Player ${username} not found in room ${roomId} or is a bot`);
-            return;
-        }
-    
-        player.totalResponseTime = (player.totalResponseTime || 0) + responseTime;
-        player.lastAnswer = answer;
-        player.answered = true;
-    
-        const currentQuestion = room.questions[room.currentQuestionIndex];
-        const isCorrect = answer === currentQuestion.correctAnswer;
-    
-        if (isCorrect) {
-            player.score = (player.score || 0) + 1;
-            console.log(`Correct answer from ${username}. New score: ${player.score}`);
-            try {
-                await User.findOneAndUpdate(
-                    { walletAddress: username },
-                    { 
-                        $inc: { 
-                            correctAnswers: 1,
-                            totalPoints: 1
-                        } 
-                    }
-                );
-            } catch (error) {
-                console.error('Error updating user stats:', error);
+            console.log(`Received answer from ${username} in room ${roomId}:`, { answer, responseTime });
+            
+            const room = gameRooms.get(roomId);
+            if (!room) {
+                console.error(`Room ${roomId} not found for answer submission`);
+                return;
             }
-        } else {
-            console.log(`Incorrect answer from ${username}. Score unchanged: ${player.score}`);
-        }
-    
-        // Send result only to the player who answered
-        socket.emit('answerResult', {
-            username: player.username,
-            isCorrect,
-            correctAnswer: currentQuestion.correctAnswer
-        });
-    
-        // Check if all players (human and bot) have answered
-        if (room.players.every(p => p.answered)) {
-            console.log(`All players answered in room ${roomId}`);
-            // When all players have answered, send the complete results to everyone
-            io.to(roomId).emit('roundComplete', {
-                correctAnswer: currentQuestion.correctAnswer,
-                playerResults: room.players.map(p => ({
-                    username: p.username,
-                    isCorrect: p.lastAnswer === currentQuestion.correctAnswer,
-                    answer: p.lastAnswer,
-                    isBot: p.isBot || false
-                }))
+        
+            const player = room.players.find(p => p.username === username && !p.isBot);
+            if (!player) {
+                console.error(`Player ${username} not found in room ${roomId} or is a bot`);
+                return;
+            }
+        
+            player.totalResponseTime = (player.totalResponseTime || 0) + responseTime;
+            player.lastAnswer = answer;
+            player.answered = true;
+        
+            const currentQuestion = room.questions[room.currentQuestionIndex];
+            const isCorrect = answer === currentQuestion.correctAnswer;
+        
+            if (isCorrect) {
+                player.score = (player.score || 0) + 1;
+                console.log(`Correct answer from ${username}. New score: ${player.score}`);
+                try {
+                    await User.findOneAndUpdate(
+                        { walletAddress: username },
+                        { 
+                            $inc: { 
+                                correctAnswers: 1,
+                                totalPoints: 1
+                            } 
+                        }
+                    );
+                } catch (error) {
+                    console.error('Error updating user stats:', error);
+                }
+            } else {
+                console.log(`Incorrect answer from ${username}. Score unchanged: ${player.score}`);
+            }
+        
+            // Send result only to the player who answered
+            socket.emit('answerResult', {
+                username: player.username,
+                isCorrect,
+                correctAnswer: currentQuestion.correctAnswer
             });
-            await completeQuestion(roomId);
-        } else {
-            // Just update that a player has answered without revealing the answer
-            socket.to(roomId).emit('playerAnswered', {
-                username,
-                isBot: false,
-                responseTime
-            });
+        
+            // Check if all players (human and bot) have answered
+            if (room.players.every(p => p.answered)) {
+                console.log(`All players answered in room ${roomId}`);
+                // When all players have answered, send the complete results to everyone
+                io.to(roomId).emit('roundComplete', {
+                    correctAnswer: currentQuestion.correctAnswer,
+                    playerResults: room.players.map(p => ({
+                        username: p.username,
+                        isCorrect: p.lastAnswer === currentQuestion.correctAnswer,
+                        answer: p.lastAnswer,
+                        isBot: p.isBot || false
+                    }))
+                });
+                await completeQuestion(roomId);
+            } else {
+                // Just update that a player has answered without revealing the answer
+                socket.to(roomId).emit('playerAnswered', {
+                    username,
+                    isBot: false,
+                    responseTime
+                });
+            }
+        } catch (error) {
+            console.error('Rate limit error for submitAnswer:', error.message);
+            socket.emit('answerError', 'Too many answer submissions. Please try again later.');
         }
     });
 
@@ -1260,7 +1270,6 @@ function startNextQuestion(roomId) {
         clearTimeout(room.questionTimeout);
     }
 
-    // If room has a bot, get their answer
     const bot = room.players.find(p => p.isBot);
     if (bot) {
         // Bot will answer according to its difficulty
@@ -1270,10 +1279,22 @@ function startNextQuestion(roomId) {
             currentQuestion.correctAnswer
         ).then(botAnswer => {
             // Emit that bot has answered
-            io.to(roomId).emit('playerAnswered', bot.username);
+            io.to(roomId).emit('playerAnswered', {
+                username: bot.username,
+                isBot: true,
+                responseTime: botAnswer.responseTime
+            });
+            
+            // Check if the human player still exists
+            const humanPlayer = room.players.find(p => !p.isBot);
+            if (!humanPlayer) {
+                // Human player has disconnected, treat as a forfeit
+                console.log(`Human player disconnected from bot game in room ${roomId}`);
+                handleBotGameForfeit(roomId, bot);
+                return;
+            }
             
             // Check if both players have answered
-            const humanPlayer = room.players.find(p => !p.isBot);
             if (humanPlayer.answered) {
                 io.to(roomId).emit('roundComplete', {
                     correctAnswer: currentQuestion.correctAnswer,
@@ -1282,11 +1303,17 @@ function startNextQuestion(roomId) {
                         isCorrect: p === bot ? 
                             botAnswer.isCorrect : 
                             p.lastAnswer === currentQuestion.correctAnswer,
-                        answer: p === bot ? botAnswer.answer : p.lastAnswer
+                        answer: p === bot ? botAnswer.answer : p.lastAnswer,
+                        isBot: p.isBot || false
                     }))
                 });
                 completeQuestion(roomId);
             }
+        }).catch(error => {
+            console.error(`Error processing bot answer in room ${roomId}:`, error);
+            // Handle bot error gracefully
+            io.to(roomId).emit('gameError', 'Error processing bot response. Game ended.');
+            gameRooms.delete(roomId);
         });
     }
 
@@ -1964,6 +1991,61 @@ async function handleGameOverEmit(room, players, winner, roomId) {
         gameRooms.delete(roomId);
     }
  }
+
+ async function handleBotGameForfeit(roomId, bot) {
+    const room = gameRooms.get(roomId);
+    if (!room) {
+        console.log(`Room ${roomId} not found during bot game forfeit`);
+        return;
+    }
+
+    console.log(`Handling bot game forfeit in room ${roomId}`);
+
+    // Clear any existing timeout
+    if (room.questionTimeout) {
+        clearTimeout(room.questionTimeout);
+    }
+
+    // Create player data for stats update
+    const humanPlayer = { // Reconstruct human player data since they're no longer in the room
+        username: room.players.find(p => !p.isBot)?.username || 'Unknown',
+        score: 0,
+        isBot: false
+    };
+
+    const allPlayers = [
+        {
+            username: humanPlayer.username,
+            score: 0,
+            isBot: false
+        },
+        {
+            username: bot.username,
+            score: bot.score || 0,
+            isBot: true
+        }
+    ];
+
+    // Emit game over event
+    io.to(roomId).emit('gameOverForfeit', {
+        winner: bot.username,
+        disconnectedPlayer: humanPlayer.username,
+        betAmount: room.betAmount,
+        botOpponent: true,
+        message: `You left the game. ${bot.username} wins by default.`
+    });
+
+    // Update stats (only for human player, as bot doesn't need stats)
+    await updatePlayerStats(allPlayers, {
+        winner: bot.username,
+        botOpponent: true,
+        betAmount: room.betAmount
+    });
+
+    // Clean up the room
+    gameRooms.delete(roomId);
+    console.log(`Bot game room ${roomId} cleaned up after forfeit`);
+}
 
 function logGameRoomsState() {
     console.log('Current game rooms state:');
