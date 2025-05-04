@@ -268,6 +268,14 @@ async function rateLimitEvent(walletAddress, eventName, maxRequests = 5, windowS
     await redisClient.set(key, parseInt(count) + 1, 'EX', windowSeconds);
 }
 
+function shuffleArray(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+}
+
 const BOT_LEVELS = {
     MEDIUM: { correctRate: 0.4, responseTimeRange: [1500, 4000] },  // 70% correct, 1.5-4 seconds
     HARD: { correctRate: 0.6, responseTimeRange: [1000, 3000] }     // 90% correct, 1-3 seconds
@@ -593,7 +601,7 @@ io.on('connection', (socket) => {
 
     socket.on('joinHumanMatchmaking', async (data) => {
         try {
-            await rateLimitEvent(data.walletAddress, 'joinGame');
+            await rateLimitEvent(data.walletAddress, 'joinGame');   // should this bea wait rateLimitEvent(data.walletAddress, 'joinHuman<atchmaking');
             const { error } = transactionSchema.validate(data);
                 if (error) {
                     console.error('Validation error:', error.message);
@@ -718,7 +726,7 @@ io.on('connection', (socket) => {
     // Handler for bot games
     socket.on('joinBotGame', async (data) => {
         try {
-            await rateLimitEvent(data.walletAddress, 'joinGame');
+            await rateLimitEvent(data.walletAddress, 'joinBotGame', 3, 60); // Stricter: 3 bot games per minute
             const { error } = transactionSchema.validate(data);
                 if (error) {
                     console.error('Validation error:', error.message);
@@ -1010,7 +1018,7 @@ io.on('connection', (socket) => {
             player.answered = true;
         
             const currentQuestion = room.questions[room.currentQuestionIndex];
-            const isCorrect = answer === currentQuestion.correctAnswer;
+            const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
         
             if (isCorrect) {
                 player.score = (player.score || 0) + 1;
@@ -1036,7 +1044,7 @@ io.on('connection', (socket) => {
             socket.emit('answerResult', {
                 username: player.username,
                 isCorrect,
-                correctAnswer: currentQuestion.correctAnswer
+                correctAnswer: currentQuestion.shuffledCorrectAnswer // Use shuffled correct answer
             });
         
             // Check if all players (human and bot) have answered
@@ -1044,10 +1052,10 @@ io.on('connection', (socket) => {
                 console.log(`All players answered in room ${roomId}`);
                 // When all players have answered, send the complete results to everyone
                 io.to(roomId).emit('roundComplete', {
-                    correctAnswer: currentQuestion.correctAnswer,
+                    correctAnswer: currentQuestion.shuffledCorrectAnswer, // Use shuffled correct answer
                     playerResults: room.players.map(p => ({
                         username: p.username,
-                        isCorrect: p.lastAnswer === currentQuestion.correctAnswer,
+                        isCorrect: p.lastAnswer === currentQuestion.shuffledCorrectAnswer,
                         answer: p.lastAnswer,
                         isBot: p.isBot || false
                     }))
@@ -1252,14 +1260,20 @@ function startNextQuestion(roomId) {
     const currentQuestion = room.questions[room.currentQuestionIndex];
     const questionStartTime = moment();
 
+    // Shuffle options and determine new correct answer index
+    const shuffledOptions = shuffleArray([...currentQuestion.options]);
+    const shuffledCorrectAnswer = shuffledOptions.indexOf(currentQuestion.options[currentQuestion.correctAnswer]);
+    currentQuestion.shuffledOptions = shuffledOptions;
+    currentQuestion.shuffledCorrectAnswer = shuffledCorrectAnswer;
+
     // Send question to human players
     io.to(roomId).emit('nextQuestion', {
         question: currentQuestion.question,
-        options: currentQuestion.options,
+        options: shuffledOptions,
         questionNumber: room.currentQuestionIndex + 1,
         totalQuestions: room.questions.length,
-        questionStartTime: questionStartTime.valueOf(),
-        correctAnswerIndex: currentQuestion.correctAnswer
+        questionStartTime: questionStartTime.valueOf()
+        // Removed correctAnswerIndex
     });
 
     room.questionStartTime = questionStartTime;
@@ -1270,13 +1284,14 @@ function startNextQuestion(roomId) {
         clearTimeout(room.questionTimeout);
     }
 
+    // If room has a bot, get their answer
     const bot = room.players.find(p => p.isBot);
     if (bot) {
         // Bot will answer according to its difficulty
         bot.answerQuestion(
             currentQuestion.question, 
-            currentQuestion.options, 
-            currentQuestion.correctAnswer
+            currentQuestion.shuffledOptions, // Use shuffled options
+            shuffledCorrectAnswer // Use shuffled correct answer
         ).then(botAnswer => {
             // Emit that bot has answered
             io.to(roomId).emit('playerAnswered', {
@@ -1297,12 +1312,12 @@ function startNextQuestion(roomId) {
             // Check if both players have answered
             if (humanPlayer.answered) {
                 io.to(roomId).emit('roundComplete', {
-                    correctAnswer: currentQuestion.correctAnswer,
+                    correctAnswer: shuffledCorrectAnswer, // Use shuffled correct answer
                     playerResults: room.players.map(p => ({
                         username: p.username,
                         isCorrect: p === bot ? 
                             botAnswer.isCorrect : 
-                            p.lastAnswer === currentQuestion.correctAnswer,
+                            p.lastAnswer === shuffledCorrectAnswer,
                         answer: p === bot ? botAnswer.answer : p.lastAnswer,
                         isBot: p.isBot || false
                     }))
@@ -1311,7 +1326,6 @@ function startNextQuestion(roomId) {
             }
         }).catch(error => {
             console.error(`Error processing bot answer in room ${roomId}:`, error);
-            // Handle bot error gracefully
             io.to(roomId).emit('gameError', 'Error processing bot response. Game ended.');
             gameRooms.delete(roomId);
         });
@@ -1322,7 +1336,11 @@ function startNextQuestion(roomId) {
             if (!player.isBot && !player.answered) {
                 player.answered = true;
                 player.lastAnswer = -1; // Invalid answer
-                io.to(roomId).emit('playerAnswered', player.username);
+                io.to(roomId).emit('playerAnswered', {
+                    username: player.username,
+                    isBot: false,
+                    timedOut: true
+                });
             }
         });
         

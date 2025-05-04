@@ -134,8 +134,6 @@
             USDC_MINT: new solanaWeb3.PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
             TREASURY_WALLET: new solanaWeb3.PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
             HOUSE_FEE_PERCENT: 2.5,
-            MIN_BET_AMOUNT: 1,
-            MAX_BET_AMOUNT: 100
         };
 
         const connection = new solanaWeb3.Connection(
@@ -782,23 +780,6 @@
             
             submitAnswerBtn.disabled = true;
             waitingMessage.textContent = 'Waiting for other player to answer...';
-            
-            try {
-                // Make sure correctAnswer is defined before using it
-                if (typeof correctAnswer !== 'undefined') {
-                    if (selectedAnswer === correctAnswer) {
-                        selectedOption.parentElement.classList.add('correct');
-                    } else {
-                        selectedOption.parentElement.classList.add('incorrect');
-                        const correctOptionElement = document.querySelector(`input[value="${correctAnswer}"]`);
-                        if (correctOptionElement && correctOptionElement.parentElement) {
-                            correctOptionElement.parentElement.classList.add('correct');
-                        }
-                    }
-                }
-            } catch (error) {
-                console.error('Error highlighting answer:', error);
-            }
         });
 
         socket.on('botGameReady', (data) => {
@@ -840,9 +821,9 @@
             updatePlayerUI(players);
         });
 
-        socket.on('nextQuestion', ({ question, options, questionNumber, totalQuestions, questionStartTime: qStartTime, correctAnswerIndex }) => {
+        socket.on('nextQuestion', ({ question, options, questionNumber, totalQuestions, questionStartTime: qStartTime }) => {
             questionStartTime = parseInt(qStartTime);
-            correctAnswer = correctAnswerIndex;
+            // Removed correctAnswer assignment since it's no longer sent
             displayQuestion(question, options, questionNumber, totalQuestions);
             submitAnswerBtn.disabled = false;
             submitAnswerBtn.style.display = 'block';
@@ -1402,7 +1383,6 @@
             event.preventDefault();
         });
 
-        // Also update the answerResult handler with similar error checking:
         socket.on('answerResult', (data) => {
             const { username, isCorrect, correctAnswer } = data;
             
@@ -1411,6 +1391,11 @@
                     const selectedOption = document.querySelector('input[name="answer"]:checked');
                     if (selectedOption && selectedOption.parentElement) {
                         selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
+                        // Highlight the correct answer
+                        const correctOption = document.querySelector(`input[value="${correctAnswer}"]`);
+                        if (correctOption && correctOption.parentElement && !isCorrect) {
+                            correctOption.parentElement.classList.add('correct');
+                        }
                     }
                 }
             } catch (error) {
