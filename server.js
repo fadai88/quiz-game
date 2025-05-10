@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 require('dotenv').config();
 const moment = require('moment');
+const { v4: uuidv4 } = require('uuid');
 const User = require('./models/User');
 const axios = require('axios');
 const fs = require('fs');
@@ -283,12 +284,15 @@ const BOT_LEVELS = {
 
 // Bot player class
 class TriviaBot {
-    constructor(botName = 'BrainyBot', difficulty = 'MEDIUM') {
+    constructor(botName = 'BrainyBot', difficultyString = 'MEDIUM') { // Renamed parameter
         this.id = `bot-${Date.now()}`;
         this.username = botName;
         this.score = 0;
         this.totalResponseTime = 0;
-        this.difficulty = BOT_LEVELS[difficulty] || BOT_LEVELS.MEDIUM;
+        // this.difficulty is now this.difficultySetting (the object)
+        this.difficultySetting = BOT_LEVELS[difficultyString] || BOT_LEVELS.MEDIUM;
+        // Store the string for client-side display or other uses
+        this.difficultyLevelString = difficultyString;
         this.currentQuestionIndex = 0;
         this.answersGiven = [];
         this.isBot = true;
@@ -296,43 +300,78 @@ class TriviaBot {
 
     async answerQuestion(question, options, correctAnswer) {
         // Determine if the bot will answer correctly based on difficulty
-        const willAnswerCorrectly = Math.random() < this.difficulty.correctRate;
+        const willAnswerCorrectly = Math.random() < this.difficultySetting.correctRate; // Use difficultySetting
         
-        // Choose answer
         let botAnswer;
+
         if (willAnswerCorrectly) {
             botAnswer = correctAnswer;
         } else {
-            // Select a random incorrect answer
-            const incorrectOptions = Array.from(Array(options.length).keys())
-                .filter(index => index !== correctAnswer);
-            botAnswer = incorrectOptions[Math.floor(Math.random() * incorrectOptions.length)];
+            const incorrectIndices = [];
+            if (Array.isArray(options) && typeof correctAnswer === 'number' && correctAnswer >= 0 && correctAnswer < options.length) {
+                for (let i = 0; i < options.length; i++) {
+                    if (i !== correctAnswer) {
+                        incorrectIndices.push(i);
+                    }
+                }
+            } else {
+                console.warn(`TriviaBot: Invalid options or correctAnswer. Options: ${JSON.stringify(options)}, CorrectAnswer: ${correctAnswer}. Question: ${question}`);
+                if (Array.isArray(options) && options.length > 0) {
+                    botAnswer = Math.floor(Math.random() * options.length);
+                } else {
+                    botAnswer = 0;
+                }
+            }
+
+            if (botAnswer === undefined) {
+                if (incorrectIndices.length > 0) {
+                    botAnswer = incorrectIndices[Math.floor(Math.random() * incorrectIndices.length)];
+                } else {
+                    if (Array.isArray(options) && options.length > 0) {
+                        if (typeof correctAnswer === 'number' && correctAnswer >= 0 && correctAnswer < options.length) {
+                            botAnswer = correctAnswer;
+                        } else {
+                            botAnswer = Math.floor(Math.random() * options.length);
+                        }
+                    } else {
+                        console.error(`TriviaBot: Options array is problematic for question "${question}". Defaulting bot answer to 0.`);
+                        botAnswer = 0; 
+                    }
+                }
+            }
         }
         
         // Determine response time within the difficulty's range
-        const [minTime, maxTime] = this.difficulty.responseTimeRange;
+        const [minTime, maxTime] = this.difficultySetting.responseTimeRange; // Use difficultySetting
         const responseTime = Math.floor(Math.random() * (maxTime - minTime)) + minTime;
         
-        // Simulate "thinking" time
         await new Promise(resolve => setTimeout(resolve, responseTime));
         
-        // Update bot stats
         this.totalResponseTime += responseTime;
-        if (botAnswer === correctAnswer) {
+        
+        const isActuallyCorrect = (
+            typeof botAnswer === 'number' &&
+            Array.isArray(options) &&
+            typeof correctAnswer === 'number' &&
+            correctAnswer >= 0 && correctAnswer < options.length &&
+            botAnswer === correctAnswer
+        );
+
+        if (isActuallyCorrect) {
             this.score += 1;
         }
         
         this.answersGiven.push({
             questionIndex: this.currentQuestionIndex++,
             answer: botAnswer,
-            isCorrect: botAnswer === correctAnswer,
+            isCorrect: isActuallyCorrect,
             responseTime
         });
         
         return {
             answer: botAnswer,
             responseTime,
-            isCorrect: botAnswer === correctAnswer
+            isCorrect: isActuallyCorrect
         };
     }
     
@@ -664,28 +703,22 @@ io.on('connection', (socket) => {
                 const roomId = generateRoomId();
                 console.log(`Creating game room ${roomId} for matched players ${walletAddress} and ${opponent.walletAddress}`);
                 
-                gameRooms.set(roomId, {
-                    players: [
-                        {
-                            id: socket.id,
-                            username: walletAddress,
-                            score: 0,
-                            totalResponseTime: 0
-                        },
-                        {
-                            id: opponent.socketId,
-                            username: opponent.walletAddress,
-                            score: 0,
-                            totalResponseTime: 0
-                        }
-                    ],
-                    questions: [],
-                    currentQuestionIndex: 0,
-                    answersReceived: 0,
-                    betAmount: betAmount,
-                    gameStarted: false,
-                    roomMode: 'multiplayer'
-                });
+                createGameRoom(roomId, betAmount, 'multiplayer');
+                const room = gameRooms.get(roomId);
+                room.players.push(
+                    {
+                        id: socket.id,
+                        username: walletAddress,
+                        score: 0,
+                        totalResponseTime: 0
+                    },
+                    {
+                        id: opponent.socketId,
+                        username: opponent.walletAddress,
+                        score: 0,
+                        totalResponseTime: 0
+                    }
+                );
                 
                 socket.join(roomId);
                 const opponentSocket = io.sockets.sockets.get(opponent.socketId);
@@ -726,22 +759,20 @@ io.on('connection', (socket) => {
     // Handler for bot games
     socket.on('joinBotGame', async (data) => {
         try {
-            await rateLimitEvent(data.walletAddress, 'joinBotGame', 3, 60); // Stricter: 3 bot games per minute
+            await rateLimitEvent(data.walletAddress, 'joinBotGame', 3, 60);
             const { error } = transactionSchema.validate(data);
-                if (error) {
-                    console.error('Validation error:', error.message);
-                    socket.emit('joinGameFailure', error.message);
-                    return;
-                }
+            if (error) {
+                console.error('Validation error:', error.message);
+                socket.emit('joinGameFailure', error.message);
+                return;
+            }
             
             const { walletAddress, betAmount, transactionSignature, gameMode } = data;
             console.log('Bot game request:', { walletAddress, betAmount, gameMode });
     
-            // Use environment variables for retries and delay
             const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
             const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
     
-            // Verify and validate transaction
             const transaction = await verifyAndValidateTransaction(
                 transactionSignature,
                 betAmount,
@@ -752,7 +783,7 @@ io.on('connection', (socket) => {
             );
     
             console.log('Transaction verified successfully');
-
+    
             for (const [roomId, room] of gameRooms.entries()) {
                 const playerIndex = room.players.findIndex(p => p.username === walletAddress);
                 if (playerIndex !== -1) {
@@ -767,25 +798,16 @@ io.on('connection', (socket) => {
                 }
             }
     
-            // Create a game room with the player
             const roomId = generateRoomId();
             console.log(`Creating bot game room ${roomId} for player ${walletAddress}`);
             
-            gameRooms.set(roomId, {
-                players: [
-                    {
-                        id: socket.id,
-                        username: walletAddress,
-                        score: 0,
-                        totalResponseTime: 0
-                    }
-                ],
-                questions: [],
-                currentQuestionIndex: 0,
-                answersReceived: 0,
-                betAmount: betAmount,
-                gameStarted: false,
-                roomMode: 'bot'
+            createGameRoom(roomId, betAmount, 'bot'); // Use createGameRoom
+            const room = gameRooms.get(roomId);
+            room.players.push({
+                id: socket.id,
+                username: walletAddress,
+                score: 0,
+                totalResponseTime: 0
             });
             
             socket.join(roomId);
@@ -799,7 +821,6 @@ io.on('connection', (socket) => {
             await startSinglePlayerGame(roomId);
             
             logGameRoomsState();
-    
         } catch (error) {
             console.error('Error creating bot game:', error);
             socket.emit('matchmakingError', { message: error.message });
@@ -834,24 +855,16 @@ io.on('connection', (socket) => {
         const newRoomId = generateRoomId();
         console.log(`Creating bot game room ${newRoomId} for player ${playerData.walletAddress}`);
         
-        gameRooms.set(newRoomId, {
-            players: [
-                {
-                    id: socket.id,
-                    username: playerData.walletAddress,
-                    score: 0,
-                    totalResponseTime: 0,
-                    answered: false,
-                    lastAnswer: null
-                }
-            ],
-            questions: [],
-            currentQuestionIndex: 0,
-            answersReceived: 0,
-            betAmount: parseInt(playerData.betAmount),
-            gameStarted: false,
-            roomMode: 'bot'
-        });
+        createGameRoom(newRoomId, parseInt(playerData.betAmount), 'bot');
+            const room = gameRooms.get(newRoomId);
+            room.players.push({
+                id: socket.id,
+                username: playerData.walletAddress,
+                score: 0,
+                totalResponseTime: 0,
+                answered: false,
+                lastAnswer: null
+            });
         
         // Join the socket to the new room
         socket.join(newRoomId);
@@ -919,33 +932,20 @@ io.on('connection', (socket) => {
     socket.on('requestBotRoom', async ({ walletAddress, betAmount }) => {
         console.log(`Player ${walletAddress} requesting dedicated bot room with bet ${betAmount}`);
         
-        // Create a new room specifically for this player and a bot
         const roomId = generateRoomId();
         console.log(`Creating new bot room ${roomId} for ${walletAddress}`);
         
-        gameRooms.set(roomId, {
-            players: [{
-                id: socket.id,
-                username: walletAddress,
-                score: 0,
-                totalResponseTime: 0
-            }],
-            questions: [],
-            currentQuestionIndex: 0,
-            answersReceived: 0,
-            betAmount: betAmount,
-            waitingTimeout: null,
-            gameStarted: false,
-            roomMode: 'bot' // Mark as bot mode from the start
+        createGameRoom(roomId, betAmount, 'bot');
+        const room = gameRooms.get(roomId);
+        room.players.push({
+            id: socket.id,
+            username: walletAddress,
+            score: 0,
+            totalResponseTime: 0
         });
         
-        // Join the socket to this room
         socket.join(roomId);
-        
-        // Notify the client
         socket.emit('botRoomCreated', roomId);
-        
-        // Log the state
         logGameRoomsState();
     });
 
@@ -995,11 +995,11 @@ io.on('connection', (socket) => {
         logGameRoomsState();
     });
 
-    socket.on('submitAnswer', async ({ roomId, answer, responseTime, username }) => {
+    socket.on('submitAnswer', async ({ roomId, questionId, answer, responseTime, username }) => {
         try {
-            await rateLimitEvent(username, 'submitAnswer', 20, 60); // Allow 20 submissions per minute
-    
-            console.log(`Received answer from ${username} in room ${roomId}:`, { answer, responseTime });
+            await rateLimitEvent(username, 'submitAnswer', 20, 60);
+        
+            console.log(`Received answer from ${username} in room ${roomId} for question ${questionId}:`, { answer, responseTime });
             
             const room = gameRooms.get(roomId);
             if (!room) {
@@ -1013,11 +1013,16 @@ io.on('connection', (socket) => {
                 return;
             }
         
+            const currentQuestion = room.questionIdMap.get(questionId);
+            if (!currentQuestion) {
+                console.error(`Question ${questionId} not found in room ${roomId}`);
+                return;
+            }
+        
             player.totalResponseTime = (player.totalResponseTime || 0) + responseTime;
             player.lastAnswer = answer;
             player.answered = true;
         
-            const currentQuestion = room.questions[room.currentQuestionIndex];
             const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
         
             if (isCorrect) {
@@ -1040,19 +1045,17 @@ io.on('connection', (socket) => {
                 console.log(`Incorrect answer from ${username}. Score unchanged: ${player.score}`);
             }
         
-            // Send result only to the player who answered
             socket.emit('answerResult', {
                 username: player.username,
                 isCorrect,
-                correctAnswer: currentQuestion.shuffledCorrectAnswer // Use shuffled correct answer
+                correctAnswer: currentQuestion.shuffledCorrectAnswer
             });
         
-            // Check if all players (human and bot) have answered
             if (room.players.every(p => p.answered)) {
                 console.log(`All players answered in room ${roomId}`);
-                // When all players have answered, send the complete results to everyone
                 io.to(roomId).emit('roundComplete', {
-                    correctAnswer: currentQuestion.shuffledCorrectAnswer, // Use shuffled correct answer
+                    questionId: currentQuestion.tempId,
+                    correctAnswer: currentQuestion.shuffledCorrectAnswer,
                     playerResults: room.players.map(p => ({
                         username: p.username,
                         isCorrect: p.lastAnswer === currentQuestion.shuffledCorrectAnswer,
@@ -1062,7 +1065,6 @@ io.on('connection', (socket) => {
                 });
                 await completeQuestion(roomId);
             } else {
-                // Just update that a player has answered without revealing the answer
                 socket.to(roomId).emit('playerAnswered', {
                     username,
                     isBot: false,
@@ -1240,9 +1242,31 @@ async function startGame(roomId) {
 
     try {
         // Fetch 7 random questions from MongoDB
-        room.questions = await Quiz.aggregate([{ $sample: { size: 7 } }]);
-        console.log(`Fetched ${room.questions.length} questions for room ${roomId}`);
-        io.to(roomId).emit('gameStart', { players: room.players, questionCount: room.questions.length });
+        const rawQuestions = await Quiz.aggregate([{ $sample: { size: 7 } }]);
+        console.log(`Fetched ${rawQuestions.length} questions for room ${roomId}`);
+
+        // Generate temporary question IDs and store in room
+        room.questions = rawQuestions.map((question, index) => {
+            const tempId = `${roomId}-${uuidv4()}`; // Unique ID for this question
+            const questionData = {
+                tempId,
+                question: question.question,
+                options: question.options,
+                correctAnswer: question.correctAnswer
+            };
+            room.questionIdMap.set(tempId, questionData);
+            return questionData;
+        });
+
+        io.to(roomId).emit('gameStart', { 
+            players: room.players.map(p => ({
+                username: p.username,
+                score: p.score,
+                isBot: p.isBot || false,
+                difficulty: p.isBot ? p.difficulty : undefined
+            })), 
+            questionCount: room.questions.length 
+        });
         startNextQuestion(roomId);
     } catch (error) {
         console.error('Error starting game:', error);
@@ -1266,14 +1290,14 @@ function startNextQuestion(roomId) {
     currentQuestion.shuffledOptions = shuffledOptions;
     currentQuestion.shuffledCorrectAnswer = shuffledCorrectAnswer;
 
-    // Send question to human players
+    // Send temporary question ID and minimal data
     io.to(roomId).emit('nextQuestion', {
+        questionId: currentQuestion.tempId,
         question: currentQuestion.question,
         options: shuffledOptions,
         questionNumber: room.currentQuestionIndex + 1,
         totalQuestions: room.questions.length,
         questionStartTime: questionStartTime.valueOf()
-        // Removed correctAnswerIndex
     });
 
     room.questionStartTime = questionStartTime;
@@ -1284,35 +1308,31 @@ function startNextQuestion(roomId) {
         clearTimeout(room.questionTimeout);
     }
 
-    // If room has a bot, get their answer
+    // Handle bot answer
     const bot = room.players.find(p => p.isBot);
     if (bot) {
-        // Bot will answer according to its difficulty
         bot.answerQuestion(
             currentQuestion.question, 
-            currentQuestion.shuffledOptions, // Use shuffled options
-            shuffledCorrectAnswer // Use shuffled correct answer
+            currentQuestion.shuffledOptions,
+            shuffledCorrectAnswer
         ).then(botAnswer => {
-            // Emit that bot has answered
             io.to(roomId).emit('playerAnswered', {
                 username: bot.username,
                 isBot: true,
                 responseTime: botAnswer.responseTime
             });
             
-            // Check if the human player still exists
             const humanPlayer = room.players.find(p => !p.isBot);
             if (!humanPlayer) {
-                // Human player has disconnected, treat as a forfeit
                 console.log(`Human player disconnected from bot game in room ${roomId}`);
                 handleBotGameForfeit(roomId, bot);
                 return;
             }
             
-            // Check if both players have answered
             if (humanPlayer.answered) {
                 io.to(roomId).emit('roundComplete', {
-                    correctAnswer: shuffledCorrectAnswer, // Use shuffled correct answer
+                    questionId: currentQuestion.tempId,
+                    correctAnswer: shuffledCorrectAnswer,
                     playerResults: room.players.map(p => ({
                         username: p.username,
                         isCorrect: p === bot ? 
@@ -1335,7 +1355,7 @@ function startNextQuestion(roomId) {
         room.players.forEach(player => {
             if (!player.isBot && !player.answered) {
                 player.answered = true;
-                player.lastAnswer = -1; // Invalid answer
+                player.lastAnswer = -1;
                 io.to(roomId).emit('playerAnswered', {
                     username: player.username,
                     isBot: false,
@@ -1345,7 +1365,7 @@ function startNextQuestion(roomId) {
         });
         
         await completeQuestion(roomId);
-    }, 10000); // 10 seconds for each question
+    }, 10000);
 }
 
 async function handleBotAnswer(room, bot, currentQuestion) {
@@ -1446,7 +1466,6 @@ async function completeQuestion(roomId) {
     const room = gameRooms.get(roomId);
     if (!room) return;
 
-    // Reset answered status for next question
     room.players.forEach(player => {
         player.answered = false;
     });
@@ -1465,7 +1484,6 @@ async function completeQuestion(roomId) {
     room.currentQuestionIndex += 1;
     room.answersReceived = 0;
 
-    // Check if any player has left mid-game
     if (room.playerLeft) {
         console.log(`Game in room ${roomId} ending early because a player left`);
         await handleGameOver(room, roomId);
@@ -1475,9 +1493,8 @@ async function completeQuestion(roomId) {
     if (room.currentQuestionIndex < room.questions.length) {
         setTimeout(() => {
             startNextQuestion(roomId);
-        }, 2000); // Slightly longer pause between questions for better UX
+        }, 2000);
     } else {
-        // Game over logic
         console.log(`Game over in room ${roomId}`);
         await handleGameOver(room, roomId);
     }
@@ -1651,20 +1668,26 @@ async function startSinglePlayerGame(roomId) {
     }
 
     try {
-        // Get questions
-        room.questions = await Quiz.aggregate([{ $sample: { size: 7 } }]);
+        const rawQuestions = await Quiz.aggregate([{ $sample: { size: 7 } }]);
+        room.questions = rawQuestions.map((question, index) => {
+            const tempId = `${roomId}-${uuidv4()}`;
+            const questionData = {
+                tempId,
+                question: question.question,
+                options: question.options,
+                correctAnswer: question.correctAnswer
+            };
+            room.questionIdMap.set(tempId, questionData);
+            return questionData;
+        });
         
-        // Count human players
         const humanPlayers = room.players.filter(p => !p.isBot);
         
-        // Make sure there's exactly one human player to play against the bot
         if (humanPlayers.length !== 1) {
             console.log(`Room ${roomId} has ${humanPlayers.length} human players, expected exactly 1`);
             if (humanPlayers.length === 0) {
-                // No players, delete the room
                 gameRooms.delete(roomId);
             } else {
-                // Multiple human players, switch to multiplayer mode
                 room.roomMode = 'multiplayer';
                 io.to(roomId).emit('gameStart', { 
                     players: room.players,
@@ -1680,13 +1703,11 @@ async function startSinglePlayerGame(roomId) {
         const humanPlayer = humanPlayers[0];
         console.log('Human player:', humanPlayer.username);
         
-        // Ensure human player's state is properly initialized
         humanPlayer.score = 0;
         humanPlayer.totalResponseTime = 0;
         humanPlayer.answered = false;
         humanPlayer.lastAnswer = null;
         
-        // Check if there's already a bot (shouldn't happen, but just in case)
         if (room.players.some(p => p.isBot)) {
             console.log(`Room ${roomId} already has a bot player`);
             if (!room.gameStarted) {
@@ -1696,32 +1717,30 @@ async function startSinglePlayerGame(roomId) {
             return;
         }
         
-        // Create a bot and add it to the room
-        const difficulty = await determineBotDifficulty(humanPlayer.username);
+        const difficultyString = await determineBotDifficulty(humanPlayer.username); // This is the string e.g. "HARD"
         const botName = chooseBotName();
-        console.log('Creating bot with name:', botName, 'and difficulty:', difficulty);
+        console.log('Creating bot with name:', botName, 'and difficulty:', difficultyString);
         
-        const bot = new TriviaBot(botName, difficulty);
+        const bot = new TriviaBot(botName, difficultyString);
+        
         room.players.push(bot);
         room.hasBot = true;
         console.log('Bot added to room. Total players:', room.players.length);
         
-        // Send specific bot ready event to the client
         io.to(roomId).emit('botGameReady', {
             botName: bot.username,
-            difficulty: difficulty
+            difficulty: bot.difficultyLevelString // Use the stored string for client
         });
         
-        // Then start the game
         io.to(roomId).emit('gameStart', { 
             players: room.players.map(p => ({
                 username: p.username,
                 score: p.score,
                 isBot: p.isBot || false,
-                difficulty: p.isBot ? difficulty : undefined
+                difficulty: p.isBot ? p.difficultyLevelString : undefined // Use the stored string for client
             })),
             questionCount: room.questions.length,
-            singlePlayerMode: true, // Indicate single player mode
+            singlePlayerMode: true,
             botOpponent: bot.username
         });
 
@@ -1742,13 +1761,20 @@ function findAvailableRoom(betAmount) {
     return null;
 }
 
-function createGameRoom(roomId, betAmount) {
+function createGameRoom(roomId, betAmount, roomMode = null) {
     gameRooms.set(roomId, {
         players: [],
         betAmount,
         questions: [],
+        questionIdMap: new Map(),
         currentQuestionIndex: 0,
-        answersReceived: 0
+        answersReceived: 0,
+        gameStarted: false,
+        roomMode: roomMode,
+        waitingTimeout: null,
+        questionTimeout: null,
+        playerLeft: false,
+        hasBot: false
     });
 }
 

@@ -137,7 +137,7 @@
         };
 
         const connection = new solanaWeb3.Connection(
-            'https://api.devnet.solana.com',
+            'https://sleek-attentive-sponge.solana-devnet.quiknode.pro/5691751daf6a072717c6e927425e523d87218437/',
             'confirmed'
         );
 
@@ -243,6 +243,7 @@
         let connectedWallet = null;
         let currentRoomId = null;
         let currentBetAmount = null;
+        let currentQuestionId = null;
         let questionStartTime;
         let questionTimer;
         let correctAnswer;
@@ -766,6 +767,7 @@
             
             console.log('Submitting answer:', {
                 roomId: currentRoomId,
+                questionId: currentQuestionId,
                 answer: selectedAnswer,
                 responseTime,
                 username: connectedWallet
@@ -773,6 +775,7 @@
             
             socket.emit('submitAnswer', { 
                 roomId: currentRoomId, 
+                questionId: currentQuestionId, 
                 answer: selectedAnswer, 
                 responseTime, 
                 username: connectedWallet 
@@ -821,9 +824,9 @@
             updatePlayerUI(players);
         });
 
-        socket.on('nextQuestion', ({ question, options, questionNumber, totalQuestions, questionStartTime: qStartTime }) => {
+        socket.on('nextQuestion', ({ questionId, question, options, questionNumber, totalQuestions, questionStartTime: qStartTime }) => {
+            currentQuestionId = questionId; // Store the question ID
             questionStartTime = parseInt(qStartTime);
-            // Removed correctAnswer assignment since it's no longer sent
             displayQuestion(question, options, questionNumber, totalQuestions);
             submitAnswerBtn.disabled = false;
             submitAnswerBtn.style.display = 'block';
@@ -1391,7 +1394,6 @@
                     const selectedOption = document.querySelector('input[name="answer"]:checked');
                     if (selectedOption && selectedOption.parentElement) {
                         selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
-                        // Highlight the correct answer
                         const correctOption = document.querySelector(`input[value="${correctAnswer}"]`);
                         if (correctOption && correctOption.parentElement && !isCorrect) {
                             correctOption.parentElement.classList.add('correct');
@@ -1499,15 +1501,13 @@
         });
 
         socket.on('roundComplete', (data) => {
-            const { correctAnswer, playerResults } = data;
-            const options = document.querySelectorAll('#options input');
+            const { questionId, correctAnswer, playerResults } = data;
             
             try {
-                // Show correct answer if options exist
+                const options = document.querySelectorAll('#options input');
                 if (options && options.length > correctAnswer && options[correctAnswer].parentElement) {
                     options[correctAnswer].parentElement.classList.add('correct');
                     
-                    // Only show the current player's incorrect answer if they were wrong
                     const playerResult = playerResults.find(result => result.username === connectedWallet);
                     if (playerResult && !playerResult.isCorrect && 
                         playerResult.answer >= 0 && 
