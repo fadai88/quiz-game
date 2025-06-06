@@ -1091,101 +1091,140 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => { // Make it async if updatePlayerStats is async
         console.log('Client disconnected:', socket.id);
-        
-        // Check if player is in a matchmaking pool
+
+        // 1. Check and remove from matchmaking pools
         for (const [betAmount, pool] of matchmakingPools.human.entries()) {
             const playerIndex = pool.findIndex(p => p.socketId === socket.id);
             if (playerIndex !== -1) {
-                console.log(`Removing player ${pool[playerIndex].walletAddress} from matchmaking pool`);
-                pool.splice(playerIndex, 1);
-                break;
+                const removedPlayer = pool.splice(playerIndex, 1)[0];
+                console.log(`Player ${removedPlayer.walletAddress} (socket ${socket.id}) removed from matchmaking pool for bet ${betAmount}`);
+                logMatchmakingState(); // Log state after removal
+                // No need to continue to gameRooms if found in matchmaking, as they weren't in a game yet.
+                // However, a player *could* be in matchmaking and then join a game, so the game room check is still needed.
+                // But if they disconnect *while* in matchmaking, we stop here for the matchmaking part.
             }
         }
-        
+
+        // 2. Handle disconnection from active game rooms
         for (const [roomId, room] of gameRooms.entries()) {
             const playerIndex = room.players.findIndex(p => p.id === socket.id);
+
             if (playerIndex !== -1) {
-                const disconnectedPlayer = room.players[playerIndex];
-                console.log(`Player ${disconnectedPlayer.username} left room ${roomId}`);
-                
+                const disconnectedPlayer = room.players[playerIndex]; // Player who disconnected
+                console.log(`Player ${disconnectedPlayer.username} (socket ${socket.id}) disconnected from room ${roomId}`);
+
+                // Remove the player from the room's active list
                 room.players.splice(playerIndex, 1);
-                room.playerLeft = true;
-                
+                room.playerLeft = true; // Mark that a player has left, this might be used by completeQuestion
+
                 if (room.questionTimeout) {
                     clearTimeout(room.questionTimeout);
+                    room.questionTimeout = null;
                 }
-                
-                // Handle bot game specially
+
+                // Scenario 1: Bot Game Forfeit (Human disconnected)
                 if (room.roomMode === 'bot') {
-                    console.log(`Player left bot game in room ${roomId}`);
-                    // Update stats for human player (bot doesn't get stats)
-                    const humanPlayer = room.players.find(p => !p.isBot) || disconnectedPlayer;
-                    const allPlayers = [
-                        {
-                            username: humanPlayer.username,
-                            score: humanPlayer.score || 0,
-                            isBot: false
-                        }
-                    ];
-                    
-                    updatePlayerStats(allPlayers, {
-                        winner: null, // Bot wins, but we don't award winnings
-                        botOpponent: true,
-                        betAmount: room.betAmount
-                    });
-                    
-                    // Emit game over event to client (if they're still connected)
-                    io.to(roomId).emit('gameOverForfeit', {
-                        winner: 'Bot', // Bot wins by default
-                        disconnectedPlayer: disconnectedPlayer.username,
-                        betAmount: room.betAmount,
-                        message: `You left the game. The bot wins by default.`
-                    });
-                    
-                    // Clean up the room
-                    gameRooms.delete(roomId);
-                    return;
-                }
-                
-                // Handle human vs. human game
-                if (room.players.length > 0) {
-                    const remainingPlayer = room.players[0];
-                    
-                    // Don't proceed if the remaining player is a bot
-                    if (remainingPlayer.isBot) {
-                        console.log(`Only a bot remained in room ${roomId} - cleaning up`);
-                        gameRooms.delete(roomId);
-                        return;
+                    console.log(`Human player ${disconnectedPlayer.username} left bot game. Bot wins by forfeit.`);
+
+                    // The remaining player(s) in room.players should be the bot.
+                    const botPlayer = room.players.find(p => p.isBot);
+
+                    if (botPlayer) {
+                        const winnerName = botPlayer.username; // Bot is the winner
+
+                        // Prepare players array for stats: includes disconnected human and the bot
+                        const allPlayersForStats = [
+                            { // The human player who disconnected
+                                username: disconnectedPlayer.username,
+                                score: disconnectedPlayer.score || 0,
+                                totalResponseTime: disconnectedPlayer.totalResponseTime || 0,
+                                isBot: false
+                            },
+                            { // The bot who won
+                                username: botPlayer.username,
+                                score: botPlayer.score || 0, // Bot's score at the time of forfeit
+                                totalResponseTime: botPlayer.totalResponseTime || 0,
+                                isBot: true
+                            }
+                        ];
+
+                        console.log(`Calling updatePlayerStats for bot forfeit. Winner: ${winnerName}, Bet: ${room.betAmount}`);
+                        await updatePlayerStats(allPlayersForStats, {
+                            winner: winnerName, // Correctly pass bot's name
+                            botOpponent: true,
+                            betAmount: room.betAmount
+                        });
+
+                        io.to(roomId).emit('gameOverForfeit', {
+                            winner: winnerName,
+                            disconnectedPlayer: disconnectedPlayer.username,
+                            betAmount: room.betAmount,
+                            botOpponent: true,
+                            message: `${disconnectedPlayer.username} left the game. ${winnerName} wins by default.`
+                        });
+
+                    } else {
+                        console.error(`CRITICAL: Bot not found in bot game room ${roomId} after human ${disconnectedPlayer.username} disconnected.`);
+                        // Fallback: emit a generic error or just clean up
+                         io.to(roomId).emit('gameError', 'An error occurred due to player disconnection.');
                     }
-                    
-                    console.log(`Player ${disconnectedPlayer.username} left during game. Declaring ${remainingPlayer.username} the winner.`);
-                    
-                    // Create players array with both remaining and disconnected player
-                    const allPlayers = [
-                        {
+                    gameRooms.delete(roomId);
+                    logGameRoomsState();
+                    return; // Player processed for this room, exit function
+                }
+
+                // Scenario 2: Human vs Human Game Forfeit
+                // Check if there's exactly one player left and that player is not a bot
+                if (room.players.length === 1 && !room.players[0].isBot) {
+                    const remainingPlayer = room.players[0]; // This player wins by forfeit
+                    console.log(`Player ${disconnectedPlayer.username} left H2H game. ${remainingPlayer.username} wins by forfeit.`);
+
+                    const allPlayersForStats = [
+                        { // The human player who won by forfeit
                             username: remainingPlayer.username,
                             score: remainingPlayer.score || 0,
+                            totalResponseTime: remainingPlayer.totalResponseTime || 0,
                             isBot: false
                         },
-                        {
+                        { // The human player who disconnected
                             username: disconnectedPlayer.username,
                             score: disconnectedPlayer.score || 0,
+                            totalResponseTime: disconnectedPlayer.totalResponseTime || 0,
                             isBot: false
                         }
                     ];
-                    
-                    // Process the win and update stats
-                    handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, false, allPlayers);
-                } else {
-                    // If no players left, delete the room
-                    console.log(`Deleting empty room ${roomId}`);
-                    gameRooms.delete(roomId);
+                    // `handlePlayerLeftWin` handles payout and emits 'gameOverForfeit'
+                    await handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, false, allPlayersForStats);
+                    // handlePlayerLeftWin will also delete the room.
+                    logGameRoomsState();
+                    return; // Player processed for this room
                 }
-                break;
+
+                // Scenario 3: Room becomes empty
+                if (room.players.length === 0) {
+                    console.log(`Room ${roomId} is now empty after ${disconnectedPlayer.username} left. Deleting room.`);
+                    gameRooms.delete(roomId);
+                    logGameRoomsState();
+                    return; // Player processed for this room
+                }
+
+                // If game was ongoing with more than 1 player remaining (e.g. >2 player game, not typical for this structure)
+                // or if some other state, the game might try to continue or call completeQuestion which checks room.playerLeft
+                // For a 2-player game, the above scenarios (bot game or H2H with 1 remaining) should cover it.
+                // If the game was not started, player is just removed, and room might be cleaned up if empty.
+                if (!room.gameStarted) {
+                     io.to(roomId).emit('playerLeft', disconnectedPlayer.username); // Notify if game hadn't started
+                }
+
+                break; // Found player in a room, processed, exit the loop for rooms.
             }
         }
+        // If the loop completes without finding the player in any room, they might have only been in matchmaking.
+        // Log final state if any changes.
+        // logGameRoomsState(); // Already logged within specific scenarios
+        // logMatchmakingState(); // Already logged if removed from pool
     });
 });
 
@@ -1500,7 +1539,6 @@ async function completeQuestion(roomId) {
     }
 }
 
-// Helper function to handle game over logic
 async function handleGameOver(room, roomId) {
     const sortedPlayers = [...room.players].sort((a, b) => {
         if (b.score !== a.score) {
@@ -1511,38 +1549,54 @@ async function handleGameOver(room, roomId) {
 
     let winner = null;
     const botOpponent = room.players.some(p => p.isBot);
-    const isSinglePlayer = room.players.length === 1;
+    // Determine if it's a single player mode (human vs bot) for the gameOver event
+    const isSinglePlayerEncounter = room.roomMode === 'bot' || (sortedPlayers.length === 1 && !botOpponent);
 
-    if (botOpponent && sortedPlayers.length === 2) {
-        const humanPlayer = sortedPlayers.find(p => !p.isBot);
-        const botPlayer = sortedPlayers.find(p => p.isBot);
-        if (humanPlayer && botPlayer) {
+
+    if (botOpponent && sortedPlayers.length >= 1) { // Handles Human vs Bot games
+        const humanPlayer = room.players.find(p => !p.isBot); // Find the human player from original list
+        const botPlayer = room.players.find(p => p.isBot);     // Find the bot player from original list
+
+        if (humanPlayer && botPlayer) { // Both human and bot are present
             if (humanPlayer.score > botPlayer.score) {
                 winner = humanPlayer.username;
-            } else if (humanPlayer.score === botPlayer.score) {
-                winner = humanPlayer.totalResponseTime <= botPlayer.totalResponseTime ? 
-                    humanPlayer.username : botPlayer.username;
+            } else if (botPlayer.score > humanPlayer.score) {
+                winner = botPlayer.username; // *** FIX: Assign bot's name if bot has higher score ***
+            } else { // Scores are equal, decide by response time
+                if ((humanPlayer.totalResponseTime || 0) <= (botPlayer.totalResponseTime || 0)) {
+                    winner = humanPlayer.username;
+                } else {
+                    winner = botPlayer.username; // *** FIX: Assign bot's name if bot wins tie-breaker ***
+                }
             }
-        }
-    } else if (sortedPlayers.length === 1) {
-        winner = sortedPlayers[0].username;
-    } else if (sortedPlayers.length > 1) {
-        if (sortedPlayers[0].score > sortedPlayers[1].score) {
+        } else if (botPlayer && !humanPlayer) { // Only bot is left (human might have disconnected abruptly)
+            winner = botPlayer.username;
+        } else if (humanPlayer && !botPlayer) { // Only human is left (bot might have been removed - less likely in this flow)
+             winner = humanPlayer.username; // Or apply specific single-player win conditions if any
+        } else if (sortedPlayers.length > 0) { // Fallback if human/bot finding fails but players exist
             winner = sortedPlayers[0].username;
-        } else if (sortedPlayers[0].score === sortedPlayers[1].score) {
-            winner = sortedPlayers[0].totalResponseTime <= sortedPlayers[1].totalResponseTime ? 
-                sortedPlayers[0].username : sortedPlayers[1].username;
         }
+
+    } else if (sortedPlayers.length === 1) {
+        // Game ended with only one player (e.g. human in a non-bot game after opponent left, or a true single player mode)
+        winner = sortedPlayers[0].username;
+    } else if (sortedPlayers.length > 1 && !botOpponent) { // Must be Human vs Human (at least 2 players)
+        // sortedPlayers[0] is the winner due to sorting logic (highest score, or fastest time on tie)
+        winner = sortedPlayers[0].username;
     }
+    // Note: If sortedPlayers is empty, winner remains null.
 
     try {
+        // Update player stats. `room.players` contains all players who participated.
         await updatePlayerStats(room.players, {
-            winner: winner,
+            winner: winner, // This will now correctly be the bot's name if the bot won
             botOpponent: botOpponent,
             betAmount: room.betAmount
         });
         
-        if (winner && !sortedPlayers.find(p => p.username === winner)?.isBot) {
+        const winnerIsActuallyHuman = winner && !room.players.find(p => p.username === winner && p.isBot);
+
+        if (winnerIsActuallyHuman) { // Payout only if a human player won
             try {
                 const payoutSignature = await sendWinnings(winner, room.betAmount, botOpponent);
                 io.to(roomId).emit('gameOver', {
@@ -1555,7 +1609,7 @@ async function handleGameOver(room, roomId) {
                     winner: winner,
                     betAmount: room.betAmount,
                     payoutSignature,
-                    singlePlayerMode: isSinglePlayer,
+                    singlePlayerMode: isSinglePlayerEncounter,
                     botOpponent: botOpponent
                 });
             } catch (error) {
@@ -1570,11 +1624,11 @@ async function handleGameOver(room, roomId) {
                     })),
                     winner: winner,
                     betAmount: room.betAmount,
-                    singlePlayerMode: isSinglePlayer,
+                    singlePlayerMode: isSinglePlayerEncounter,
                     botOpponent: botOpponent
                 });
             }
-        } else {
+        } else { // Bot won, or no human winner (e.g., draw with no human winner if logic allowed)
             io.to(roomId).emit('gameOver', {
                 players: sortedPlayers.map(p => ({ 
                     username: p.username, 
@@ -1582,9 +1636,9 @@ async function handleGameOver(room, roomId) {
                     totalResponseTime: p.totalResponseTime || 0,
                     isBot: p.isBot || false
                 })),
-                winner: winner,
+                winner: winner, // This will be the bot's name if bot won
                 betAmount: room.betAmount,
-                singlePlayerMode: isSinglePlayer,
+                singlePlayerMode: isSinglePlayerEncounter,
                 botOpponent: botOpponent
             });
         }
@@ -1593,9 +1647,10 @@ async function handleGameOver(room, roomId) {
     } catch (error) {
         console.error('Error handling game over:', error);
         io.to(roomId).emit('gameError', 'An error occurred while ending the game.');
-        gameRooms.delete(roomId);
+        gameRooms.delete(roomId); // Ensure room is cleaned up on error too
     }
 }
+
 
 
 const PORT = process.env.PORT || 5000;

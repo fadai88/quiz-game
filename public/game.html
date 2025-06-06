@@ -853,106 +853,110 @@
 
         socket.on('gameOver', (data) => {
             console.log('Received game over data:', data);
-            const { players, winner, betAmount, winnerBalance, singlePlayerMode, payoutSignature, botOpponent } = data;
-            
+            const { players, winner, betAmount, singlePlayerMode, payoutSignature, botOpponent, error: gameOverError } = data;
+
             // Clear any timers
             if (questionTimer) {
                 clearTimeout(questionTimer);
             }
-            
             if (countdownInterval) {
                 clearInterval(countdownInterval);
             }
-            
+
             // Update the UI
             questionDiv.textContent = 'Game Over!';
             submitAnswerBtn.style.display = 'none';
             countdownTimer.style.display = 'none';
-            
-            // Calculate the correct multiplier based on game type
-            const multiplier = botOpponent ? 1.5 : 1.8;
-            const winnings = betAmount * multiplier;
-            
-            if (singlePlayerMode) {
-                // Handle single player mode
-                const player = players[0];
-                if (winner) {
-                    waitingMessage.textContent = `Congratulations! You won with ${player.score} correct answers! You won ${winnings.toFixed(2)} USDC!`;
-                    if (payoutSignature) {
-                        const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
-                        waitingMessage.innerHTML += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
-                    }
-                } else {
-                    waitingMessage.textContent = `Game Over! You got ${player.score} correct answers. You need at least 5 correct answers to win.`;
-                }
-            } else {
-                // Handle multiplayer mode
-                players.sort((a, b) => b.score - a.score || a.totalResponseTime - b.totalResponseTime);
 
-                if (winner) {
-                    const winnerPlayer = players.find(p => p.username === winner);
-                    waitingMessage.textContent = `The winner is ${winner} with a score of ${winnerPlayer.score}!`;
-                    
-                    if (winner === connectedWallet) {
-                        waitingMessage.textContent += ` You won ${winnings.toFixed(2)} USDC!`;
-                        if (payoutSignature) {
-                            waitingMessage.textContent += ` Winnings have been sent to your wallet!`;
-                            const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
-                            waitingMessage.innerHTML += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
-                        }
-                        
-                        // Show win celebration
-                        if (typeof celebrateWin === 'function') {
-                            celebrateWin('normal');
-                        }
-                    } else {
-                        waitingMessage.textContent += ` Better luck next time!`;
+            if (gameOverError) {
+                waitingMessage.textContent = `Game Over! Error: ${gameOverError}`;
+                // Reset UI and update balance after a delay
+                setTimeout(() => {
+                    resetGame(); // Use your existing resetGame function
+                    updateBalance();
+                }, 5000);
+                return;
+            }
+
+
+            // Determine if the current client is the winner
+            const clientIsWinner = winner === connectedWallet;
+            const winnings = betAmount * (botOpponent ? 1.5 : 1.8); // Calculate potential winnings
+
+            let gameOverMessage = '';
+
+            if (botOpponent) { // Game was against a bot
+                const humanPlayer = players.find(p => p.username === connectedWallet && !p.isBot); // Get current client's data
+                const botPlayer = players.find(p => p.isBot);
+
+                if (clientIsWinner) { // Human client won against the bot
+                    gameOverMessage = `Congratulations! You defeated ${botPlayer ? botPlayer.username : 'the bot'} with ${humanPlayer ? humanPlayer.score : 0} correct answers! You won ${winnings.toFixed(2)} USDC!`;
+                    if (payoutSignature) {
+                        gameOverMessage += ` Winnings have been sent to your wallet!`;
+                        const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
+                        gameOverMessage += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
+                    }
+                    if (typeof celebrateWin === 'function') celebrateWin('bot_win');
+                } else if (winner === botPlayer?.username) { // Bot won against the human client
+                    gameOverMessage = `Game Over! You got ${humanPlayer ? humanPlayer.score : 0} correct answers. Better luck next time!`;
+                } else { // Draw or other unexpected outcome with bot
+                     gameOverMessage = `Game Over against ${botPlayer ? botPlayer.username : 'the bot'}! Your score: ${humanPlayer ? humanPlayer.score : 0}.`;
+                     if (winner) { // If there was a winner but it wasn't the client or the bot (unlikely in 1v1 bot)
+                        gameOverMessage += ` The winner was ${winner}.`;
+                     } else {
+                        gameOverMessage += " It was a draw!";
+                     }
+                }
+            } else if (singlePlayerMode && !botOpponent) { // True single player mode (if you implement this without a bot)
+                const player = players[0];
+                 if (clientIsWinner) { // Won single player mode (based on score threshold or other criteria)
+                    gameOverMessage = `Congratulations! You won in single player mode with ${player.score} correct answers! You won ${winnings.toFixed(2)} USDC!`;
+                    if (payoutSignature) {
+                        gameOverMessage += ` Winnings have been sent to your wallet!`;
+                        const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
+                        gameOverMessage += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
                     }
                 } else {
-                    // Handle tied scores
-                    if (players[0].score === players[1].score) {
-                        if (players[0].totalResponseTime < players[1].totalResponseTime) {
-                            waitingMessage.textContent = `It's a draw based on score! ${players[0].username} wins due to faster total response time (${players[0].totalResponseTime}ms vs ${players[1].totalResponseTime}ms).`;
-                        } else if (players[0].totalResponseTime > players[1].totalResponseTime) {
-                            waitingMessage.textContent = `It's a draw based on score! ${players[1].username} wins due to faster total response time (${players[1].totalResponseTime}ms vs ${players[0].totalResponseTime}ms).`;
-                        } else {
-                            waitingMessage.textContent = "It's a perfect draw! Both players had the same score and response time.";
-                        }
-                        
-                        const tiebreakWinner = players[0].totalResponseTime <= players[1].totalResponseTime ? players[0].username : players[1].username;
-                        if (tiebreakWinner === connectedWallet) {
-                            waitingMessage.textContent += ` You won ${winnings.toFixed(2)} USDC!`;
-                            if (payoutSignature) {
-                                const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
-                                waitingMessage.innerHTML += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
-                            }
-                            
-                            // Show win celebration
-                            if (typeof celebrateWin === 'function') {
-                                celebrateWin('tiebreak');
-                            }
-                        } else {
-                            waitingMessage.textContent += ` Better luck next time!`;
-                        }
+                    gameOverMessage = `Game Over! You got ${player.score} correct answers. You need at least 5 correct answers to win in single player.`; // Adjust win condition text
+                }
+            } else { // Multiplayer mode (human vs human)
+                const clientPlayer = players.find(p => p.username === connectedWallet);
+                const opponentPlayer = players.find(p => p.username !== connectedWallet);
+
+                if (clientIsWinner) {
+                    gameOverMessage = `Congratulations! You are the winner with a score of ${clientPlayer.score}! You won ${winnings.toFixed(2)} USDC!`;
+                    if (payoutSignature) {
+                        gameOverMessage += ` Winnings have been sent to your wallet!`;
+                        const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
+                        gameOverMessage += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
                     }
+                    if (typeof celebrateWin === 'function') celebrateWin('normal');
+                } else if (winner) { // Another human player won
+                    const winnerPlayer = players.find(p => p.username === winner);
+                    gameOverMessage = `Game Over! The winner is ${winner} with a score of ${winnerPlayer.score}. Better luck next time!`;
+                } else { // Draw in multiplayer
+                    gameOverMessage = "Game Over! It's a draw!";
+                    // Handle draw payout if applicable (e.g. split pot or return bets)
+                    // For now, assuming no payout on a draw in H2H unless specifically handled
                 }
             }
 
+            waitingMessage.innerHTML = gameOverMessage; // Use innerHTML for the link
+
             // Update UI after game over
             setTimeout(() => {
-                const scoresHtml = singlePlayerMode ?
-                    `<p>${players[0].username}: ${players[0].score} (Total response time: ${players[0].totalResponseTime}ms)</p>` :
-                    players.map(p => 
-                        `<p>${p.username}: ${p.score} (Total response time: ${p.totalResponseTime}ms)</p>`
-                    ).join('');
-                
+                const scoresHtml = players.map(p =>
+                    `<p>${p.username}${p.isBot ? ' 🤖' : ''}: ${p.score} (Total response time: ${p.totalResponseTime || 0}ms)</p>`
+                ).join('');
+
                 playersDiv.innerHTML = '<h2>Final Scores:</h2>' + scoresHtml;
-                joinGameBtn.style.display = 'inline-block';
+                joinGameBtn.style.display = 'inline-block'; // Or use resetGame()
                 optionsDiv.innerHTML = '';
 
                 // Update balance after game over
                 updateBalance();
-            }, 3000);
+                resetGame(); // Call your resetGame function to clear game state and UI elements
+            }, 7000); // Increased delay to allow reading the message
         });
 
         socket.on('playerLeft', (username) => {
@@ -964,52 +968,44 @@
         socket.on('gameOverForfeit', (data) => {
             console.log('Forfeit game over:', data);
             const { winner, disconnectedPlayer, betAmount, payoutSignature, botOpponent, message } = data;
-            
-            // Clear all game-related UI
-            resetGame();
-            
-            // Update message
-            waitingMessage.textContent = message;
-            
-            // Calculate the appropriate winnings
-            const multiplier = botOpponent ? 1.5 : 1.8;
-            const winnings = betAmount * multiplier;
-            
-            // If this client is the winner, show additional details
-            if (winner === connectedWallet) {
-                waitingMessage.textContent += ` You've been awarded ${winnings.toFixed(2)} USDC for the win!`;
-                
+
+            // Clear all game-related UI and timers
+            resetGame(); // Your existing resetGame function should handle this
+
+            let forfeitMessage = message; // Base message from server
+            const clientIsWinner = winner === connectedWallet;
+            const winnings = betAmount * (botOpponent ? 1.5 : 1.8);
+
+            if (clientIsWinner) { // This client won by forfeit
+                forfeitMessage += ` You've been awarded ${winnings.toFixed(2)} USDC for the win!`;
                 if (payoutSignature) {
-                    waitingMessage.textContent += ` Winnings have been sent to your wallet!`;
+                    forfeitMessage += ` Winnings have been sent to your wallet!`;
                     const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
-                    waitingMessage.innerHTML += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
+                    forfeitMessage += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
                 }
-                
-                // Display a celebration effect if available
-                if (typeof celebrateWin === 'function') {
-                    celebrateWin('forfeit');
-                }
-            } else if (botOpponent) {
-                waitingMessage.textContent += ` You left the game and lost to the bot.`;
+                if (typeof celebrateWin === 'function') celebrateWin('forfeit');
+            } else if (botOpponent && winner && winner !== connectedWallet) { // Bot won by client's forfeit
+                // The base message from server should already cover this
+                // forfeitMessage += ` You left the game and lost to the bot.`;
+            } else if (!botOpponent && winner && winner !== connectedWallet) { // Another human won by client's forfeit
+                 forfeitMessage = `${disconnectedPlayer} left the game. ${winner} wins by forfeit.`;
             }
-            
+
+
+            waitingMessage.innerHTML = forfeitMessage;
+
             // Update UI after forfeit
             setTimeout(() => {
-                playersDiv.innerHTML = '<h2>Game Ended Early</h2>';
-                joinGameBtn.style.display = 'inline-block';
-                
-                // Create a special message about the forfeit
-                const forfeitDiv = document.createElement('div');
-                forfeitDiv.className = 'forfeit-message';
-                forfeitDiv.innerHTML = `
-                    <p>${disconnectedPlayer} left the game.</p>
-                    <p>${botOpponent ? 'Bot' : winner} is the winner.</p>
-                `;
-                playersDiv.appendChild(forfeitDiv);
-                
-                // Update balance after forfeit
+                playersDiv.innerHTML = `<h2>Game Ended Early</h2>
+                    <div class="forfeit-message">
+                        <p>${disconnectedPlayer} left the game.</p>
+                        <p>${winner} is the winner.</p>
+                    </div>`;
+                joinGameBtn.style.display = 'inline-block'; // Or use resetGame()
+
                 updateBalance();
-            }, 3000);
+                resetGame(); // Call resetGame here too to ensure consistent state
+            }, 7000); // Increased delay
         });
 
         socket.on('gameError', (errorMessage) => {
@@ -1175,30 +1171,32 @@
             submitAnswerBtn.style.display = 'none';
             waitingMessage.textContent = '';
             joinGameBtn.style.display = 'block';
-            
+            joinGameBtn.disabled = false; // Ensure join button is enabled
+            document.getElementById('betAmount').disabled = false; // Ensure bet amount is enabled
+
+            document.body.classList.remove('playing-bot'); // Remove bot-specific class
+
             if (questionTimer) {
                 clearTimeout(questionTimer);
                 questionTimer = null;
             }
-            
             if (countdownInterval) {
                 clearInterval(countdownInterval);
                 countdownInterval = null;
             }
-            
             countdownTimer.style.display = 'none';
-            
-            // Reset any modal that might be open
+            countdownTimer.textContent = '';
+
+
             const modal = document.getElementById('gameChoiceModal');
             if (modal && modal.style.display === 'flex') {
                 modal.style.display = 'none';
             }
-            
-            // Reset any waiting timeout
             if (waitingTimeout) {
                 clearTimeout(waitingTimeout);
                 waitingTimeout = null;
             }
+            console.log('Game UI reset.');
         }
 
         function toggleTheme() {
