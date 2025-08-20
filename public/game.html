@@ -244,7 +244,6 @@
         let currentRoomId = null;
         let currentBetAmount = null;
         let currentQuestionId = null;
-        let questionStartTime;
         let questionTimer;
         let correctAnswer;
         let loggedInUser = null;
@@ -748,11 +747,11 @@
             joinGameBtn.disabled = false;
         });
 
-        socket.on('matchmakingExpired', ({ message }) => {
-            console.log('Matchmaking expired:', message);
-            waitingMessage.textContent = message;
+        socket.on('matchmakingError', ({ message }) => {
+            console.error('Matchmaking/bot game error:', message);
             resetUIAfterError();
-            alert(message);
+            alert(`Game setup failed: ${message}`);
+            joinGameBtn.disabled = false;
         });
 
         submitAnswerBtn.addEventListener('click', () => {
@@ -761,33 +760,25 @@
                 alert('Please select an answer!');
                 return;
             }
-
+            
             const selectedAnswer = parseInt(selectedOption.value);
-
+            
             console.log('Submitting answer:', {
                 roomId: currentRoomId,
                 questionId: currentQuestionId,
                 answer: selectedAnswer,
                 username: connectedWallet
             });
-
-            socket.emit('submitAnswer', {
-                roomId: currentRoomId,
-                questionId: currentQuestionId,
+            
+            socket.emit('submitAnswer', { 
+                roomId: currentRoomId, 
+                questionId: currentQuestionId, 
                 answer: selectedAnswer,
-                username: connectedWallet
+                username: connectedWallet 
             });
-
+            
             submitAnswerBtn.disabled = true;
             waitingMessage.textContent = 'Waiting for other player to answer...';
-        });
-
-        socket.on('answerError', (message) => {
-            console.error('Answer submission error:', message);
-            alert(`Error submitting answer: ${message}`);
-            if (message === 'Room not found' || message === 'Invalid response time') {
-                resetGame();
-            }
         });
 
         socket.on('botGameReady', (data) => {
@@ -829,17 +820,8 @@
             updatePlayerUI(players);
         });
 
-        socket.on('nextQuestion', ({ questionId, question, options, questionNumber, totalQuestions, questionStartTime: qStartTime }) => {
-            currentQuestionId = questionId;
-            questionStartTime = parseInt(qStartTime);
-            
-            // Clear any previous answer highlights
-            const previousOptions = document.querySelectorAll('#options input');
-            previousOptions.forEach(option => {
-                if (option.parentElement) {
-                    option.parentElement.classList.remove('correct', 'incorrect');
-                }
-            });
+        socket.on('nextQuestion', ({ questionId, question, options, questionNumber, totalQuestions }) => {
+            currentQuestionId = questionId; // Store the question ID
             
             displayQuestion(question, options, questionNumber, totalQuestions);
             submitAnswerBtn.disabled = false;
@@ -850,16 +832,13 @@
                 clearTimeout(questionTimer);
             }
             
-            // Set a local timer to disable submit button after 10 seconds
-            // This is just UI feedback - the server controls the actual timing
             questionTimer = setTimeout(() => {
-                if (!submitAnswerBtn.disabled) {
-                    submitAnswerBtn.disabled = true;
-                    waitingMessage.textContent = 'Time\'s up! Waiting for round to complete...';
-                }
-            }, 10000);
+                submitAnswerBtn.disabled = true;
+                waitingMessage.textContent = 'Time\'s up!';
+            }, 10000); // Match server timeout
             
-            startCountdown(questionStartTime);
+            // Start visual countdown for user experience
+            startVisualCountdown();
         });
 
         socket.on('scoreUpdate', (players) => {
@@ -977,19 +956,6 @@
             }, 7000); // Increased delay to allow reading the message
         });
 
-        socket.on('paymentCompleted', (data) => {
-            console.log('Payment completed!', data);
-            const explorerLink = `https://explorer.solana.com/tx/${data.transactionSignature}?cluster=devnet`;
-            showNotification(`Your winnings of ${data.amount} USDC have been sent! <a href="${explorerLink}" target="_blank">View Transaction</a>`, 'success');
-            updateBalance(); // Refresh the user's balance
-        });
-
-        socket.on('paymentFailed', (data) => {
-            console.error('Payment failed!', data);
-            // Show an error notification. Assure the user it will be retried.
-            showNotification(`There was an issue sending your winnings for game ${data.gameId}. We will automatically retry. If the problem persists, please contact support with Payment ID: ${data.paymentId}.`, 'error');
-        });
-
         socket.on('playerLeft', (username) => {
             console.log(`Player ${username} left the game`);
             waitingMessage.textContent = `${username} left the game. Waiting for game resolution...`;
@@ -1042,14 +1008,16 @@
         socket.on('gameError', (errorMessage) => {
             console.error('Game error:', errorMessage);
             alert(`Game error: ${errorMessage}`);
+            
             resetGame();
         });
 
         socket.on('disconnect', () => {
             console.log('Disconnected from server');
             alert('You have been disconnected from the game server. Please refresh the page to reconnect.');
+            
+            // Reset game UI
             resetGame();
-            clearInterval(balanceUpdateInterval);
         });
 
         const forfeitStyles = document.createElement('style');
@@ -1155,22 +1123,22 @@
             `).join('');
         }
 
-        function startCountdown(qStartTime) {
-            const duration = 7;
-
+        function startVisualCountdown() {
+            let timeRemaining = 10; // 10 seconds to match server
+            
             clearInterval(countdownInterval);
-
+            
             countdownInterval = setInterval(() => {
-                const timeRemaining = duration - moment().diff(moment(qStartTime), 'seconds');
                 countdownTimer.textContent = `Time remaining: ${timeRemaining} seconds`;
-
-                if (timeRemaining <= 0) {
+                timeRemaining--;
+                
+                if (timeRemaining < 0) {
                     clearInterval(countdownInterval);
                     countdownTimer.textContent = "Time's up!";
                     submitAnswerBtn.disabled = true;
                 }
             }, 1000);
-
+            
             countdownTimer.style.display = 'block';
         }
 
@@ -1200,10 +1168,10 @@
             submitAnswerBtn.style.display = 'none';
             waitingMessage.textContent = '';
             joinGameBtn.style.display = 'block';
-            joinGameBtn.disabled = false; // Ensure join button is enabled
-            document.getElementById('betAmount').disabled = false; // Ensure bet amount is enabled
+            joinGameBtn.disabled = false;
+            document.getElementById('betAmount').disabled = false;
 
-            document.body.classList.remove('playing-bot'); // Remove bot-specific class
+            document.body.classList.remove('playing-bot');
 
             if (questionTimer) {
                 clearTimeout(questionTimer);
@@ -1216,7 +1184,6 @@
             countdownTimer.style.display = 'none';
             countdownTimer.textContent = '';
 
-
             const modal = document.getElementById('gameChoiceModal');
             if (modal && modal.style.display === 'flex') {
                 modal.style.display = 'none';
@@ -1225,6 +1192,9 @@
                 clearTimeout(waitingTimeout);
                 waitingTimeout = null;
             }
+            
+            currentQuestionId = null;
+            
             console.log('Game UI reset.');
         }
 
@@ -1349,17 +1319,6 @@
             }
         }
 
-        function showNotification(message, type = 'info') {
-            const notification = document.getElementById('notification');
-            notification.innerHTML = message;
-            notification.className = `notification ${type}`; // Add classes for styling
-            notification.style.display = 'block';
-
-            setTimeout(() => {
-                notification.style.display = 'none';
-            }, 10000); // Show for 10 seconds
-        }
-
         socket.on('leaderboardData', (leaderboard) => {
             leaderboardBody.innerHTML = '';
             leaderboard.forEach((user, index) => {
@@ -1428,31 +1387,20 @@
             const { username, isCorrect, correctAnswer } = data;
             
             try {
-                // Only highlight answers for the current client who answered
                 if (username === connectedWallet) {
                     const selectedOption = document.querySelector('input[name="answer"]:checked');
                     if (selectedOption && selectedOption.parentElement) {
-                        // Highlight the player's choice
                         selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
-                        
-                        // If the answer was wrong, also highlight the correct answer
-                        if (!isCorrect) {
-                            const correctOption = document.querySelector(`input[value="${correctAnswer}"]`);
-                            if (correctOption && correctOption.parentElement) {
-                                correctOption.parentElement.classList.add('correct');
-                            }
+                        const correctOption = document.querySelector(`input[value="${correctAnswer}"]`);
+                        if (correctOption && correctOption.parentElement && !isCorrect) {
+                            correctOption.parentElement.classList.add('correct');
                         }
                     }
-                    
-                    // Disable submit button since this player has answered
-                    submitAnswerBtn.disabled = true;
-                    waitingMessage.textContent = 'Answer submitted! Waiting for timer to complete...';
                 }
             } catch (error) {
                 console.error('Error highlighting answers in answerResult:', error);
             }
         });
-
 
         socket.on('playerAnswered', (data) => {
             if (typeof data === 'string') {
@@ -1462,29 +1410,23 @@
             }
             
             const { username, isBot, responseTime, timedOut } = data;
-            
-            // Don't show anything for the current client (they already got answerResult)
-            if (username === connectedWallet) {
-                return;
-            }
-            
-            // Show notification for other players
-            if (isBot) {
-                waitingMessage.innerHTML = `
-                    <div class="bot-answer">
-                        ${username} 🤖 has answered in ${responseTime}ms. Timer continues...
-                        <span class="bot-thinking"></span>
-                    </div>`;
-                playBotSound('answer');
-            } else {
-                if (timedOut) {
-                    waitingMessage.textContent = `${username} ran out of time!`;
+            if (username !== connectedWallet) {
+                if (isBot) {
+                    waitingMessage.innerHTML = `
+                        <div class="bot-answer">
+                            ${username} 🤖 has answered in ${responseTime}ms
+                            <span class="bot-thinking"></span>
+                        </div>`;
+                    playBotSound('answer');
                 } else {
-                    waitingMessage.textContent = `${username} has answered in ${responseTime}ms. Timer continues...`;
+                    // Show server-calculated response time for transparency
+                    const responseText = timedOut ? 
+                        `${username} ran out of time!` : 
+                        `${username} has submitted their answer${responseTime ? ` (${responseTime}ms)` : ''}`;
+                    waitingMessage.textContent = responseText;
                 }
             }
         });
-
 
         socket.on('botRoomCreated', (roomId) => {
             console.log(`Bot room created: ${roomId}`);
@@ -1561,81 +1503,33 @@
             const { questionId, correctAnswer, playerResults } = data;
             
             try {
-                console.log('Round complete data:', data);
-                
-                // Find the current client's result
-                const clientResult = playerResults.find(result => result.username === connectedWallet);
-                
-                // Clear any existing highlights first
                 const options = document.querySelectorAll('#options input');
-                options.forEach(option => {
-                    if (option.parentElement) {
-                        option.parentElement.classList.remove('correct', 'incorrect');
-                    }
-                });
-                
-                // Only highlight if the client actually answered (didn't time out)
-                if (clientResult && clientResult.answer !== -1) {
-                    // Highlight the correct answer in green
-                    if (correctAnswer >= 0 && correctAnswer < options.length && options[correctAnswer].parentElement) {
-                        options[correctAnswer].parentElement.classList.add('correct');
-                    }
+                if (options && options.length > correctAnswer && options[correctAnswer].parentElement) {
+                    options[correctAnswer].parentElement.classList.add('correct');
                     
-                    // If client was wrong, highlight their wrong answer in red
-                    if (!clientResult.isCorrect && 
-                        clientResult.answer >= 0 && 
-                        clientResult.answer < options.length && 
-                        options[clientResult.answer].parentElement) {
-                        options[clientResult.answer].parentElement.classList.add('incorrect');
+                    const playerResult = playerResults.find(result => result.username === connectedWallet);
+                    if (playerResult && !playerResult.isCorrect && 
+                        playerResult.answer >= 0 && 
+                        playerResult.answer < options.length && 
+                        options[playerResult.answer].parentElement) {
+                        options[playerResult.answer].parentElement.classList.add('incorrect');
                     }
                 }
-                // If client didn't answer (timed out), don't highlight anything
                 
-                // Show response times for all players
-                const responseTimes = playerResults.map(result => {
-                    if (result.timedOut) {
-                        return `${result.username}${result.isBot ? ' 🤖' : ''}: No answer`;
-                    }
-                    return `${result.username}${result.isBot ? ' 🤖' : ''}: ${result.responseTime}ms`;
-                }).join(', ');
-                console.log(`Round complete: Response times - ${responseTimes}`);
-                
-                // Disable submit button and show waiting message
-                submitAnswerBtn.disabled = true;
-                waitingMessage.textContent = 'Round complete. Next question coming...';
+                // Display round results with server-calculated response times
+                console.log('Round complete results:', playerResults);
+                let resultsText = 'Round Results:\n';
+                playerResults.forEach(result => {
+                    const status = result.isCorrect ? '✓' : '✗';
+                    const responseTime = result.responseTime ? `${result.responseTime}ms` : 'N/A';
+                    const botLabel = result.isBot ? ' 🤖' : '';
+                    resultsText += `${status} ${result.username}${botLabel}: ${responseTime}\n`;
+                });
+                console.log(resultsText);
                 
             } catch (error) {
                 console.error('Error highlighting answers in roundComplete:', error);
             }
-        });
-
-
-        socket.on('finalRoundComplete', (data) => {
-            console.log('Final round complete:', data);
-            
-            // Clear countdown timer
-            if (countdownInterval) {
-                clearInterval(countdownInterval);
-            }
-            countdownTimer.style.display = 'none';
-            
-            // Hide submit button and options
-            submitAnswerBtn.style.display = 'none';
-            optionsDiv.innerHTML = '';
-            
-            // Show final message
-            waitingMessage.innerHTML = `
-                <div class="final-results">
-                    <h3>${data.message}</h3>
-                    <div class="final-scores">
-                        ${data.finalScores.map(p => 
-                            `<p><strong>${p.username}${p.isBot ? ' 🤖' : ''}</strong>: ${p.score} correct answers</p>`
-                        ).join('')}
-                    </div>
-                </div>
-            `;
-            
-            questionDiv.innerHTML = '<h2>Game Complete!</h2><p>Final results coming up...</p>';
         });
 
         // Add bot-related CSS
