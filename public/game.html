@@ -121,6 +121,18 @@
             background-color: #F44336;
             color: white;
         }
+        .correct-answer {
+            font-weight: bold;
+            color: #2e7d32; /* Dark green for visibility */
+            background-color: #e8f5e9; /* Light green background */
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            }
+            .dark-theme .correct-answer {
+            background-color: #1b5e20;
+            color: #ffffff;
+        }
     </style>
     <script>
         const splToken = window.SplToken;
@@ -1012,6 +1024,12 @@
             resetGame();
         });
 
+        socket.on('clearQuestionUI', () => {
+            questionDiv.innerHTML = '';
+            optionsDiv.innerHTML = '';
+            waitingMessage.innerHTML = '';
+        });
+
         socket.on('disconnect', () => {
             console.log('Disconnected from server');
             alert('You have been disconnected from the game server. Please refresh the page to reconnect.');
@@ -1523,13 +1541,17 @@
 
         socket.on('revealCorrectAnswer', (data) => {
             const { questionId, correctAnswerText } = data;
+            console.log(`Received revealCorrectAnswer: questionId=${questionId}, correctAnswerText=${correctAnswerText}`);
             try {
-                // Display the correct answer as text
-                waitingMessage.innerHTML += `<p>Correct Answer: ${correctAnswerText}</p>`;
-                // Highlight the correct answer in the UI by matching the text
+                const normalizeText = (text) => text.trim().toLowerCase().replace(/\s+/g, ' ');
+                waitingMessage.innerHTML += `<p class="correct-answer">Correct Answer: ${correctAnswerText}</p>`;
                 const options = document.querySelectorAll('#options label');
+                console.log('Options available:', Array.from(options).map(label => label.textContent));
                 options.forEach((label, index) => {
-                if (label.textContent === correctAnswerText) {
+                const labelText = normalizeText(label.textContent);
+                const correctText = normalizeText(correctAnswerText);
+                console.log(`Comparing label: "${labelText}" with correct: "${correctText}"`);
+                if (labelText === correctText) {
                     label.parentElement.classList.add('correct');
                 }
                 });

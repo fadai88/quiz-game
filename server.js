@@ -1123,11 +1123,12 @@ io.on('connection', (socket) => {
 
             // Delay revealing the correct answer
             setTimeout(() => {
+                console.log(`Emitting revealCorrectAnswer for room ${roomId}, question ${currentQuestion.tempId}: ${currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer]}`);
                 io.to(roomId).emit('revealCorrectAnswer', {
-                questionId: currentQuestion.tempId,
-                correctAnswerText: currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer] // Send text, not index
+                    questionId: currentQuestion.tempId,
+                    correctAnswerText: currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer]
                 });
-            }, 2000); // 2-second delay
+            }, 2000);
 
             await completeQuestion(roomId);
             } else {
@@ -1380,109 +1381,133 @@ async function startGame(roomId) {
 }
 
 function startNextQuestion(roomId) {
-    const room = gameRooms.get(roomId);
-    if (!room) {
-        console.log(`Room ${roomId} not found when trying to start next question`);
+  const room = gameRooms.get(roomId);
+  if (!room) {
+    console.log(`Room ${roomId} not found when trying to start next question`);
+    return;
+  }
+
+  const currentQuestion = room.questions[room.currentQuestionIndex];
+  room.questionStartTime = Date.now();
+
+  console.log(`Question ${room.currentQuestionIndex + 1} started at timestamp: ${room.questionStartTime} for room ${roomId}`);
+
+  const shuffledOptions = shuffleArray([...currentQuestion.options]);
+  const shuffledCorrectAnswer = shuffledOptions.indexOf(currentQuestion.options[currentQuestion.correctAnswer]);
+  currentQuestion.shuffledOptions = shuffledOptions;
+  currentQuestion.shuffledCorrectAnswer = shuffledCorrectAnswer;
+
+  // Clear previous question UI before sending new question
+  io.to(roomId).emit('clearQuestionUI');
+
+  io.to(roomId).emit('nextQuestion', {
+    questionId: currentQuestion.tempId,
+    question: currentQuestion.question,
+    options: shuffledOptions,
+    questionNumber: room.currentQuestionIndex + 1,
+    totalQuestions: room.questions.length
+  });
+
+  room.answersReceived = 0;
+
+  // Handle bot answer for bot games
+  const bot = room.players.find(p => p.isBot);
+  if (bot) {
+    bot.answerQuestion(
+      currentQuestion.question,
+      currentQuestion.shuffledOptions,
+      shuffledCorrectAnswer
+    ).then(botAnswer => {
+      bot.answered = true;
+      bot.lastAnswer = botAnswer.answer;
+      bot.lastResponseTime = botAnswer.responseTime;
+
+      io.to(roomId).emit('playerAnswered', {
+        username: bot.username,
+        isBot: true,
+        responseTime: botAnswer.responseTime
+      });
+
+      const humanPlayer = room.players.find(p => !p.isBot);
+      if (!humanPlayer) {
+        console.log(`Human player disconnected from bot game in room ${roomId}`);
+        handleBotGameForfeit(roomId, bot);
         return;
-    }
+      }
 
-    const currentQuestion = room.questions[room.currentQuestionIndex];
-    
-    // SERVER-SIDE: Record the exact timestamp when question is sent
-    room.questionStartTime = Date.now(); // Use high precision timestamp
-    
-    console.log(`Question ${room.currentQuestionIndex + 1} started at timestamp: ${room.questionStartTime} for room ${roomId}`);
+      if (humanPlayer.answered) {
+        console.log(`All players answered in bot game room ${roomId}`);
+        io.to(roomId).emit('roundComplete', {
+          questionId: currentQuestion.tempId,
+          playerResults: room.players.map(p => ({
+            username: p.username,
+            isCorrect: p.lastAnswer === shuffledCorrectAnswer,
+            answer: p.lastAnswer,
+            responseTime: p.lastResponseTime || 0,
+            isBot: p.isBot || false
+          }))
+        });
 
-    // Shuffle options and determine new correct answer index
-    const shuffledOptions = shuffleArray([...currentQuestion.options]);
-    const shuffledCorrectAnswer = shuffledOptions.indexOf(currentQuestion.options[currentQuestion.correctAnswer]);
-    currentQuestion.shuffledOptions = shuffledOptions;
-    currentQuestion.shuffledCorrectAnswer = shuffledCorrectAnswer;
+        // Emit revealCorrectAnswer after a delay, consistent with human games
+        setTimeout(() => {
+          console.log(`Emitting revealCorrectAnswer for bot game room ${roomId}, question ${currentQuestion.tempId}: ${currentQuestion.shuffledOptions[shuffledCorrectAnswer]}`);
+          io.to(roomId).emit('revealCorrectAnswer', {
+            questionId: currentQuestion.tempId,
+            correctAnswerText: currentQuestion.shuffledOptions[shuffledCorrectAnswer]
+          });
+        }, 2000);
 
-    // Send question to clients (remove questionStartTime from client data for security)
-    io.to(roomId).emit('nextQuestion', {
-        questionId: currentQuestion.tempId,
-        question: currentQuestion.question,
-        options: shuffledOptions,
-        questionNumber: room.currentQuestionIndex + 1,
-        totalQuestions: room.questions.length
-        // REMOVED: questionStartTime - clients don't need this anymore
+        completeQuestion(roomId);
+      }
+    }).catch(error => {
+      console.error(`Error processing bot answer in room ${roomId}:`, error);
+      io.to(roomId).emit('gameError', 'Error processing bot response. Game ended.');
+      gameRooms.delete(roomId);
+    });
+  }
+
+  // Set timeout for question
+  room.questionTimeout = setTimeout(async () => {
+    room.players.forEach(player => {
+      if (!player.isBot && !player.answered) {
+        player.answered = true;
+        player.lastAnswer = -1;
+        const timeoutResponseTime = Date.now() - room.questionStartTime;
+        player.lastResponseTime = timeoutResponseTime;
+
+        io.to(roomId).emit('playerAnswered', {
+          username: player.username,
+          isBot: false,
+          timedOut: true,
+          responseTime: timeoutResponseTime
+        });
+      }
     });
 
-    room.answersReceived = 0;
+    if (room.players.every(p => p.answered)) {
+      console.log(`Question timeout: all players answered or timed out in room ${roomId}`);
+      io.to(roomId).emit('roundComplete', {
+        questionId: currentQuestion.tempId,
+        playerResults: room.players.map(p => ({
+          username: p.username,
+          isCorrect: p.lastAnswer === shuffledCorrectAnswer,
+          answer: p.lastAnswer,
+          responseTime: p.lastResponseTime || 0,
+          isBot: p.isBot || false
+        }))
+      });
 
-    // Clear any existing timeout
-    if (room.questionTimeout) {
-        clearTimeout(room.questionTimeout);
-    }
-
-    // Handle bot answer with server-calculated timing
-    const bot = room.players.find(p => p.isBot);
-    if (bot) {
-        bot.answerQuestion(
-            currentQuestion.question, 
-            currentQuestion.shuffledOptions,
-            shuffledCorrectAnswer
-        ).then(botAnswer => {
-            // Bot's response time is already calculated by the bot class
-            const botResponseTime = botAnswer.responseTime;
-            
-            io.to(roomId).emit('playerAnswered', {
-                username: bot.username,
-                isBot: true,
-                responseTime: botResponseTime
-            });
-            
-            const humanPlayer = room.players.find(p => !p.isBot);
-            if (!humanPlayer) {
-                console.log(`Human player disconnected from bot game in room ${roomId}`);
-                handleBotGameForfeit(roomId, bot);
-                return;
-            }
-            
-            if (humanPlayer.answered) {
-                io.to(roomId).emit('roundComplete', {
-                    questionId: currentQuestion.tempId,
-                    correctAnswer: shuffledCorrectAnswer,
-                    playerResults: room.players.map(p => ({
-                        username: p.username,
-                        isCorrect: p === bot ? 
-                            botAnswer.isCorrect : 
-                            p.lastAnswer === shuffledCorrectAnswer,
-                        answer: p === bot ? botAnswer.answer : p.lastAnswer,
-                        isBot: p.isBot || false
-                    }))
-                });
-                completeQuestion(roomId);
-            }
-        }).catch(error => {
-            console.error(`Error processing bot answer in room ${roomId}:`, error);
-            io.to(roomId).emit('gameError', 'Error processing bot response. Game ended.');
-            gameRooms.delete(roomId);
+      setTimeout(() => {
+        console.log(`Emitting revealCorrectAnswer for bot game timeout room ${roomId}, question ${currentQuestion.tempId}: ${currentQuestion.shuffledOptions[shuffledCorrectAnswer]}`);
+        io.to(roomId).emit('revealCorrectAnswer', {
+          questionId: currentQuestion.tempId,
+          correctAnswerText: currentQuestion.shuffledOptions[shuffledCorrectAnswer]
         });
-    }
+      }, 2000);
 
-    // Set timeout for question (increased to account for network latency)
-    room.questionTimeout = setTimeout(async () => {
-        room.players.forEach(player => {
-            if (!player.isBot && !player.answered) {
-                player.answered = true;
-                player.lastAnswer = -1;
-                // Server calculates timeout response time
-                const timeoutResponseTime = Date.now() - room.questionStartTime;
-                player.lastResponseTime = timeoutResponseTime;
-                
-                io.to(roomId).emit('playerAnswered', {
-                    username: player.username,
-                    isBot: false,
-                    timedOut: true,
-                    responseTime: timeoutResponseTime
-                });
-            }
-        });
-        
-        await completeQuestion(roomId);
-    }, 10000); // 10 second timeout
+      await completeQuestion(roomId);
+    }
+  }, 10000);
 }
 
 async function handleBotAnswer(room, bot, currentQuestion) {
@@ -1580,47 +1605,47 @@ async function determineBotDifficulty(playerUsername) {
 }
 
 async function completeQuestion(roomId) {
-    const room = gameRooms.get(roomId);
-    if (!room) return;
+  const room = gameRooms.get(roomId);
+  if (!room) return;
 
-    // Clear server-side timing data for security
-    room.questionStartTime = null;
-    room.roundStartTime = null;
+  // Clear server-side timing data for security
+  room.questionStartTime = null;
+  room.roundStartTime = null;
 
-    room.players.forEach(player => {
-        player.answered = false;
-        player.lastResponseTime = null; // Clear last response time
-    });
+  room.players.forEach(player => {
+    player.answered = false;
+    player.lastResponseTime = null;
+  });
 
-    io.to(roomId).emit('updateScores', room.players.map(p => ({ 
-        username: p.username, 
-        score: p.score, 
-        totalResponseTime: p.totalResponseTime || 0,
-        isBot: p.isBot || false
-    })));
+  io.to(roomId).emit('updateScores', room.players.map(p => ({
+    username: p.username,
+    score: p.score,
+    totalResponseTime: p.totalResponseTime || 0,
+    isBot: p.isBot || false
+  })));
 
-    if (room.questionTimeout) {
-        clearTimeout(room.questionTimeout);
-        room.questionTimeout = null;
-    }
+  if (room.questionTimeout) {
+    clearTimeout(room.questionTimeout);
+    room.questionTimeout = null;
+  }
 
-    room.currentQuestionIndex += 1;
-    room.answersReceived = 0;
+  room.currentQuestionIndex += 1;
+  room.answersReceived = 0;
 
-    if (room.playerLeft) {
-        console.log(`Game in room ${roomId} ending early because a player left`);
-        await handleGameOver(room, roomId);
-        return;
-    }
+  if (room.playerLeft) {
+    console.log(`Game in room ${roomId} ending early because a player left`);
+    await handleGameOver(room, roomId);
+    return;
+  }
 
-    if (room.currentQuestionIndex < room.questions.length) {
-        setTimeout(() => {
-            startNextQuestion(roomId);
-        }, 2000);
-    } else {
-        console.log(`Game over in room ${roomId}`);
-        await handleGameOver(room, roomId);
-    }
+  if (room.currentQuestionIndex < room.questions.length) {
+    setTimeout(() => {
+      startNextQuestion(roomId);
+    }, 3000); // Increased from 2000 to 3000ms
+  } else {
+    console.log(`Game over in room ${roomId}`);
+    await handleGameOver(room, roomId);
+  }
 }
 
 function logResponseTimes(roomId, round) {
