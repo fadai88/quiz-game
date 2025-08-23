@@ -1384,18 +1384,14 @@
         });
 
         socket.on('answerResult', (data) => {
-            const { username, isCorrect, correctAnswer } = data;
-            
+            const { username, isCorrect } = data;
+
             try {
                 if (username === connectedWallet) {
-                    const selectedOption = document.querySelector('input[name="answer"]:checked');
-                    if (selectedOption && selectedOption.parentElement) {
-                        selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
-                        const correctOption = document.querySelector(`input[value="${correctAnswer}"]`);
-                        if (correctOption && correctOption.parentElement && !isCorrect) {
-                            correctOption.parentElement.classList.add('correct');
-                        }
-                    }
+                const selectedOption = document.querySelector('input[name="answer"]:checked');
+                if (selectedOption && selectedOption.parentElement) {
+                    selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
+                }
                 }
             } catch (error) {
                 console.error('Error highlighting answers in answerResult:', error);
@@ -1500,35 +1496,45 @@
         });
 
         socket.on('roundComplete', (data) => {
-            const { questionId, correctAnswer, playerResults } = data;
-            
+            const { questionId, playerResults } = data;
+
             try {
                 const options = document.querySelectorAll('#options input');
-                if (options && options.length > correctAnswer && options[correctAnswer].parentElement) {
-                    options[correctAnswer].parentElement.classList.add('correct');
-                    
-                    const playerResult = playerResults.find(result => result.username === connectedWallet);
-                    if (playerResult && !playerResult.isCorrect && 
-                        playerResult.answer >= 0 && 
-                        playerResult.answer < options.length && 
-                        options[playerResult.answer].parentElement) {
-                        options[playerResult.answer].parentElement.classList.add('incorrect');
-                    }
+                // Highlight the current player's answer based on isCorrect
+                const playerResult = playerResults.find(result => result.username === connectedWallet);
+                if (playerResult && playerResult.answer >= 0 && playerResult.answer < options.length) {
+                options[playerResult.answer].parentElement.classList.add(playerResult.isCorrect ? 'correct' : 'incorrect');
                 }
-                
+
                 // Display round results with server-calculated response times
                 console.log('Round complete results:', playerResults);
                 let resultsText = 'Round Results:\n';
                 playerResults.forEach(result => {
-                    const status = result.isCorrect ? '✓' : '✗';
-                    const responseTime = result.responseTime ? `${result.responseTime}ms` : 'N/A';
-                    const botLabel = result.isBot ? ' 🤖' : '';
-                    resultsText += `${status} ${result.username}${botLabel}: ${responseTime}\n`;
+                const status = result.isCorrect ? '✓' : '✗';
+                const responseTime = result.responseTime ? `${result.responseTime}ms` : 'N/A';
+                const botLabel = result.isBot ? ' 🤖' : '';
+                resultsText += `${status} ${result.username}${botLabel}: ${responseTime}\n`;
                 });
                 console.log(resultsText);
-                
             } catch (error) {
-                console.error('Error highlighting answers in roundComplete:', error);
+                console.error('Error in roundComplete:', error);
+            }
+        });
+
+        socket.on('revealCorrectAnswer', (data) => {
+            const { questionId, correctAnswerText } = data;
+            try {
+                // Display the correct answer as text
+                waitingMessage.innerHTML += `<p>Correct Answer: ${correctAnswerText}</p>`;
+                // Highlight the correct answer in the UI by matching the text
+                const options = document.querySelectorAll('#options label');
+                options.forEach((label, index) => {
+                if (label.textContent === correctAnswerText) {
+                    label.parentElement.classList.add('correct');
+                }
+                });
+            } catch (error) {
+                console.error('Error in revealCorrectAnswer:', error);
             }
         });
 

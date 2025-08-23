@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, Keypair } = require('@solana/web3.js');
 const Joi = require('joi');
+const BotDetector = require('./botDetector');
 
 const transactionSchema = Joi.object({
     walletAddress: Joi.string().required(),
@@ -86,6 +87,7 @@ const gameRooms = new Map();
 const matchmakingPools = {
     human: new Map() // Map of betAmount -> array of waiting players
 };
+const botDetector = new BotDetector();
 
 const config = {
     USDC_MINT: new PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
@@ -412,6 +414,12 @@ io.on('connection', (socket) => {
     }
 
     socket.on('walletLogin', async ({ walletAddress, signature, message, recaptchaToken, clientData }) => {
+        const isWalletBlocked = await redisClient.get(`blocklist:wallet:${walletAddress}`);
+        if (isWalletBlocked) {
+            console.warn(`Blocked wallet attempting to login: ${walletAddress}`);
+            socket.emit('loginFailure', 'This wallet is temporarily blocked.');
+            return;
+        }
         try {
             console.log('Wallet login attempt:', { walletAddress, recaptchaToken: !!recaptchaToken });
             
@@ -469,7 +477,6 @@ io.on('connection', (socket) => {
                 return socket.emit('loginFailure', 'Invalid wallet credentials');
             }
 
-            // 4. Find or create user
             try {
                 let user = await User.findOne({ walletAddress });
                 if (!user) {
@@ -997,117 +1004,142 @@ io.on('connection', (socket) => {
 
     socket.on('submitAnswer', async ({ roomId, questionId, answer, username }) => {
         try {
-            await rateLimitEvent(username, 'submitAnswer', 20, 60);
-        
+            // Pass socket to rateLimitEvent
+            await rateLimitEvent(username, 'submitAnswer', 10, 60);
+
             console.log(`Received answer from ${username} in room ${roomId} for question ${questionId}:`, { answer });
-            
+
             const room = gameRooms.get(roomId);
             if (!room) {
-                console.error(`Room ${roomId} not found for answer submission`);
-                return;
+            console.error(`Room ${roomId} not found for answer submission`);
+            socket.emit('answerError', 'Room not found');
+            return;
             }
 
             // SECURITY: Verify that a question is currently active
             if (!room.questionStartTime) {
-                console.error(`No active question in room ${roomId} when ${username} submitted answer`);
-                socket.emit('answerError', 'No active question');
-                return;
+            console.error(`No active question in room ${roomId} when ${username} submitted answer`);
+            socket.emit('answerError', 'No active question');
+            return;
             }
-        
+
             const player = room.players.find(p => p.username === username && !p.isBot);
             if (!player) {
-                console.error(`Player ${username} not found in room ${roomId} or is a bot`);
-                return;
+            console.error(`Player ${username} not found in room ${roomId} or is a bot`);
+            socket.emit('answerError', 'Player not found');
+            return;
             }
 
             // Prevent double submission
             if (player.answered) {
-                console.log(`Player ${username} already answered this question`);
-                return;
+            console.log(`Player ${username} already answered this question`);
+            socket.emit('answerError', 'Already answered');
+            return;
             }
-        
+
             const currentQuestion = room.questionIdMap.get(questionId);
             if (!currentQuestion) {
-                console.error(`Question ${questionId} not found in room ${roomId}`);
-                return;
+            console.error(`Question ${questionId} not found in room ${roomId}`);
+            socket.emit('answerError', 'Question not found');
+            return;
             }
 
             // SERVER-SIDE CALCULATION: Calculate response time on server
             const serverResponseTime = Date.now() - room.questionStartTime;
-            
+
             // Validate response time (prevent negative or impossibly fast responses)
-            if (serverResponseTime < 100) { // Minimum 100ms to prevent impossible speeds
-                console.warn(`Suspiciously fast response time ${serverResponseTime}ms from ${username} in room ${roomId}`);
-                socket.emit('answerError', 'Response submitted too quickly');
-                return;
+            if (serverResponseTime < 200) {
+            console.warn(`Suspiciously fast response time ${serverResponseTime}ms from ${username} in room ${roomId}`);
+            await redisClient.set(`suspect:${username}`, 1, 'EX', 3600); // Flag for 1 hour
+            socket.emit('answerError', 'Response submitted too quickly');
+            return;
             }
 
-            if (serverResponseTime > 15000) { // Maximum 15 seconds (5s buffer beyond timeout)
-                console.warn(`Response time too slow ${serverResponseTime}ms from ${username} in room ${roomId}`);
-                socket.emit('answerError', 'Response submitted too late');
-                return;
+            if (serverResponseTime > 15000) {
+            console.warn(`Response time too slow ${serverResponseTime}ms from ${username} in room ${roomId}`);
+            await redisClient.set(`suspect:${username}`, 1, 'EX', 3600); // Flag for 1 hour
+            socket.emit('answerError', 'Response submitted too late');
+            return;
             }
-            
+
             console.log(`SERVER CALCULATED: ${username} response time: ${serverResponseTime}ms`);
-        
+
+            // Check if answer is correct
+            const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
+
+            // Record for bot detection
+            botDetector.recordAnswer(username, isCorrect, serverResponseTime, currentQuestion.difficulty);
+
+            // Check if player is suspicious
+            if (botDetector.isSuspicious(username)) {
+            console.warn(`Flagging suspicious player: ${username}`);
+            await redisClient.set(`suspicious:${username}`, 1, 'EX', 86400);
+            }
+
             // Use SERVER-CALCULATED response time, not client-provided
             player.totalResponseTime = (player.totalResponseTime || 0) + serverResponseTime;
             player.lastAnswer = answer;
             player.lastResponseTime = serverResponseTime; // Store for this round
             player.answered = true;
-        
-            const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
-        
+
             if (isCorrect) {
-                player.score = (player.score || 0) + 1;
-                console.log(`Correct answer from ${username}. New score: ${player.score}`);
-                try {
-                    await User.findOneAndUpdate(
-                        { walletAddress: username },
-                        { 
-                            $inc: { 
-                                correctAnswers: 1,
-                                totalPoints: 1
-                            } 
-                        }
-                    );
-                } catch (error) {
-                    console.error('Error updating user stats:', error);
+            player.score = (player.score || 0) + 1;
+            console.log(`Correct answer from ${username}. New score: ${player.score}`);
+            try {
+                await User.findOneAndUpdate(
+                { walletAddress: username },
+                {
+                    $inc: {
+                    correctAnswers: 1,
+                    totalPoints: 1
+                    }
                 }
-            } else {
-                console.log(`Incorrect answer from ${username}. Score unchanged: ${player.score}`);
+                );
+            } catch (error) {
+                console.error('Error updating user stats:', error);
             }
-        
-            socket.emit('answerResult', {
-                username: player.username,
-                isCorrect,
-                correctAnswer: currentQuestion.shuffledCorrectAnswer
-            });
-        
-            if (room.players.every(p => p.answered)) {
-                console.log(`All players answered in room ${roomId}`);
-                io.to(roomId).emit('roundComplete', {
-                    questionId: currentQuestion.tempId,
-                    correctAnswer: currentQuestion.shuffledCorrectAnswer,
-                    playerResults: room.players.map(p => ({
-                        username: p.username,
-                        isCorrect: p.lastAnswer === currentQuestion.shuffledCorrectAnswer,
-                        answer: p.lastAnswer,
-                        responseTime: p.lastResponseTime || 0, // Include server-calculated response time
-                        isBot: p.isBot || false
-                    }))
-                });
-                await completeQuestion(roomId);
             } else {
-                socket.to(roomId).emit('playerAnswered', {
-                    username,
-                    isBot: false,
-                    responseTime: serverResponseTime // Send server-calculated time to other players
+            console.log(`Incorrect answer from ${username}. Score unchanged: ${player.score}`);
+            }
+
+            socket.emit('answerResult', {
+            username: player.username,
+            isCorrect
+            // Removed: correctAnswer: currentQuestion.shuffledCorrectAnswer
+            });
+
+            if (room.players.every(p => p.answered)) {
+            console.log(`All players answered in room ${roomId}`);
+            io.to(roomId).emit('roundComplete', {
+                questionId: currentQuestion.tempId,
+                playerResults: room.players.map(p => ({
+                username: p.username,
+                isCorrect: p.lastAnswer === currentQuestion.shuffledCorrectAnswer,
+                answer: p.lastAnswer, // Send the index of what they answered
+                responseTime: p.lastResponseTime || 0,
+                isBot: p.isBot || false
+                }))
+            });
+
+            // Delay revealing the correct answer
+            setTimeout(() => {
+                io.to(roomId).emit('revealCorrectAnswer', {
+                questionId: currentQuestion.tempId,
+                correctAnswerText: currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer] // Send text, not index
                 });
+            }, 2000); // 2-second delay
+
+            await completeQuestion(roomId);
+            } else {
+            socket.to(roomId).emit('playerAnswered', {
+                username,
+                isBot: false,
+                responseTime: serverResponseTime // Send server-calculated time to other players
+            });
             }
         } catch (error) {
-            console.error('Rate limit error for submitAnswer:', error.message);
-            socket.emit('answerError', 'Too many answer submissions. Please try again later.');
+            console.error('Error in submitAnswer:', error.message);
+            socket.emit('answerError', `Error submitting answer: ${error.message}`);
         }
     });
 
