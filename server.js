@@ -21,6 +21,39 @@ const transactionSchema = Joi.object({
     gameMode: Joi.string().optional()
 });
 
+const submitAnswerSchema = Joi.object({
+    roomId: Joi.string().required(),
+    questionId: Joi.string().required(),
+    answer: Joi.number().integer().min(-1).required(), // Allow -1 for timeout cases
+    username: Joi.string().required()
+});
+
+const playerReadySchema = Joi.object({
+    roomId: Joi.string().required(),
+    preferredMode: Joi.string().valid('human', 'bot').optional()
+});
+
+const switchToBotSchema = Joi.object({
+    roomId: Joi.string().required()
+});
+
+const requestBotRoomSchema = Joi.object({
+    walletAddress: Joi.string().required(),
+    betAmount: Joi.number().min(1).max(100).required()
+});
+
+const requestBotGameSchema = Joi.object({
+    roomId: Joi.string().required()
+});
+
+const leaveRoomSchema = Joi.object({
+    roomId: Joi.string().required()
+});
+
+const matchFoundSchema = Joi.object({
+    newRoomId: Joi.string().required()
+});
+
 const { 
     createAssociatedTokenAccountInstruction, 
     getAssociatedTokenAddress, 
@@ -572,77 +605,85 @@ io.on('connection', (socket) => {
     });
 
     socket.on('playerReady', ({ roomId, preferredMode }) => {
-        console.log(`Player ${socket.id} ready in room ${roomId}, preferred mode: ${preferredMode || 'not specified'}`);
-        const room = gameRooms.get(roomId);
-        
-        if (!room) {
-            console.error(`Room ${roomId} not found when player ${socket.id} marked ready`);
-            return socket.emit('gameError', 'Room not found');
-        }
-        
-        if (room.roomMode === 'bot') {
-            console.log(`Room ${roomId} is set for bot play, not starting regular game`);
-            return;
-        }
-        
-        // Set preferred game mode if specified
-        if (preferredMode === 'human') {
-            room.roomMode = 'human';
-            console.log(`Room ${roomId} marked for human vs human play`);
-            
-            if (room.players.length === 1) {
-                let matchFound = false;
-                
-                for (const [otherRoomId, otherRoom] of gameRooms.entries()) {
-                    // Skip current room and invalid matches
-                    if (otherRoomId === roomId || 
-                        otherRoom.roomMode !== 'human' || 
-                        otherRoom.gameStarted || 
-                        otherRoom.betAmount !== room.betAmount ||
-                        otherRoom.players.length !== 1) {
-                        continue;
+        try {
+            // Validate input
+            const { error } = playerReadySchema.validate({ roomId, preferredMode });
+            if (error) {
+                console.error('Validation error in playerReady:', error.message);
+                socket.emit('gameError', `Invalid input: ${error.message}`);
+                return;
+            }
+
+            console.log(`Player ${socket.id} ready in room ${roomId}, preferred mode: ${preferredMode || 'not specified'}`);
+            const room = gameRooms.get(roomId);
+
+            if (!room) {
+                console.error(`Room ${roomId} not found when player ${socket.id} marked ready`);
+                socket.emit('gameError', 'Room not found');
+                return;
+            }
+
+            if (room.roomMode === 'bot') {
+                console.log(`Room ${roomId} is set for bot play, not starting regular game`);
+                return;
+            }
+
+            // Set preferred game mode if specified
+            if (preferredMode === 'human') {
+                room.roomMode = 'human';
+                console.log(`Room ${roomId} marked for human vs human play`);
+
+                if (room.players.length === 1) {
+                    let matchFound = false;
+
+                    for (const [otherRoomId, otherRoom] of gameRooms.entries()) {
+                        if (
+                            otherRoomId === roomId ||
+                            otherRoom.roomMode !== 'human' ||
+                            otherRoom.gameStarted ||
+                            otherRoom.betAmount !== room.betAmount ||
+                            otherRoom.players.length !== 1
+                        ) {
+                            continue;
+                        }
+
+                        console.log(`Found matching room ${otherRoomId} for player in room ${roomId}`);
+                        const player = room.players[0];
+                        otherRoom.players.push(player);
+                        socket.leave(roomId);
+                        socket.join(otherRoomId);
+
+                        socket.emit('matchFound', { newRoomId: otherRoomId });
+                        io.to(otherRoomId).emit('playerJoined', player.username);
+
+                        otherRoom.gameStarted = true;
+                        startGame(otherRoomId);
+
+                        gameRooms.delete(roomId);
+                        matchFound = true;
+                        break;
                     }
-                    
-                    // Found a match! Move the current player to the other room
-                    console.log(`Found matching room ${otherRoomId} for player in room ${roomId}`);
-                    
-                    const player = room.players[0]; // The current player
-                    
-                    otherRoom.players.push(player);
-                    socket.leave(roomId);
-                    socket.join(otherRoomId);
-                    
-                    socket.emit('matchFound', { newRoomId: otherRoomId });
-                    io.to(otherRoomId).emit('playerJoined', player.username);
-                    
-                    otherRoom.gameStarted = true;
-                    startGame(otherRoomId);
-                    
-                    gameRooms.delete(roomId);
-                    
-                    matchFound = true;
-                    break;
-                }
-                
-                if (!matchFound) {
-                    console.log(`No match found for player in room ${roomId}, waiting for others`);
+
+                    if (!matchFound) {
+                        console.log(`No match found for player in room ${roomId}, waiting for others`);
+                    }
                 }
             }
+
+            if (room.players.length === 2 && !room.gameStarted) {
+                console.log(`Starting multiplayer game in room ${roomId} with 2 players`);
+                room.gameStarted = true;
+                room.roomMode = 'multiplayer';
+                startGame(roomId);
+            } else {
+                console.log(`Room ${roomId} has ${room.players.length} players, waiting for more to join`);
+            }
+
+            logGameRoomsState();
+        } catch (error) {
+            console.error('Error in playerReady:', error);
+            socket.emit('gameError', `Error: ${error.message}`);
         }
-        
-        // Handle the case where there are already 2 players in the room
-        if (room.players.length === 2 && !room.gameStarted) {
-            console.log(`Starting multiplayer game in room ${roomId} with 2 players`);
-            room.gameStarted = true;
-            room.roomMode = 'multiplayer'; // Explicitly mark as multiplayer mode
-            startGame(roomId);
-        } else {
-            console.log(`Room ${roomId} has ${room.players.length} players, waiting for more to join`);
-        }
-        
-        // Log room state
-        console.log('Current room state:');
-        logGameRoomsState();
     });
 
     socket.on('joinHumanMatchmaking', async (data) => {
@@ -835,34 +876,41 @@ io.on('connection', (socket) => {
     });
 
     socket.on('switchToBot', async ({ roomId }) => {
-        console.log(`Player ${socket.id} wants to switch from matchmaking to bot game`);
-        
-        // Find this player in the matchmaking pools
-        let playerFound = false;
-        let playerData = null;
-        
-        for (const [betAmount, pool] of matchmakingPools.human.entries()) {
-            const playerIndex = pool.findIndex(p => p.socketId === socket.id);
-            if (playerIndex !== -1) {
-                playerData = pool[playerIndex];
-                pool.splice(playerIndex, 1); // Remove from matchmaking
-                playerFound = true;
-                console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${betAmount}`);
-                break;
+        try {
+            // Validate input
+            const { error } = switchToBotSchema.validate({ roomId });
+            if (error) {
+                console.error('Validation error in switchToBot:', error.message);
+                socket.emit('matchmakingError', { message: `Invalid input: ${error.message}` });
+                return;
             }
-        }
-        
-        if (!playerFound || !playerData) {
-            console.error(`Player ${socket.id} not found in any matchmaking pool`);
-            socket.emit('matchmakingError', { message: 'Not found in matchmaking' });
-            return;
-        }
-        
-        // Create a new bot game room
-        const newRoomId = generateRoomId();
-        console.log(`Creating bot game room ${newRoomId} for player ${playerData.walletAddress}`);
-        
-        createGameRoom(newRoomId, parseInt(playerData.betAmount), 'bot');
+
+            console.log(`Player ${socket.id} wants to switch from matchmaking to bot game`);
+
+            let playerFound = false;
+            let playerData = null;
+
+            for (const [betAmount, pool] of matchmakingPools.human.entries()) {
+                const playerIndex = pool.findIndex(p => p.socketId === socket.id);
+                if (playerIndex !== -1) {
+                    playerData = pool[playerIndex];
+                    pool.splice(playerIndex, 1);
+                    playerFound = true;
+                    console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${betAmount}`);
+                    break;
+                }
+            }
+
+            if (!playerFound || !playerData) {
+                console.error(`Player ${socket.id} not found in any matchmaking pool`);
+                socket.emit('matchmakingError', { message: 'Not found in matchmaking' });
+                return;
+            }
+
+            const newRoomId = generateRoomId();
+            console.log(`Creating bot game room ${newRoomId} for player ${playerData.walletAddress}`);
+
+            createGameRoom(newRoomId, parseInt(playerData.betAmount), 'bot');
             const room = gameRooms.get(newRoomId);
             room.players.push({
                 id: socket.id,
@@ -872,176 +920,232 @@ io.on('connection', (socket) => {
                 answered: false,
                 lastAnswer: null
             });
-        
-        // Join the socket to the new room
-        socket.join(newRoomId);
-        
-        // Notify the player
-        const botName = chooseBotName();
-        socket.emit('botGameCreated', { 
-            gameRoomId: newRoomId, 
-            botName 
-        });
-        
-        // Start the single player game with a bot
-        await startSinglePlayerGame(newRoomId);
+
+            socket.join(newRoomId);
+
+            const botName = chooseBotName();
+            socket.emit('botGameCreated', {
+                gameRoomId: newRoomId,
+                botName
+            });
+
+            await startSinglePlayerGame(newRoomId);
+        } catch (error) {
+            console.error('Error in switchToBot:', error);
+            socket.emit('matchmakingError', { message: error.message });
+        }
     });
     
-
     socket.on('matchFound', ({ newRoomId }) => {
-        console.log(`Match found, player ${socket.id} moved to room ${newRoomId}`);
-        currentRoomId = newRoomId;
-        // Additional handling if needed
+        try {
+            // Validate input
+            const { error } = matchFoundSchema.validate({ newRoomId });
+            if (error) {
+                console.error('Validation error in matchFound:', error.message);
+                socket.emit('gameError', `Invalid input: ${error.message}`);
+                return;
+            }
+
+            console.log(`Match found, player ${socket.id} moved to room ${newRoomId}`);
+            currentRoomId = newRoomId;
+            // Additional handling if needed
+        } catch (error) {
+            console.error('Error in matchFound:', error);
+            socket.emit('gameError', `Error: ${error.message}`);
+        }
     });
 
     socket.on('leaveRoom', ({ roomId }) => {
-        console.log(`Player ${socket.id} requested to leave room ${roomId}`);
-        
-        const room = gameRooms.get(roomId);
-        if (!room) {
-            console.log(`Room ${roomId} not found when player tried to leave`);
-            socket.emit('leftRoom', { roomId });
-            return;
-        }
-        
-        // If the game has already started, handle as a disconnect/forfeit
-        if (room.gameStarted) {
-            console.log(`Game already started in room ${roomId}, handling as disconnect`);
-            // The existing disconnect handler will take care of this
-            return;
-        }
-        
-        // Remove the player from the room
-        const playerIndex = room.players.findIndex(p => p.id === socket.id);
-        if (playerIndex !== -1) {
-            const player = room.players[playerIndex];
-            console.log(`Removing player ${player.username} from room ${roomId}`);
-            room.players.splice(playerIndex, 1);
-            
-            // Leave the socket.io room
-            socket.leave(roomId);
-            
-            // If the room is now empty, delete it
-            if (room.players.length === 0) {
-                console.log(`Room ${roomId} is now empty, deleting it`);
-                gameRooms.delete(roomId);
-            } else {
-                // Notify remaining players
-                console.log(`Notifying remaining players in room ${roomId}`);
-                io.to(roomId).emit('playerLeft', player.username);
+        try {
+            // Validate input
+            const { error } = leaveRoomSchema.validate({ roomId });
+            if (error) {
+                console.error('Validation error in leaveRoom:', error.message);
+                socket.emit('gameError', `Invalid input: ${error.message}`);
+                return;
             }
+
+            console.log(`Player ${socket.id} requested to leave room ${roomId}`);
+            
+            const room = gameRooms.get(roomId);
+            if (!room) {
+                console.log(`Room ${roomId} not found when player tried to leave`);
+                socket.emit('leftRoom', { roomId });
+                return;
+            }
+            
+            // If the game has already started, handle as a disconnect/forfeit
+            if (room.gameStarted) {
+                console.log(`Game already started in room ${roomId}, handling as disconnect`);
+                // The existing disconnect handler will take care of this
+                return;
+            }
+            
+            // Remove the player from the room
+            const playerIndex = room.players.findIndex(p => p.id === socket.id);
+            if (playerIndex !== -1) {
+                const player = room.players[playerIndex];
+                console.log(`Removing player ${player.username} from room ${roomId}`);
+                room.players.splice(playerIndex, 1);
+                
+                // Leave the socket.io room
+                socket.leave(roomId);
+                
+                // If the room is now empty, delete it
+                if (room.players.length === 0) {
+                    console.log(`Room ${roomId} is now empty, deleting it`);
+                    gameRooms.delete(roomId);
+                } else {
+                    // Notify remaining players
+                    console.log(`Notifying remaining players in room ${roomId}`);
+                    io.to(roomId).emit('playerLeft', player.username);
+                }
+            }
+            
+            // Confirm to the client they've left
+            socket.emit('leftRoom', { roomId });
+        } catch (error) {
+            console.error('Error in leaveRoom:', error);
+            socket.emit('gameError', `Error: ${error.message}`);
         }
-        
-        // Confirm to the client they've left
-        socket.emit('leftRoom', { roomId });
     });
     
     socket.on('requestBotRoom', async ({ walletAddress, betAmount }) => {
-        console.log(`Player ${walletAddress} requesting dedicated bot room with bet ${betAmount}`);
-        
-        const roomId = generateRoomId();
-        console.log(`Creating new bot room ${roomId} for ${walletAddress}`);
-        
-        createGameRoom(roomId, betAmount, 'bot');
-        const room = gameRooms.get(roomId);
-        room.players.push({
-            id: socket.id,
-            username: walletAddress,
-            score: 0,
-            totalResponseTime: 0
-        });
-        
-        socket.join(roomId);
-        socket.emit('botRoomCreated', roomId);
-        logGameRoomsState();
+        try {
+            // Validate input
+            const { error } = requestBotRoomSchema.validate({ walletAddress, betAmount });
+            if (error) {
+                console.error('Validation error in requestBotRoom:', error.message);
+                socket.emit('gameError', `Invalid input: ${error.message}`);
+                return;
+            }
+
+            console.log(`Player ${walletAddress} requesting dedicated bot room with bet ${betAmount}`);
+
+            const roomId = generateRoomId();
+            console.log(`Creating new bot room ${roomId} for ${walletAddress}`);
+
+            createGameRoom(roomId, betAmount, 'bot');
+            const room = gameRooms.get(roomId);
+            room.players.push({
+                id: socket.id,
+                username: walletAddress,
+                score: 0,
+                totalResponseTime: 0
+            });
+
+            socket.join(roomId);
+            socket.emit('botRoomCreated', roomId);
+            logGameRoomsState();
+        } catch (error) {
+            console.error('Error in requestBotRoom:', error);
+            socket.emit('gameError', `Error: ${error.message}`);
+        }
     });
 
     socket.on('requestBotGame', async ({ roomId }) => {
-        console.log(`Bot game requested for room ${roomId}`);
-        
-        // Log game rooms state before bot request
-        console.log('Game rooms state BEFORE bot request:');
-        logGameRoomsState();
-        
-        const room = gameRooms.get(roomId);
-        
-        if (!room) {
-            console.error(`Room ${roomId} not found when requesting bot game`);
-            socket.emit('gameError', 'Room not found');
-            return;
+        try {
+            // Validate input
+            const { error } = requestBotGameSchema.validate({ roomId });
+            if (error) {
+                console.error('Validation error in requestBotGame:', error.message);
+                socket.emit('gameError', `Invalid input: ${error.message}`);
+                return;
+            }
+
+            console.log(`Bot game requested for room ${roomId}`);
+
+            console.log('Game rooms state BEFORE bot request:');
+            logGameRoomsState();
+
+            const room = gameRooms.get(roomId);
+
+            if (!room) {
+                console.error(`Room ${roomId} not found when requesting bot game`);
+                socket.emit('gameError', 'Room not found');
+                return;
+            }
+
+            if (room.waitingTimeout) {
+                clearTimeout(room.waitingTimeout);
+            }
+
+            const humanPlayers = room.players.filter(p => !p.isBot);
+
+            if (humanPlayers.length > 1) {
+                console.error(`Room ${roomId} already has ${humanPlayers.length} human players, can't add bot`);
+                socket.emit('gameError', 'Cannot add bot to a room with multiple players');
+                return;
+            }
+
+            const playerInRoom = room.players.find(p => p.id === socket.id);
+            if (!playerInRoom) {
+                console.error(`Player ${socket.id} not found in room ${roomId}`);
+                socket.emit('gameError', 'You are not in this room');
+                return;
+            }
+
+            console.log(`Setting room ${roomId} to bot mode`);
+            room.roomMode = 'bot';
+
+            await startSinglePlayerGame(roomId);
+
+            console.log('Game rooms state AFTER bot request:');
+            logGameRoomsState();
+        } catch (error) {
+            console.error('Error in requestBotGame:', error);
+            socket.emit('gameError', `Error: ${error.message}`);
         }
-        
-        // Clear any existing timeout
-        if (room.waitingTimeout) {
-            clearTimeout(room.waitingTimeout);
-        }
-        
-        // Check if room already has multiple human players
-        const humanPlayers = room.players.filter(p => !p.isBot);
-        
-        if (humanPlayers.length > 1) {
-            console.error(`Room ${roomId} already has ${humanPlayers.length} human players, can't add bot`);
-            socket.emit('gameError', 'Cannot add bot to a room with multiple players');
-            return;
-        }
-        
-        // Check if this player is actually in this room
-        const playerInRoom = room.players.find(p => p.id === socket.id);
-        if (!playerInRoom) {
-            console.error(`Player ${socket.id} not found in room ${roomId}`);
-            socket.emit('gameError', 'You are not in this room');
-            return;
-        }
-        
-        console.log(`Setting room ${roomId} to bot mode`);
-        room.roomMode = 'bot';
-        
-        await startSinglePlayerGame(roomId);
-        
-        console.log('Game rooms state AFTER bot request:');
-        logGameRoomsState();
     });
 
     socket.on('submitAnswer', async ({ roomId, questionId, answer, username }) => {
         try {
-            // Pass socket to rateLimitEvent
+            // Validate input
+            const { error } = submitAnswerSchema.validate({ roomId, questionId, answer, username });
+            if (error) {
+                console.error('Validation error in submitAnswer:', error.message);
+                socket.emit('answerError', `Invalid input: ${error.message}`);
+                return;
+            }
+
+            // Rate limit check
             await rateLimitEvent(username, 'submitAnswer', 10, 60);
 
             console.log(`Received answer from ${username} in room ${roomId} for question ${questionId}:`, { answer });
 
             const room = gameRooms.get(roomId);
             if (!room) {
-            console.error(`Room ${roomId} not found for answer submission`);
-            socket.emit('answerError', 'Room not found');
-            return;
+                console.error(`Room ${roomId} not found for answer submission`);
+                socket.emit('answerError', 'Room not found');
+                return;
             }
 
             // SECURITY: Verify that a question is currently active
             if (!room.questionStartTime) {
-            console.error(`No active question in room ${roomId} when ${username} submitted answer`);
-            socket.emit('answerError', 'No active question');
-            return;
+                console.error(`No active question in room ${roomId} when ${username} submitted answer`);
+                socket.emit('answerError', 'No active question');
+                return;
             }
 
             const player = room.players.find(p => p.username === username && !p.isBot);
             if (!player) {
-            console.error(`Player ${username} not found in room ${roomId} or is a bot`);
-            socket.emit('answerError', 'Player not found');
-            return;
+                console.error(`Player ${username} not found in room ${roomId} or is a bot`);
+                socket.emit('answerError', 'Player not found');
+                return;
             }
 
             // Prevent double submission
             if (player.answered) {
-            console.log(`Player ${username} already answered this question`);
-            socket.emit('answerError', 'Already answered');
-            return;
+                console.log(`Player ${username} already answered this question`);
+                socket.emit('answerError', 'Already answered');
+                return;
             }
 
             const currentQuestion = room.questionIdMap.get(questionId);
             if (!currentQuestion) {
-            console.error(`Question ${questionId} not found in room ${roomId}`);
-            socket.emit('answerError', 'Question not found');
-            return;
+                console.error(`Question ${questionId} not found in room ${roomId}`);
+                socket.emit('answerError', 'Question not found');
+                return;
             }
 
             // SERVER-SIDE CALCULATION: Calculate response time on server
@@ -1049,17 +1153,17 @@ io.on('connection', (socket) => {
 
             // Validate response time (prevent negative or impossibly fast responses)
             if (serverResponseTime < 200) {
-            console.warn(`Suspiciously fast response time ${serverResponseTime}ms from ${username} in room ${roomId}`);
-            await redisClient.set(`suspect:${username}`, 1, 'EX', 3600); // Flag for 1 hour
-            socket.emit('answerError', 'Response submitted too quickly');
-            return;
+                console.warn(`Suspiciously fast response time ${serverResponseTime}ms from ${username} in room ${roomId}`);
+                await redisClient.set(`suspect:${username}`, 1, 'EX', 3600); // Flag for 1 hour
+                socket.emit('answerError', 'Response submitted too quickly');
+                return;
             }
 
             if (serverResponseTime > 15000) {
-            console.warn(`Response time too slow ${serverResponseTime}ms from ${username} in room ${roomId}`);
-            await redisClient.set(`suspect:${username}`, 1, 'EX', 3600); // Flag for 1 hour
-            socket.emit('answerError', 'Response submitted too late');
-            return;
+                console.warn(`Response time too slow ${serverResponseTime}ms from ${username} in room ${roomId}`);
+                await redisClient.set(`suspect:${username}`, 1, 'EX', 3600); // Flag for 1 hour
+                socket.emit('answerError', 'Response submitted too late');
+                return;
             }
 
             console.log(`SERVER CALCULATED: ${username} response time: ${serverResponseTime}ms`);
@@ -1072,71 +1176,70 @@ io.on('connection', (socket) => {
 
             // Check if player is suspicious
             if (botDetector.isSuspicious(username)) {
-            console.warn(`Flagging suspicious player: ${username}`);
-            await redisClient.set(`suspicious:${username}`, 1, 'EX', 86400);
+                console.warn(`Flagging suspicious player: ${username}`);
+                await redisClient.set(`suspicious:${username}`, 1, 'EX', 86400);
             }
 
-            // Use SERVER-CALCULATED response time, not client-provided
+            // Use SERVER-CALCULATED response time
             player.totalResponseTime = (player.totalResponseTime || 0) + serverResponseTime;
             player.lastAnswer = answer;
-            player.lastResponseTime = serverResponseTime; // Store for this round
+            player.lastResponseTime = serverResponseTime;
             player.answered = true;
 
             if (isCorrect) {
-            player.score = (player.score || 0) + 1;
-            console.log(`Correct answer from ${username}. New score: ${player.score}`);
-            try {
-                await User.findOneAndUpdate(
-                { walletAddress: username },
-                {
-                    $inc: {
-                    correctAnswers: 1,
-                    totalPoints: 1
-                    }
+                player.score = (player.score || 0) + 1;
+                console.log(`Correct answer from ${username}. New score: ${player.score}`);
+                try {
+                    await User.findOneAndUpdate(
+                        { walletAddress: username },
+                        {
+                            $inc: {
+                                correctAnswers: 1,
+                                totalPoints: 1
+                            }
+                        }
+                    );
+                } catch (error) {
+                    console.error('Error updating user stats:', error);
                 }
-                );
-            } catch (error) {
-                console.error('Error updating user stats:', error);
-            }
             } else {
-            console.log(`Incorrect answer from ${username}. Score unchanged: ${player.score}`);
+                console.log(`Incorrect answer from ${username}. Score unchanged: ${player.score}`);
             }
 
             socket.emit('answerResult', {
-            username: player.username,
-            isCorrect
-            // Removed: correctAnswer: currentQuestion.shuffledCorrectAnswer
+                username: player.username,
+                isCorrect
             });
 
             if (room.players.every(p => p.answered)) {
-            console.log(`All players answered in room ${roomId}`);
-            io.to(roomId).emit('roundComplete', {
-                questionId: currentQuestion.tempId,
-                playerResults: room.players.map(p => ({
-                username: p.username,
-                isCorrect: p.lastAnswer === currentQuestion.shuffledCorrectAnswer,
-                answer: p.lastAnswer, // Send the index of what they answered
-                responseTime: p.lastResponseTime || 0,
-                isBot: p.isBot || false
-                }))
-            });
-
-            // Delay revealing the correct answer
-            setTimeout(() => {
-                console.log(`Emitting revealCorrectAnswer for room ${roomId}, question ${currentQuestion.tempId}: ${currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer]}`);
-                io.to(roomId).emit('revealCorrectAnswer', {
+                console.log(`All players answered in room ${roomId}`);
+                io.to(roomId).emit('roundComplete', {
                     questionId: currentQuestion.tempId,
-                    correctAnswerText: currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer]
+                    playerResults: room.players.map(p => ({
+                        username: p.username,
+                        isCorrect: p.lastAnswer === currentQuestion.shuffledCorrectAnswer,
+                        answer: p.lastAnswer,
+                        responseTime: p.lastResponseTime || 0,
+                        isBot: p.isBot || false
+                    }))
                 });
-            }, 2000);
 
-            await completeQuestion(roomId);
+                // Delay revealing the correct answer
+                setTimeout(() => {
+                    console.log(`Emitting revealCorrectAnswer for room ${roomId}, question ${currentQuestion.tempId}: ${currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer]}`);
+                    io.to(roomId).emit('revealCorrectAnswer', {
+                        questionId: currentQuestion.tempId,
+                        correctAnswerText: currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer]
+                    });
+                }, 2000);
+
+                await completeQuestion(roomId);
             } else {
-            socket.to(roomId).emit('playerAnswered', {
-                username,
-                isBot: false,
-                responseTime: serverResponseTime // Send server-calculated time to other players
-            });
+                socket.to(roomId).emit('playerAnswered', {
+                    username,
+                    isBot: false,
+                    responseTime: serverResponseTime
+                });
             }
         } catch (error) {
             console.error('Error in submitAnswer:', error.message);
@@ -1146,6 +1249,9 @@ io.on('connection', (socket) => {
 
     socket.on('getLeaderboard', async () => {
         try {
+            // Apply rate-limiting
+            await rateLimitEvent(socket.id, 'getLeaderboard', 5, 60); // 5 requests per minute per socket
+
             const leaderboard = await User.find({})
                 .select('walletAddress gamesPlayed totalWinnings wins correctAnswers')
                 .sort({ totalWinnings: -1 })
