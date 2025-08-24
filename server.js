@@ -1608,7 +1608,6 @@ async function completeQuestion(roomId) {
   const room = gameRooms.get(roomId);
   if (!room) return;
 
-  // Clear server-side timing data for security
   room.questionStartTime = null;
   room.roundStartTime = null;
 
@@ -1641,7 +1640,7 @@ async function completeQuestion(roomId) {
   if (room.currentQuestionIndex < room.questions.length) {
     setTimeout(() => {
       startNextQuestion(roomId);
-    }, 3000); // Increased from 2000 to 3000ms
+    }, 3000);
   } else {
     console.log(`Game over in room ${roomId}`);
     await handleGameOver(room, roomId);

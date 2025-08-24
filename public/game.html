@@ -1025,9 +1025,12 @@
         });
 
         socket.on('clearQuestionUI', () => {
-            questionDiv.innerHTML = '';
-            optionsDiv.innerHTML = '';
-            waitingMessage.innerHTML = '';
+            // Only clear if no correct answer is being displayed
+            if (!waitingMessage.innerHTML.includes('Correct Answer')) {
+                questionDiv.innerHTML = '';
+                optionsDiv.innerHTML = '';
+                waitingMessage.innerHTML = '';
+            }
         });
 
         socket.on('disconnect', () => {
@@ -1515,26 +1518,22 @@
 
         socket.on('roundComplete', (data) => {
             const { questionId, playerResults } = data;
-
             try {
                 const options = document.querySelectorAll('#options input');
-                // Highlight the current player's answer based on isCorrect
                 const playerResult = playerResults.find(result => result.username === connectedWallet);
                 if (playerResult && playerResult.answer >= 0 && playerResult.answer < options.length) {
-                options[playerResult.answer].parentElement.classList.add(playerResult.isCorrect ? 'correct' : 'incorrect');
+                    options[playerResult.answer].parentElement.classList.add(playerResult.isCorrect ? 'correct' : 'incorrect');
                 }
-
-                // Display round results with server-calculated response times
-                console.log('Round complete results:', playerResults);
+                // Display round results
                 let resultsText = 'Round Results:\n';
                 playerResults.forEach(result => {
-                const status = result.isCorrect ? '✓' : '✗';
-                const responseTime = result.responseTime ? `${result.responseTime}ms` : 'N/A';
-                const botLabel = result.isBot ? ' 🤖' : '';
-                resultsText += `${status} ${result.username}${botLabel}: ${responseTime}\n`;
+                    const status = result.isCorrect ? '✓' : result.answer === -1 ? '⏰' : '✗';
+                    const responseTime = result.responseTime ? `${result.responseTime}ms` : 'N/A';
+                    const botLabel = result.isBot ? ' 🤖' : '';
+                    resultsText += `${status} ${result.username}${botLabel}: ${responseTime}\n`;
                 });
                 console.log(resultsText);
-            } catch (error) {
+                } catch (error) {
                 console.error('Error in roundComplete:', error);
             }
         });
@@ -1544,19 +1543,28 @@
             console.log(`Received revealCorrectAnswer: questionId=${questionId}, correctAnswerText=${correctAnswerText}`);
             try {
                 const normalizeText = (text) => text.trim().toLowerCase().replace(/\s+/g, ' ');
-                waitingMessage.innerHTML += `<p class="correct-answer">Correct Answer: ${correctAnswerText}</p>`;
+                waitingMessage.innerHTML = `<p class="correct-answer">Correct Answer: ${correctAnswerText}</p>`;
                 const options = document.querySelectorAll('#options label');
                 console.log('Options available:', Array.from(options).map(label => label.textContent));
                 options.forEach((label, index) => {
-                const labelText = normalizeText(label.textContent);
-                const correctText = normalizeText(correctAnswerText);
-                console.log(`Comparing label: "${labelText}" with correct: "${correctText}"`);
-                if (labelText === correctText) {
+                    const labelText = normalizeText(label.textContent);
+                    const correctText = normalizeText(correctAnswerText);
+                    console.log(`Comparing label: "${labelText}" with correct: "${correctText}"`);
+                    if (labelText === correctText) {
                     label.parentElement.classList.add('correct');
-                }
+                    }
                 });
+                // Ensure the correct answer remains visible
+                submitAnswerBtn.disabled = true; // Prevent further submissions
+                submitAnswerBtn.style.display = 'none'; // Hide submit button
+                if (countdownInterval) {
+                    clearInterval(countdownInterval); // Stop countdown
+                    countdownTimer.textContent = '';
+                    countdownTimer.style.display = 'none';
+                }
             } catch (error) {
                 console.error('Error in revealCorrectAnswer:', error);
+                waitingMessage.innerHTML = `<p class="correct-answer">Error displaying correct answer</p>`;
             }
         });
 
