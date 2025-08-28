@@ -875,9 +875,9 @@ io.on('connection', (socket) => {
         }
     });
 
+    // server-side code
     socket.on('switchToBot', async ({ roomId }) => {
         try {
-            // Validate input
             const { error } = switchToBotSchema.validate({ roomId });
             if (error) {
                 console.error('Validation error in switchToBot:', error.message);
@@ -889,15 +889,16 @@ io.on('connection', (socket) => {
 
             let playerFound = false;
             let playerData = null;
+            let playerBetAmount = null; // <-- FIX: Variable to store the bet amount
 
             for (const [betAmount, pool] of matchmakingPools.human.entries()) {
                 const playerIndex = pool.findIndex(p => p.socketId === socket.id);
                 if (playerIndex !== -1) {
-                    playerData = pool[playerIndex];
-                    pool.splice(playerIndex, 1);
+                    playerData = pool.splice(playerIndex, 1)[0]; // Remove player from pool
+                    playerBetAmount = betAmount; // <-- FIX: Capture the bet amount from the map key
                     playerFound = true;
-                    console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${betAmount}`);
-                    break;
+                    console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
+                    break; // <-- FIX: Exit loop once player is found
                 }
             }
 
@@ -910,7 +911,8 @@ io.on('connection', (socket) => {
             const newRoomId = generateRoomId();
             console.log(`Creating bot game room ${newRoomId} for player ${playerData.walletAddress}`);
 
-            createGameRoom(newRoomId, parseInt(playerData.betAmount), 'bot');
+            // FIX: Use the captured playerBetAmount, which is a valid number
+            createGameRoom(newRoomId, playerBetAmount, 'bot');
             const room = gameRooms.get(newRoomId);
             room.players.push({
                 id: socket.id,
