@@ -85,6 +85,7 @@ mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTop
         console.log('Connected to MongoDB');
         
         // Drop both problematic indexes
+        /*
         try {
             const collections = await mongoose.connection.db.collections();
             const usersCollection = collections.find(c => c.collectionName === 'users');
@@ -107,6 +108,7 @@ mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTop
             console.error('Error dropping indexes:', error);
             // Continue anyway - the indexes might not exist
         }
+        */
     })
     .catch(err => console.error('Could not connect to MongoDB', err));
 
@@ -1754,7 +1756,7 @@ async function completeQuestion(roomId) {
     await handleGameOver(room, roomId);
   }
 }
-
+/*
 function logResponseTimes(roomId, round) {
     const room = gameRooms.get(roomId);
     if (!room) return;
@@ -1772,6 +1774,7 @@ function logResponseTimes(roomId, round) {
     });
     console.log('===============================================');
 }
+*/
 
 async function handleGameOver(room, roomId) {
     const sortedPlayers = [...room.players].sort((a, b) => {
@@ -1896,8 +1899,6 @@ function generateRoomId() {
 }
 
 
-
-// Function to verify reCAPTCHA token
 async function verifyRecaptcha(token) {
     if (process.env.ENABLE_RECAPTCHA !== 'true') {
         console.log('reCAPTCHA verification skipped (disabled in config)');
@@ -1938,10 +1939,7 @@ async function verifyRecaptcha(token) {
     }
 }
 
-const suspiciousActivity = {
-    ips: {},
-    wallets: {}
-};
+
 
 async function startSinglePlayerGame(roomId) {
     console.log('Starting single player game with bot for room:', roomId);
@@ -2041,6 +2039,7 @@ async function startSinglePlayerGame(roomId) {
     }
 }
 
+/*
 function findAvailableRoom(betAmount) {
     for (const [roomId, room] of gameRooms.entries()) {
         if (room.players.length < 2 && room.betAmount === betAmount) {
@@ -2049,7 +2048,7 @@ function findAvailableRoom(betAmount) {
     }
     return null;
 }
-
+*/
 function createGameRoom(roomId, betAmount, roomMode = null) {
     gameRooms.set(roomId, {
         players: [],
@@ -2186,49 +2185,6 @@ app.get('/admin', (req, res) => {
     res.redirect('/');
 });
 
-// Add suspicious wallet detection during game play
-async function detectSuspiciousWalletActivity(walletAddress) {
-    // Check for too many games in short period
-    const recentGames = await Game.countDocuments({
-        'players.walletAddress': walletAddress,
-        createdAt: { $gte: new Date(Date.now() - 1000 * 60 * 60) } // Last hour
-    });
-    
-    if (recentGames > 20) {
-        console.warn(`Suspicious activity: Wallet ${walletAddress} played ${recentGames} games in the last hour`);
-        return true;
-    }
-    
-    // Check win rate (if abnormally high)
-    const stats = await User.findOne({ walletAddress });
-    if (stats && stats.gamesPlayed > 10 && (stats.wins / stats.gamesPlayed > 0.8)) {
-        console.warn(`Suspicious activity: Wallet ${walletAddress} has ${stats.wins}/${stats.gamesPlayed} wins`);
-        return true;
-    }
-    
-    return false;
-}
-
-function determineWinner(players) {
-    if (!players || players.length === 0) {
-      return null;
-    }
-    /*
-    if (players.length === 1) {
-      // Single player mode - win if score is 5 or more (or use your threshold logic)
-      return players[0].score >= 5 ? players[0].username : null;
-    }
-    */
-    if (players[0].score > players[1].score) {
-      return players[0].username;
-    } else if (players[0].score === players[1].score) {
-      return players[0].totalResponseTime <= players[1].totalResponseTime ? 
-        players[0].username : players[1].username;
-    }
-    
-    // Should never reach here if players are sorted properly
-    return null;
-  }
 
 async function handleGameOverEmit(room, players, winner, roomId) {
     try {
