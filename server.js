@@ -83,32 +83,6 @@ app.use(express.static(path.join(__dirname, 'public')));
 mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
     .then(async () => {
         console.log('Connected to MongoDB');
-        
-        // Drop both problematic indexes
-        /*
-        try {
-            const collections = await mongoose.connection.db.collections();
-            const usersCollection = collections.find(c => c.collectionName === 'users');
-            
-            if (usersCollection) {
-                // Drop both username and email indexes
-                const indexes = await usersCollection.indexes();
-                
-                for (const index of indexes) {
-                    // Only drop the single-field unique indexes for username and email
-                    if (index.name === 'username_1' || index.name === 'email_1') {
-                        console.log(`Dropping index: ${index.name}`);
-                        await usersCollection.dropIndex(index.name);
-                    }
-                }
-                
-                console.log('Successfully dropped problematic indexes');
-            }
-        } catch (error) {
-            console.error('Error dropping indexes:', error);
-            // Continue anyway - the indexes might not exist
-        }
-        */
     })
     .catch(err => console.error('Could not connect to MongoDB', err));
 
@@ -877,116 +851,116 @@ io.on('connection', (socket) => {
     });
 
     socket.on('switchToBot', async ({ roomId }) => {
-    try {
-        const { error } = switchToBotSchema.validate({ roomId });
-        if (error) {
-            console.error('Validation error in switchToBot:', error.message);
-            socket.emit('matchmakingError', { message: `Invalid input: ${error.message}` });
-            return;
-        }
-
-        console.log(`Player ${socket.id} wants to switch from matchmaking to bot game`);
-
-        let playerFound = false;
-        let playerData = null;
-        let playerBetAmount = null;
-
-        // Check all matchmaking pools in Redis
-        const poolKeys = await redisClient.keys('matchmaking:human:*');
-        for (const key of poolKeys) {
-            const betAmount = key.replace('matchmaking:human:', '');
-            const parsedBetAmount = parseFloat(betAmount);
-            if (isNaN(parsedBetAmount)) {
-                console.warn(`Invalid bet amount in Redis key ${key}`);
-                continue;
+        try {
+            const { error } = switchToBotSchema.validate({ roomId });
+            if (error) {
+                console.error('Validation error in switchToBot:', error.message);
+                socket.emit('matchmakingError', { message: `Invalid input: ${error.message}` });
+                return;
             }
-            const playerDataFromPool = await removeFromMatchmakingPool(betAmount, socket.id);
-            if (playerDataFromPool) {
-                playerData = playerDataFromPool;
-                playerBetAmount = parsedBetAmount;
-                playerFound = true;
-                console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
-                break;
-            }
-        }
 
-        // If player not found in matchmaking, check existing rooms
-        if (!playerFound) {
-            console.log(`Player ${socket.id} not found in matchmaking pools, checking existing rooms`);
-            const roomKeys = await redisClient.keys('room:*');
-            for (const key of roomKeys) {
-                const existingRoomId = key.replace('room:', '');
-                let room = await getGameRoom(existingRoomId);
-                if (!room) continue;
+            console.log(`Player ${socket.id} wants to switch from matchmaking to bot game`);
 
-                const playerIndex = room.players.findIndex(p => p.id === socket.id);
-                if (playerIndex !== -1) {
-                    playerData = room.players[playerIndex];
-                    playerBetAmount = room.betAmount;
+            let playerFound = false;
+            let playerData = null;
+            let playerBetAmount = null;
+
+            // Check all matchmaking pools in Redis
+            const poolKeys = await redisClient.keys('matchmaking:human:*');
+            for (const key of poolKeys) {
+                const betAmount = key.replace('matchmaking:human:', '');
+                const parsedBetAmount = parseFloat(betAmount);
+                if (isNaN(parsedBetAmount)) {
+                    console.warn(`Invalid bet amount in Redis key ${key}`);
+                    continue;
+                }
+                const playerDataFromPool = await removeFromMatchmakingPool(betAmount, socket.id);
+                if (playerDataFromPool) {
+                    playerData = playerDataFromPool;
+                    playerBetAmount = parsedBetAmount;
                     playerFound = true;
-                    console.log(`Found player ${playerData.username} in room ${existingRoomId} with bet ${playerBetAmount}`);
-                    room.players.splice(playerIndex, 1);
-                    socket.leave(existingRoomId);
-                    if (room.players.length === 0) {
-                        await deleteGameRoom(existingRoomId);
-                        console.log(`Deleted empty room ${existingRoomId}`);
-                    } else {
-                        await updateGameRoom(existingRoomId, room);
-                        io.to(existingRoomId).emit('playerLeft', playerData.username);
-                    }
+                    console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
                     break;
                 }
             }
+
+            // If player not found in matchmaking, check existing rooms
+            if (!playerFound) {
+                console.log(`Player ${socket.id} not found in matchmaking pools, checking existing rooms`);
+                const roomKeys = await redisClient.keys('room:*');
+                for (const key of roomKeys) {
+                    const existingRoomId = key.replace('room:', '');
+                    let room = await getGameRoom(existingRoomId);
+                    if (!room) continue;
+
+                    const playerIndex = room.players.findIndex(p => p.id === socket.id);
+                    if (playerIndex !== -1) {
+                        playerData = room.players[playerIndex];
+                        playerBetAmount = room.betAmount;
+                        playerFound = true;
+                        console.log(`Found player ${playerData.username} in room ${existingRoomId} with bet ${playerBetAmount}`);
+                        room.players.splice(playerIndex, 1);
+                        socket.leave(existingRoomId);
+                        if (room.players.length === 0) {
+                            await deleteGameRoom(existingRoomId);
+                            console.log(`Deleted empty room ${existingRoomId}`);
+                        } else {
+                            await updateGameRoom(existingRoomId, room);
+                            io.to(existingRoomId).emit('playerLeft', playerData.username);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (!playerFound || !playerData) {
+                console.error(`Player ${socket.id} not found in any matchmaking pool or room`);
+                socket.emit('matchmakingError', { message: 'Not found in matchmaking or game rooms' });
+                return;
+            }
+
+            const playerIdentifier = playerData.username || playerData.walletAddress || socket.id;
+            const newRoomId = generateRoomId();
+            console.log(`Creating bot game room ${newRoomId} for player ${playerIdentifier}`);
+
+            // Create a new game room in Redis
+            await createGameRoom(newRoomId, playerBetAmount, 'bot');
+            let room = await getGameRoom(newRoomId);
+            if (!room) {
+                console.error(`Failed to create or retrieve room ${newRoomId}`);
+                socket.emit('matchmakingError', { message: 'Failed to create bot game room' });
+                return;
+            }
+
+            // Add player to the room
+            room.players.push({
+                id: socket.id,
+                username: playerIdentifier,
+                score: 0,
+                totalResponseTime: 0,
+                answered: false,
+                lastAnswer: null
+            });
+
+            // Update the room in Redis
+            await updateGameRoom(newRoomId, room);
+
+            socket.join(newRoomId);
+
+            const botName = chooseBotName();
+            socket.emit('botGameCreated', {
+                gameRoomId: newRoomId,
+                botName
+            });
+
+            await startSinglePlayerGame(newRoomId);
+            await logGameRoomsState();
+            await logMatchmakingState();
+        } catch (error) {
+            console.error('Error in switchToBot:', error);
+            socket.emit('matchmakingError', { message: error.message });
         }
-
-        if (!playerFound || !playerData) {
-            console.error(`Player ${socket.id} not found in any matchmaking pool or room`);
-            socket.emit('matchmakingError', { message: 'Not found in matchmaking or game rooms' });
-            return;
-        }
-
-        const playerIdentifier = playerData.username || playerData.walletAddress || socket.id;
-        const newRoomId = generateRoomId();
-        console.log(`Creating bot game room ${newRoomId} for player ${playerIdentifier}`);
-
-        // Create a new game room in Redis
-        await createGameRoom(newRoomId, playerBetAmount, 'bot');
-        let room = await getGameRoom(newRoomId);
-        if (!room) {
-            console.error(`Failed to create or retrieve room ${newRoomId}`);
-            socket.emit('matchmakingError', { message: 'Failed to create bot game room' });
-            return;
-        }
-
-        // Add player to the room
-        room.players.push({
-            id: socket.id,
-            username: playerIdentifier,
-            score: 0,
-            totalResponseTime: 0,
-            answered: false,
-            lastAnswer: null
-        });
-
-        // Update the room in Redis
-        await updateGameRoom(newRoomId, room);
-
-        socket.join(newRoomId);
-
-        const botName = chooseBotName();
-        socket.emit('botGameCreated', {
-            gameRoomId: newRoomId,
-            botName
-        });
-
-        await startSinglePlayerGame(newRoomId);
-        await logGameRoomsState();
-        await logMatchmakingState();
-    } catch (error) {
-        console.error('Error in switchToBot:', error);
-        socket.emit('matchmakingError', { message: error.message });
-    }
-});
+    });
     
     socket.on('matchFound', ({ newRoomId }) => {
         try {
@@ -1250,14 +1224,11 @@ io.on('connection', (socket) => {
                 isCorrect
             });
 
-            // Notify other players of the answer
             socket.to(roomId).emit('playerAnswered', {
                 username,
                 isBot: false,
                 responseTime: serverResponseTime
             });
-
-            // Do not emit roundComplete here; let questionTimeout handle it
         } catch (error) {
             console.error('Error in submitAnswer:', error.message);
             socket.emit('answerError', `Error submitting answer: ${error.message}`);
@@ -1282,140 +1253,140 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', async () => {
-    console.log('Client disconnected:', socket.id);
+        console.log('Client disconnected:', socket.id);
 
-    // 1. Check and remove from matchmaking pools in Redis
-    try {
-        const poolKeys = await redisClient.keys('matchmaking:human:*');
-        for (const key of poolKeys) {
-            const betAmount = key.replace('matchmaking:human:', '');
-            const pool = await getMatchmakingPool(betAmount);
-            const playerIndex = pool.findIndex(p => p.socketId === socket.id);
-            if (playerIndex !== -1) {
-                const removedPlayer = await removeFromMatchmakingPool(betAmount, socket.id);
-                if (removedPlayer) {
-                    console.log(`Player ${removedPlayer.walletAddress} (socket ${socket.id}) removed from matchmaking pool for bet ${betAmount}`);
+        // 1. Check and remove from matchmaking pools in Redis
+        try {
+            const poolKeys = await redisClient.keys('matchmaking:human:*');
+            for (const key of poolKeys) {
+                const betAmount = key.replace('matchmaking:human:', '');
+                const pool = await getMatchmakingPool(betAmount);
+                const playerIndex = pool.findIndex(p => p.socketId === socket.id);
+                if (playerIndex !== -1) {
+                    const removedPlayer = await removeFromMatchmakingPool(betAmount, socket.id);
+                    if (removedPlayer) {
+                        console.log(`Player ${removedPlayer.walletAddress} (socket ${socket.id}) removed from matchmaking pool for bet ${betAmount}`);
+                    }
+                    await logMatchmakingState();
                 }
-                await logMatchmakingState();
             }
+        } catch (error) {
+            console.error(`Error cleaning up matchmaking pools for socket ${socket.id}:`, error);
         }
-    } catch (error) {
-        console.error(`Error cleaning up matchmaking pools for socket ${socket.id}:`, error);
-    }
 
-    // 2. Handle disconnection from active game rooms
-    try {
-        const roomKeys = await redisClient.keys('room:*');
-        for (const key of roomKeys) {
-            const roomId = key.replace('room:', '');
-            let room = await getGameRoom(roomId);
-            if (!room) continue;
+        // 2. Handle disconnection from active game rooms
+        try {
+            const roomKeys = await redisClient.keys('room:*');
+            for (const key of roomKeys) {
+                const roomId = key.replace('room:', '');
+                let room = await getGameRoom(roomId);
+                if (!room) continue;
 
-            const playerIndex = room.players.findIndex(p => p.id === socket.id);
-            if (playerIndex !== -1) {
-                const disconnectedPlayer = room.players[playerIndex];
-                console.log(`Player ${disconnectedPlayer.username} (socket ${socket.id}) disconnected from room ${roomId}`);
+                const playerIndex = room.players.findIndex(p => p.id === socket.id);
+                if (playerIndex !== -1) {
+                    const disconnectedPlayer = room.players[playerIndex];
+                    console.log(`Player ${disconnectedPlayer.username} (socket ${socket.id}) disconnected from room ${roomId}`);
 
-                room.players.splice(playerIndex, 1);
-                room.playerLeft = true;
-                await updateGameRoom(roomId, room);
-
-                if (room.questionTimeout) {
-                    clearTimeout(room.questionTimeout);
-                    room.questionTimeout = null;
+                    room.players.splice(playerIndex, 1);
+                    room.playerLeft = true;
                     await updateGameRoom(roomId, room);
-                }
 
-                // Scenario 1: Bot Game Forfeit (Human disconnected)
-                if (room.roomMode === 'bot') {
-                    console.log(`Human player ${disconnectedPlayer.username} left bot game. Bot wins by forfeit.`);
-                    const botPlayer = room.players.find(p => p.isBot);
+                    if (room.questionTimeout) {
+                        clearTimeout(room.questionTimeout);
+                        room.questionTimeout = null;
+                        await updateGameRoom(roomId, room);
+                    }
 
-                    if (botPlayer) {
-                        const winnerName = botPlayer.username;
+                    // Scenario 1: Bot Game Forfeit (Human disconnected)
+                    if (room.roomMode === 'bot') {
+                        console.log(`Human player ${disconnectedPlayer.username} left bot game. Bot wins by forfeit.`);
+                        const botPlayer = room.players.find(p => p.isBot);
+
+                        if (botPlayer) {
+                            const winnerName = botPlayer.username;
+                            const allPlayersForStats = [
+                                {
+                                    username: disconnectedPlayer.username,
+                                    score: disconnectedPlayer.score || 0,
+                                    totalResponseTime: disconnectedPlayer.totalResponseTime || 0,
+                                    isBot: false
+                                },
+                                {
+                                    username: botPlayer.username,
+                                    score: botPlayer.score || 0,
+                                    totalResponseTime: botPlayer.totalResponseTime || 0,
+                                    isBot: true
+                                }
+                            ];
+
+                            console.log(`Calling updatePlayerStats for bot forfeit. Winner: ${winnerName}, Bet: ${room.betAmount}`);
+                            await updatePlayerStats(allPlayersForStats, {
+                                winner: winnerName,
+                                botOpponent: true,
+                                betAmount: room.betAmount
+                            });
+
+                            io.to(roomId).emit('gameOverForfeit', {
+                                winner: winnerName,
+                                disconnectedPlayer: disconnectedPlayer.username,
+                                betAmount: room.betAmount,
+                                botOpponent: true,
+                                message: `${disconnectedPlayer.username} left the game. ${winnerName} wins by default.`
+                            });
+                        } else {
+                            console.error(`CRITICAL: Bot not found in bot game room ${roomId} after human ${disconnectedPlayer.username} disconnected.`);
+                            io.to(roomId).emit('gameError', 'An error occurred due to player disconnection.');
+                        }
+                        await deleteGameRoom(roomId);
+                        await logGameRoomsState();
+                        return;
+                    }
+
+                    // Scenario 2: Human vs Human Game Forfeit
+                    if (room.players.length === 1 && !room.players[0].isBot) {
+                        const remainingPlayer = room.players[0];
+                        console.log(`Player ${disconnectedPlayer.username} left H2H game. ${remainingPlayer.username} wins by forfeit.`);
+
                         const allPlayersForStats = [
+                            {
+                                username: remainingPlayer.username,
+                                score: remainingPlayer.score || 0,
+                                totalResponseTime: remainingPlayer.totalResponseTime || 0,
+                                isBot: false
+                            },
                             {
                                 username: disconnectedPlayer.username,
                                 score: disconnectedPlayer.score || 0,
                                 totalResponseTime: disconnectedPlayer.totalResponseTime || 0,
                                 isBot: false
-                            },
-                            {
-                                username: botPlayer.username,
-                                score: botPlayer.score || 0,
-                                totalResponseTime: botPlayer.totalResponseTime || 0,
-                                isBot: true
                             }
                         ];
 
-                        console.log(`Calling updatePlayerStats for bot forfeit. Winner: ${winnerName}, Bet: ${room.betAmount}`);
-                        await updatePlayerStats(allPlayersForStats, {
-                            winner: winnerName,
-                            botOpponent: true,
-                            betAmount: room.betAmount
-                        });
-
-                        io.to(roomId).emit('gameOverForfeit', {
-                            winner: winnerName,
-                            disconnectedPlayer: disconnectedPlayer.username,
-                            betAmount: room.betAmount,
-                            botOpponent: true,
-                            message: `${disconnectedPlayer.username} left the game. ${winnerName} wins by default.`
-                        });
-                    } else {
-                        console.error(`CRITICAL: Bot not found in bot game room ${roomId} after human ${disconnectedPlayer.username} disconnected.`);
-                        io.to(roomId).emit('gameError', 'An error occurred due to player disconnection.');
+                        await handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, false, allPlayersForStats);
+                        await logGameRoomsState();
+                        return;
                     }
-                    await deleteGameRoom(roomId);
-                    await logGameRoomsState();
-                    return;
+
+                    // Scenario 3: Room becomes empty
+                    if (room.players.length === 0) {
+                        console.log(`Room ${roomId} is now empty after ${disconnectedPlayer.username} left. Deleting room.`);
+                        await deleteGameRoom(roomId);
+                        await logGameRoomsState();
+                        return;
+                    }
+
+                    // If game hasn't started, notify remaining players
+                    if (!room.gameStarted) {
+                        io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
+                    }
+
+                    break; // Player found and processed
                 }
-
-                // Scenario 2: Human vs Human Game Forfeit
-                if (room.players.length === 1 && !room.players[0].isBot) {
-                    const remainingPlayer = room.players[0];
-                    console.log(`Player ${disconnectedPlayer.username} left H2H game. ${remainingPlayer.username} wins by forfeit.`);
-
-                    const allPlayersForStats = [
-                        {
-                            username: remainingPlayer.username,
-                            score: remainingPlayer.score || 0,
-                            totalResponseTime: remainingPlayer.totalResponseTime || 0,
-                            isBot: false
-                        },
-                        {
-                            username: disconnectedPlayer.username,
-                            score: disconnectedPlayer.score || 0,
-                            totalResponseTime: disconnectedPlayer.totalResponseTime || 0,
-                            isBot: false
-                        }
-                    ];
-
-                    await handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, false, allPlayersForStats);
-                    await logGameRoomsState();
-                    return;
-                }
-
-                // Scenario 3: Room becomes empty
-                if (room.players.length === 0) {
-                    console.log(`Room ${roomId} is now empty after ${disconnectedPlayer.username} left. Deleting room.`);
-                    await deleteGameRoom(roomId);
-                    await logGameRoomsState();
-                    return;
-                }
-
-                // If game hasn't started, notify remaining players
-                if (!room.gameStarted) {
-                    io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
-                }
-
-                break; // Player found and processed
             }
+        } catch (error) {
+            console.error(`Error cleaning up game rooms for socket ${socket.id}:`, error);
         }
-    } catch (error) {
-        console.error(`Error cleaning up game rooms for socket ${socket.id}:`, error);
-    }
-});
+    });
 });
 
 
@@ -1513,18 +1484,17 @@ async function startNextQuestion(roomId) {
 
     const currentQuestion = room.questions[room.currentQuestionIndex];
     room.questionStartTime = Date.now();
-    console.log(`Question ${room.currentQuestionIndex + 1} started at timestamp: ${room.questionStartTime} for room ${roomId}`);
+    room.answersReceived = 0;
 
     const shuffledOptions = shuffleArray([...currentQuestion.options]);
     const shuffledCorrectAnswer = shuffledOptions.indexOf(currentQuestion.options[currentQuestion.correctAnswer]);
     currentQuestion.shuffledOptions = shuffledOptions;
     currentQuestion.shuffledCorrectAnswer = shuffledCorrectAnswer;
-
     room.questionIdMap.set(currentQuestion.tempId, { ...currentQuestion });
-    room.answersReceived = 0;
 
     // Update room once with initial question state
     await updateGameRoom(roomId, room);
+    console.log(`Question ${room.currentQuestionIndex + 1} started at timestamp: ${room.questionStartTime} for room ${roomId}`);
 
     io.to(roomId).emit('clearQuestionUI');
     io.to(roomId).emit('nextQuestion', {
@@ -1571,6 +1541,7 @@ async function startNextQuestion(roomId) {
                 await updateGameRoom(roomId, room);
             }
 
+            console.log(`Bot ${bot.username} answered question ${currentQuestion.tempId} with answer ${botAnswer.answer} (correct: ${botAnswer.isCorrect}, responseTime: ${botAnswer.responseTime}ms)`);
             io.to(roomId).emit('playerAnswered', {
                 username: bot.username,
                 isBot: true,
@@ -1591,13 +1562,16 @@ async function startNextQuestion(roomId) {
             return;
         }
 
+        let timedOut = false;
         room.players.forEach(player => {
             if (!player.answered && !player.isBot) {
                 player.answered = true;
                 player.lastAnswer = -1;
                 const timeoutResponseTime = Date.now() - room.questionStartTime;
                 player.lastResponseTime = timeoutResponseTime;
+                timedOut = true;
 
+                console.log(`Player ${player.username} timed out on question ${currentQuestion.tempId} with responseTime: ${timeoutResponseTime}ms`);
                 io.to(roomId).emit('playerAnswered', {
                     username: player.username,
                     isBot: false,
@@ -1608,7 +1582,9 @@ async function startNextQuestion(roomId) {
         });
 
         // Update room after timeout
-        await updateGameRoom(roomId, room);
+        if (timedOut) {
+            await updateGameRoom(roomId, room);
+        }
 
         console.log(`Question timeout completed in room ${roomId}`);
         io.to(roomId).emit('roundComplete', {
@@ -1637,74 +1613,6 @@ async function startNextQuestion(roomId) {
     }, 10000);
 }
 
-async function handleBotAnswer(room, bot, currentQuestion) {
-    try {
-        const botAnswer = await bot.answerQuestion(
-            currentQuestion.question, 
-            currentQuestion.options, 
-            currentQuestion.correctAnswer
-        );
-
-        // Store bot's answer
-        bot.answered = true;
-        bot.lastAnswer = botAnswer.answer;
-        
-        // Emit bot's answer event
-        io.to(room.id).emit('playerAnswered', {
-            username: bot.username,
-            isBot: true,
-            responseTime: botAnswer.responseTime
-        });
-        
-        // Check if round is complete
-        const humanPlayer = room.players.find(p => !p.isBot);
-        if (humanPlayer.answered) {
-            emitRoundComplete(room, currentQuestion.correctAnswer, botAnswer);
-        }
-    } catch (error) {
-        console.error('Error handling bot answer:', error);
-        // Handle bot error gracefully - maybe give it a wrong answer
-        bot.answered = true;
-        bot.lastAnswer = -1;
-    }
-}
-
-// Helper function to handle question timeout
-async function handleQuestionTimeout(room, roomId) {
-    const unansweredPlayers = room.players.filter(player => !player.answered && !player.isBot);
-    
-    unansweredPlayers.forEach(player => {
-        player.answered = true;
-        player.lastAnswer = -1;
-        io.to(roomId).emit('playerAnswered', {
-            username: player.username,
-            isBot: false,
-            timedOut: true
-        });
-    });
-
-    if (unansweredPlayers.length > 0) {
-        await completeQuestion(roomId);
-    }
-}
-
-function emitRoundComplete(room, correctAnswer, botAnswer) {
-    io.to(room.id).emit('roundComplete', {
-        correctAnswer: correctAnswer,
-        playerResults: room.players.map(p => ({
-            username: p.username,
-            isCorrect: p.isBot ? 
-                botAnswer.isCorrect : 
-                p.lastAnswer === correctAnswer,
-            answer: p.isBot ? botAnswer.answer : p.lastAnswer,
-            responseTime: p.isBot ? botAnswer.responseTime : p.responseTime,
-            isBot: p.isBot || false
-        }))
-    });
-    
-    completeQuestion(room.id);
-}
-
 function chooseBotName() {
     const botNames = [
         'BrainyBot', 'QuizMaster', 'Trivia Titan', 'FactFinder', 
@@ -1714,7 +1622,6 @@ function chooseBotName() {
     return botNames[Math.floor(Math.random() * botNames.length)];
 }
 
-// Determine bot difficulty based on player stats or other factors
 async function determineBotDifficulty(playerUsername) {
     try {
         const player = await User.findOne({ walletAddress: playerUsername });
@@ -1942,8 +1849,6 @@ async function verifyRecaptcha(token) {
         return { success: false, error: 'Verification service error' };
     }
 }
-
-
 
 async function startSinglePlayerGame(roomId) {
     console.log('Starting single player game with bot for room:', roomId);
@@ -2338,66 +2243,6 @@ app.get('/admin', (req, res) => {
     res.redirect('/');
 });
 
-
-async function handleGameOverEmit(room, players, winner, roomId) {
-    try {
-      const isSinglePlayer = room.players.length === 1;
-      const hasBot = room.players.some(p => p.isBot);
-      
-      // If there's a winner and they're not a bot, send winnings
-      if (winner && !players.find(p => p.username === winner)?.isBot) {
-        try {
-          const payoutSignature = await sendWinnings(winner, room.betAmount, hasBot);
-          io.to(roomId).emit('gameOver', {
-            players: players.map(p => ({ 
-              username: p.username, 
-              score: p.score, 
-              totalResponseTime: p.totalResponseTime || 0,
-              isBot: p.isBot || false
-            })),
-            winner: winner,
-            betAmount: room.betAmount,
-            payoutSignature,
-            singlePlayerMode: isSinglePlayer,
-            botOpponent: hasBot
-          });
-        } catch (error) {
-          console.error('Error processing payout:', error);
-          io.to(roomId).emit('gameOver', {
-            error: 'Error processing payout. Please contact support.',
-            players: players.map(p => ({ 
-              username: p.username, 
-              score: p.score, 
-              totalResponseTime: p.totalResponseTime || 0,
-              isBot: p.isBot || false
-            })),
-            winner: winner,
-            betAmount: room.betAmount,
-            singlePlayerMode: isSinglePlayer,
-            botOpponent: hasBot
-          });
-        }
-      } else {
-        // No payout (no winner or bot won)
-        io.to(roomId).emit('gameOver', {
-          players: players.map(p => ({ 
-            username: p.username, 
-            score: p.score, 
-            totalResponseTime: p.totalResponseTime || 0,
-            isBot: p.isBot || false
-          })),
-          winner: winner,
-          betAmount: room.betAmount,
-          singlePlayerMode: isSinglePlayer,
-          botOpponent: hasBot
-        });
-      }
-    } catch (error) {
-      console.error('Error in handleGameOverEmit:', error);
-      io.to(roomId).emit('gameError', 'An error occurred while ending the game.');
-    }
-  }
-
 async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, betAmount, botOpponent, allPlayers) {
     try {
         // Calculate winnings using the appropriate multiplier
@@ -2436,59 +2281,6 @@ async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, 
         await deleteGameRoom(roomId);
         await logGameRoomsState();
     }
-}
-
-async function handleBotGameForfeit(roomId, bot) {
-    let room = await getGameRoom(roomId);
-    if (!room) {
-        console.log(`Room ${roomId} not found during bot game forfeit`);
-        return;
-    }
-
-    console.log(`Handling bot game forfeit in room ${roomId}`);
-
-    if (room.questionTimeout) {
-        clearTimeout(room.questionTimeout);
-        room.questionTimeout = null;
-        await updateGameRoom(roomId, room);
-    }
-
-    const humanPlayer = {
-        username: room.players.find(p => !p.isBot)?.username || 'Unknown',
-        score: 0,
-        isBot: false
-    };
-
-    const allPlayers = [
-        {
-            username: humanPlayer.username,
-            score: 0,
-            isBot: false
-        },
-        {
-            username: bot.username,
-            score: bot.score || 0,
-            isBot: true
-        }
-    ];
-
-    io.to(roomId).emit('gameOverForfeit', {
-        winner: bot.username,
-        disconnectedPlayer: humanPlayer.username,
-        betAmount: room.betAmount,
-        botOpponent: true,
-        message: `You left the game. ${bot.username} wins by default.`
-    });
-
-    await updatePlayerStats(allPlayers, {
-        winner: bot.username,
-        botOpponent: true,
-        betAmount: room.betAmount
-    });
-
-    await deleteGameRoom(roomId);
-    console.log(`Bot game room ${roomId} cleaned up after forfeit`);
-    await logGameRoomsState();
 }
 
 async function logGameRoomsState() {
