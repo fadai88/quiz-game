@@ -855,117 +855,102 @@
 
         socket.on('scoreUpdate', (players) => {
             updatePlayers(players);
+            /*
             if (questionTimer) {
                 clearTimeout(questionTimer);
             }
+            */
         });
 
         socket.on('gameOver', (data) => {
             console.log('Received game over data:', data);
-            const { players, winner, betAmount, singlePlayerMode, payoutSignature, botOpponent, error: gameOverError } = data;
+            const { players, winner, betAmount, singlePlayerMode, payoutSignature, botOpponent, error } = data;
 
-            // Clear any timers
-            if (questionTimer) {
-                clearTimeout(questionTimer);
-            }
-            if (countdownInterval) {
-                clearInterval(countdownInterval);
-            }
+            // Clear timers
+            if (questionTimer) clearTimeout(questionTimer);
+            if (countdownInterval) clearInterval(countdownInterval);
+            questionTimer = null;
+            countdownInterval = null;
 
-            // Update the UI
+            // Update UI
             questionDiv.textContent = 'Game Over!';
             submitAnswerBtn.style.display = 'none';
             countdownTimer.style.display = 'none';
+            optionsDiv.innerHTML = '';
 
-            if (gameOverError) {
-                waitingMessage.textContent = `Game Over! Error: ${gameOverError}`;
-                // Reset UI and update balance after a delay
+            if (error) {
+                waitingMessage.textContent = `Game Over! Error: ${error}`;
                 setTimeout(() => {
-                    resetGame(); // Use your existing resetGame function
+                    resetGame();
                     updateBalance();
                 }, 5000);
                 return;
             }
 
+            // Display scores
+            const scoresHtml = players.map(p =>
+                `<p>${p.username}${p.isBot ? ' 🤖' : ''}: ${p.score} (Total response time: ${p.totalResponseTime || 0}ms)</p>`
+            ).join('');
+            playersDiv.innerHTML = '<h2>Final Scores:</h2>' + scoresHtml;
 
-            // Determine if the current client is the winner
-            const clientIsWinner = winner === connectedWallet;
-            const winnings = betAmount * (botOpponent ? 1.5 : 1.8); // Calculate potential winnings
-
+            // Display game outcome
             let gameOverMessage = '';
+            const clientIsWinner = winner === connectedWallet;
+            const winnings = betAmount * (botOpponent ? 1.5 : 1.8);
 
-            if (botOpponent) { // Game was against a bot
-                const humanPlayer = players.find(p => p.username === connectedWallet && !p.isBot); // Get current client's data
+            if (botOpponent) {
+                const humanPlayer = players.find(p => p.username === connectedWallet && !p.isBot);
                 const botPlayer = players.find(p => p.isBot);
-
-                if (clientIsWinner) { // Human client won against the bot
+                if (clientIsWinner) {
                     gameOverMessage = `Congratulations! You defeated ${botPlayer ? botPlayer.username : 'the bot'} with ${humanPlayer ? humanPlayer.score : 0} correct answers! You won ${winnings.toFixed(2)} USDC!`;
                     if (payoutSignature) {
-                        gameOverMessage += ` Winnings have been sent to your wallet!`;
-                        const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
-                        gameOverMessage += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
+                        gameOverMessage += `<br><a href="https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet" target="_blank">View transaction</a>`;
                     }
                     if (typeof celebrateWin === 'function') celebrateWin('bot_win');
-                } else if (winner === botPlayer?.username) { // Bot won against the human client
+                } else if (winner === botPlayer?.username) {
                     gameOverMessage = `Game Over! You got ${humanPlayer ? humanPlayer.score : 0} correct answers. Better luck next time!`;
-                } else { // Draw or other unexpected outcome with bot
-                     gameOverMessage = `Game Over against ${botPlayer ? botPlayer.username : 'the bot'}! Your score: ${humanPlayer ? humanPlayer.score : 0}.`;
-                     if (winner) { // If there was a winner but it wasn't the client or the bot (unlikely in 1v1 bot)
+                } else {
+                    gameOverMessage = `Game Over against ${botPlayer ? botPlayer.username : 'the bot'}! Your score: ${humanPlayer ? humanPlayer.score : 0}.`;
+                    if (winner) {
                         gameOverMessage += ` The winner was ${winner}.`;
-                     } else {
+                    } else {
                         gameOverMessage += " It was a draw!";
-                     }
+                    }
                 }
-            } else if (singlePlayerMode && !botOpponent) { // True single player mode (if you implement this without a bot)
+            } else if (singlePlayerMode && !botOpponent) {
                 const player = players[0];
-                 if (clientIsWinner) { // Won single player mode (based on score threshold or other criteria)
+                if (clientIsWinner) {
                     gameOverMessage = `Congratulations! You won in single player mode with ${player.score} correct answers! You won ${winnings.toFixed(2)} USDC!`;
                     if (payoutSignature) {
-                        gameOverMessage += ` Winnings have been sent to your wallet!`;
-                        const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
-                        gameOverMessage += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
+                        gameOverMessage += `<br><a href="https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet" target="_blank">View transaction</a>`;
                     }
                 } else {
-                    gameOverMessage = `Game Over! You got ${player.score} correct answers. You need at least 5 correct answers to win in single player.`; // Adjust win condition text
+                    gameOverMessage = `Game Over! You got ${player.score} correct answers. You need at least 5 correct answers to win in single player.`;
                 }
-            } else { // Multiplayer mode (human vs human)
+            } else {
                 const clientPlayer = players.find(p => p.username === connectedWallet);
                 const opponentPlayer = players.find(p => p.username !== connectedWallet);
-
                 if (clientIsWinner) {
                     gameOverMessage = `Congratulations! You are the winner with a score of ${clientPlayer.score}! You won ${winnings.toFixed(2)} USDC!`;
                     if (payoutSignature) {
-                        gameOverMessage += ` Winnings have been sent to your wallet!`;
-                        const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
-                        gameOverMessage += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
+                        gameOverMessage += `<br><a href="https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet" target="_blank">View transaction</a>`;
                     }
                     if (typeof celebrateWin === 'function') celebrateWin('normal');
-                } else if (winner) { // Another human player won
+                } else if (winner) {
                     const winnerPlayer = players.find(p => p.username === winner);
                     gameOverMessage = `Game Over! The winner is ${winner} with a score of ${winnerPlayer.score}. Better luck next time!`;
-                } else { // Draw in multiplayer
+                } else {
                     gameOverMessage = "Game Over! It's a draw!";
-                    // Handle draw payout if applicable (e.g. split pot or return bets)
-                    // For now, assuming no payout on a draw in H2H unless specifically handled
                 }
             }
 
-            waitingMessage.innerHTML = gameOverMessage; // Use innerHTML for the link
+            waitingMessage.innerHTML = gameOverMessage;
 
-            // Update UI after game over
+            // Reset UI after game over
             setTimeout(() => {
-                const scoresHtml = players.map(p =>
-                    `<p>${p.username}${p.isBot ? ' 🤖' : ''}: ${p.score} (Total response time: ${p.totalResponseTime || 0}ms)</p>`
-                ).join('');
-
-                playersDiv.innerHTML = '<h2>Final Scores:</h2>' + scoresHtml;
-                joinGameBtn.style.display = 'inline-block'; // Or use resetGame()
-                optionsDiv.innerHTML = '';
-
-                // Update balance after game over
+                resetGame();
                 updateBalance();
-                resetGame(); // Call your resetGame function to clear game state and UI elements
-            }, 7000); // Increased delay to allow reading the message
+            }, 7000);
         });
 
         socket.on('playerLeft', (username) => {
@@ -978,43 +963,31 @@
             console.log('Forfeit game over:', data);
             const { winner, disconnectedPlayer, betAmount, payoutSignature, botOpponent, message } = data;
 
-            // Clear all game-related UI and timers
-            resetGame(); // Your existing resetGame function should handle this
+            resetGame();
 
-            let forfeitMessage = message; // Base message from server
+            let forfeitMessage = message;
             const clientIsWinner = winner === connectedWallet;
             const winnings = betAmount * (botOpponent ? 1.5 : 1.8);
 
-            if (clientIsWinner) { // This client won by forfeit
+            if (clientIsWinner) {
                 forfeitMessage += ` You've been awarded ${winnings.toFixed(2)} USDC for the win!`;
                 if (payoutSignature) {
-                    forfeitMessage += ` Winnings have been sent to your wallet!`;
-                    const explorerLink = `https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet`;
-                    forfeitMessage += `<br><a href="${explorerLink}" target="_blank">View transaction</a>`;
+                    forfeitMessage += `<br><a href="https://explorer.solana.com/tx/${payoutSignature}?cluster=devnet" target="_blank">View transaction</a>`;
                 }
                 if (typeof celebrateWin === 'function') celebrateWin('forfeit');
-            } else if (botOpponent && winner && winner !== connectedWallet) { // Bot won by client's forfeit
-                // The base message from server should already cover this
-                // forfeitMessage += ` You left the game and lost to the bot.`;
-            } else if (!botOpponent && winner && winner !== connectedWallet) { // Another human won by client's forfeit
-                 forfeitMessage = `${disconnectedPlayer} left the game. ${winner} wins by forfeit.`;
             }
-
 
             waitingMessage.innerHTML = forfeitMessage;
 
-            // Update UI after forfeit
             setTimeout(() => {
                 playersDiv.innerHTML = `<h2>Game Ended Early</h2>
-                    <div class="forfeit-message">
-                        <p>${disconnectedPlayer} left the game.</p>
-                        <p>${winner} is the winner.</p>
-                    </div>`;
-                joinGameBtn.style.display = 'inline-block'; // Or use resetGame()
-
+            <div class="forfeit-message">
+                <p>${disconnectedPlayer} left the game.</p>
+                <p>${winner} is the winner.</p>
+            </div>`;
+                joinGameBtn.style.display = 'inline-block';
                 updateBalance();
-                resetGame(); // Call resetGame here too to ensure consistent state
-            }, 7000); // Increased delay
+            }, 7000);
         });
 
         socket.on('gameError', (errorMessage) => {
@@ -1171,7 +1144,7 @@
                     `<span class="difficulty-badge ${p.difficulty.toLowerCase()}">${p.difficulty}</span>` : '';
                 return `
                     <p${botClass}>
-                        ${p.username}${botIcon}${difficultyBadge}: ${p.score} 
+                        ${p.username}${botIcon}${difficultyBadge}: ${p.score || 0} 
                         <span class="response-time">(Response time: ${p.totalResponseTime || 0}ms)</span>
                     </p>`;
             }).join('');
@@ -1405,23 +1378,21 @@
         });
 
         socket.on('answerResult', (data) => {
-            const { username, isCorrect } = data;
-
+            const { username, isCorrect, questionId } = data;
             try {
-                if (username === connectedWallet) {
-                const selectedOption = document.querySelector('input[name="answer"]:checked');
-                if (selectedOption && selectedOption.parentElement) {
-                    selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
-                }
+                if (username === connectedWallet && questionId === currentQuestionId) {
+                    const selectedOption = document.querySelector(`input[name="answer"][value="${data.selectedAnswer}"]`);
+                    if (selectedOption && selectedOption.parentElement) {
+                        selectedOption.parentElement.classList.add(isCorrect ? 'correct' : 'incorrect');
+                    }
                 }
             } catch (error) {
-                console.error('Error highlighting answers in answerResult:', error);
+                console.error('Error updating answer UI:', error);
             }
         });
 
         socket.on('playerAnswered', (data) => {
             if (typeof data === 'string') {
-                // Handle legacy format
                 waitingMessage.textContent = `${data} has submitted their answer`;
                 return;
             }
@@ -1436,7 +1407,6 @@
                         </div>`;
                     playBotSound('answer');
                 } else {
-                    // Show server-calculated response time for transparency
                     const responseText = timedOut ? 
                         `${username} ran out of time!` : 
                         `${username} has submitted their answer${responseTime ? ` (${responseTime}ms)` : ''}`;
@@ -1517,56 +1487,83 @@
         });
 
         socket.on('roundComplete', (data) => {
-            const { questionId, playerResults } = data;
+            const { questionId, playerResults, correctAnswerText } = data;
             try {
-                const options = document.querySelectorAll('#options input');
-                const playerResult = playerResults.find(result => result.username === connectedWallet);
-                if (playerResult && playerResult.answer >= 0 && playerResult.answer < options.length) {
-                    options[playerResult.answer].parentElement.classList.add(playerResult.isCorrect ? 'correct' : 'incorrect');
+                if (questionId !== currentQuestionId) {
+                    console.warn('Received roundComplete for incorrect question ID:', questionId);
+                    return;
                 }
-                // Display round results
-                let resultsText = 'Round Results:\n';
-                playerResults.forEach(result => {
-                    const status = result.isCorrect ? '✓' : result.answer === -1 ? '⏰' : '✗';
-                    const responseTime = result.responseTime ? `${result.responseTime}ms` : 'N/A';
+
+                // Update UI with player results
+                const resultsHtml = playerResults.map(result => {
+                    const status = result.isCorrect ? '✓ Correct' : result.answer === -1 ? '⏰ Timed Out' : '✗ Incorrect';
                     const botLabel = result.isBot ? ' 🤖' : '';
-                    resultsText += `${status} ${result.username}${botLabel}: ${responseTime}\n`;
+                    return `<p>${status} ${result.username}${botLabel}: ${result.responseTime}ms</p>`;
+                }).join('');
+                playersDiv.innerHTML = `<h2>Round Results:</h2>${resultsHtml}`;
+
+                // Display correct answer
+                waitingMessage.innerHTML = `<p class="correct-answer">Correct Answer: ${correctAnswerText}</p>`;
+                const options = document.querySelectorAll('#options label');
+                const normalizeText = (text) => text.trim().toLowerCase().replace(/\s+/g, ' ');
+                options.forEach((label) => {
+                    if (normalizeText(label.textContent) === normalizeText(correctAnswerText)) {
+                        label.parentElement.classList.add('correct');
+                    }
                 });
-                console.log(resultsText);
-                } catch (error) {
+
+                // Disable further interactions
+                submitAnswerBtn.disabled = true;
+                submitAnswerBtn.style.display = 'none';
+                if (countdownInterval) {
+                    clearInterval(countdownInterval);
+                    countdownTimer.textContent = '';
+                    countdownTimer.style.display = 'none';
+                }
+
+                // Update player scores
+                updatePlayerUI(playerResults.map(result => ({
+                    username: result.username,
+                    score: result.isCorrect ? (playersDiv.querySelector(`p:contains('${result.username}')`)?.score || 0) + 1 : (playersDiv.querySelector(`p:contains('${result.username}')`)?.score || 0),
+                    totalResponseTime: result.responseTime,
+                    isBot: result.isBot,
+                    difficulty: result.isBot ? playersDiv.querySelector(`p:contains('${result.username}') .difficulty-badge`)?.textContent : undefined
+                })));
+            } catch (error) {
                 console.error('Error in roundComplete:', error);
+                waitingMessage.innerHTML = `<p class="error-message">Error displaying round results</p>`;
             }
         });
-
+        /*
         socket.on('revealCorrectAnswer', (data) => {
             const { questionId, correctAnswerText } = data;
             console.log(`Received revealCorrectAnswer: questionId=${questionId}, correctAnswerText=${correctAnswerText}`);
             try {
-                const normalizeText = (text) => text.trim().toLowerCase().replace(/\s+/g, ' ');
+                if (questionId !== currentQuestionId) {
+                    console.warn('Received revealCorrectAnswer for incorrect question ID:', questionId);
+                    return;
+                }
                 waitingMessage.innerHTML = `<p class="correct-answer">Correct Answer: ${correctAnswerText}</p>`;
                 const options = document.querySelectorAll('#options label');
-                console.log('Options available:', Array.from(options).map(label => label.textContent));
-                options.forEach((label, index) => {
-                    const labelText = normalizeText(label.textContent);
-                    const correctText = normalizeText(correctAnswerText);
-                    console.log(`Comparing label: "${labelText}" with correct: "${correctText}"`);
-                    if (labelText === correctText) {
-                    label.parentElement.classList.add('correct');
+                const normalizeText = (text) => text.trim().toLowerCase().replace(/\s+/g, ' ');
+                options.forEach((label) => {
+                    if (normalizeText(label.textContent) === normalizeText(correctAnswerText)) {
+                        label.parentElement.classList.add('correct');
                     }
                 });
-                // Ensure the correct answer remains visible
-                submitAnswerBtn.disabled = true; // Prevent further submissions
-                submitAnswerBtn.style.display = 'none'; // Hide submit button
+                submitAnswerBtn.disabled = true;
+                submitAnswerBtn.style.display = 'none';
                 if (countdownInterval) {
-                    clearInterval(countdownInterval); // Stop countdown
+                    clearInterval(countdownInterval);
                     countdownTimer.textContent = '';
                     countdownTimer.style.display = 'none';
                 }
             } catch (error) {
                 console.error('Error in revealCorrectAnswer:', error);
-                waitingMessage.innerHTML = `<p class="correct-answer">Error displaying correct answer</p>`;
+                waitingMessage.innerHTML = `<p class="error-message">Error displaying correct answer</p>`;
             }
         });
+        */
 
         // Add bot-related CSS
         const botStyles = document.createElement('style');

@@ -802,21 +802,22 @@ io.on('connection', (socket) => {
 
             console.log('Transaction verified successfully');
 
+            // Check existing rooms for this player
             const roomKeys = await redisClient.keys('room:*');
             for (const key of roomKeys) {
                 const roomId = key.replace('room:', '');
                 let room = await getGameRoom(roomId);
+                if (!room || room.isDeleted) continue;
+
                 const playerIndex = room.players.findIndex(p => p.username === walletAddress);
                 if (playerIndex !== -1) {
+                    console.log(`Player ${walletAddress} already in room ${roomId}, cleaning up`);
                     room.players.splice(playerIndex, 1);
+                    room.isDeleted = true;
                     await updateGameRoom(roomId, room);
                     socket.leave(roomId);
-                    console.log(`Player ${walletAddress} left room ${roomId} for matchmaking`);
-                    if (room.players.length === 0) {
-                        await deleteGameRoom(roomId);
-                        console.log(`Deleted empty room ${roomId}`);
-                    }
-                    break;
+                    await redisClient.del(`room:${roomId}`);
+                    console.log(`Deleted room ${roomId} due to new bot game request`);
                 }
             }
 
@@ -842,7 +843,6 @@ io.on('connection', (socket) => {
             });
 
             await startSinglePlayerGame(roomId);
-
             await logGameRoomsState();
         } catch (error) {
             console.error('Error creating bot game:', error);
@@ -1139,9 +1139,16 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            if (!room.questionStartTime) {
+            if (!room.questionStartTime || room.currentQuestionIndex >= room.questions.length) {
                 console.error(`No active question in room ${roomId} when ${username} submitted answer`);
                 socket.emit('answerError', 'No active question');
+                return;
+            }
+
+            const currentQuestion = room.questionIdMap.get(questionId);
+            if (!currentQuestion || questionId !== room.questions[room.currentQuestionIndex].tempId) {
+                console.error(`Invalid question ${questionId} for room ${roomId}`);
+                socket.emit('answerError', 'Invalid question');
                 return;
             }
 
@@ -1158,44 +1165,21 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            const currentQuestion = room.questionIdMap.get(questionId);
-            if (!currentQuestion) {
-                console.error(`Question ${questionId} not found in room ${roomId}`);
-                socket.emit('answerError', 'Question not found');
-                return;
-            }
-
             const serverResponseTime = Date.now() - room.questionStartTime;
-
-            if (serverResponseTime < 200) {
-                console.warn(`Suspiciously fast response time ${serverResponseTime}ms from ${username} in room ${roomId}`);
+            if (serverResponseTime < 200 || serverResponseTime > 15000) {
+                console.warn(`Invalid response time ${serverResponseTime}ms from ${username} in room ${roomId}`);
                 await redisClient.set(`suspect:${username}`, 1, 'EX', 3600);
-                socket.emit('answerError', 'Response submitted too quickly');
-                return;
-            }
-
-            if (serverResponseTime > 15000) {
-                console.warn(`Response time too slow ${serverResponseTime}ms from ${username} in room ${roomId}`);
-                await redisClient.set(`suspect:${username}`, 1, 'EX', 3600);
-                socket.emit('answerError', 'Response submitted too late');
+                socket.emit('answerError', 'Invalid response timing');
                 return;
             }
 
             console.log(`SERVER CALCULATED: ${username} response time: ${serverResponseTime}ms`);
 
             const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
-
-            botDetector.recordAnswer(username, isCorrect, serverResponseTime, currentQuestion.difficulty);
-
-            if (botDetector.isSuspicious(username)) {
-                console.warn(`Flagging suspicious player: ${username}`);
-                await redisClient.set(`suspicious:${username}`, 1, 'EX', 86400);
-            }
-
-            player.totalResponseTime = (player.totalResponseTime || 0) + serverResponseTime;
+            player.answered = true;
             player.lastAnswer = answer;
             player.lastResponseTime = serverResponseTime;
-            player.answered = true;
+            player.totalResponseTime = (player.totalResponseTime || 0) + serverResponseTime;
 
             if (isCorrect) {
                 player.score = (player.score || 0) + 1;
@@ -1213,22 +1197,35 @@ io.on('connection', (socket) => {
                 } catch (error) {
                     console.error('Error updating user stats:', error);
                 }
-            } else {
-                console.log(`Incorrect answer from ${username}. Score unchanged: ${player.score}`);
             }
 
+            room.answersReceived += 1;
             await updateGameRoom(roomId, room);
 
             socket.emit('answerResult', {
                 username: player.username,
-                isCorrect
+                isCorrect,
+                questionId,
+                selectedAnswer: answer
             });
 
             socket.to(roomId).emit('playerAnswered', {
                 username,
                 isBot: false,
-                responseTime: serverResponseTime
+                responseTime: serverResponseTime,
+                timedOut: false
             });
+
+            // Emit score update to all players in the room
+            io.to(roomId).emit('scoreUpdate', room.players.map(p => ({
+                username: p.username,
+                score: p.score || 0,
+                totalResponseTime: p.totalResponseTime || 0,
+                isBot: p.isBot || false,
+                difficulty: p.isBot ? p.difficultyLevelString : undefined
+            })));
+
+            // Do not call completeQuestion here; wait for the timeout
         } catch (error) {
             console.error('Error in submitAnswer:', error.message);
             socket.emit('answerError', `Error submitting answer: ${error.message}`);
@@ -1280,22 +1277,23 @@ io.on('connection', (socket) => {
             for (const key of roomKeys) {
                 const roomId = key.replace('room:', '');
                 let room = await getGameRoom(roomId);
-                if (!room) continue;
+                if (!room || room.isDeleted) continue;
 
                 const playerIndex = room.players.findIndex(p => p.id === socket.id);
                 if (playerIndex !== -1) {
                     const disconnectedPlayer = room.players[playerIndex];
                     console.log(`Player ${disconnectedPlayer.username} (socket ${socket.id}) disconnected from room ${roomId}`);
 
-                    room.players.splice(playerIndex, 1);
-                    room.playerLeft = true;
-                    await updateGameRoom(roomId, room);
-
+                    // Clear question timeout
                     if (room.questionTimeout) {
                         clearTimeout(room.questionTimeout);
                         room.questionTimeout = null;
-                        await updateGameRoom(roomId, room);
                     }
+
+                    room.players.splice(playerIndex, 1);
+                    room.playerLeft = true;
+                    room.isDeleted = true; // Mark room as deleted
+                    await updateGameRoom(roomId, room);
 
                     // Scenario 1: Bot Game Forfeit (Human disconnected)
                     if (room.roomMode === 'bot') {
@@ -1337,7 +1335,11 @@ io.on('connection', (socket) => {
                             console.error(`CRITICAL: Bot not found in bot game room ${roomId} after human ${disconnectedPlayer.username} disconnected.`);
                             io.to(roomId).emit('gameError', 'An error occurred due to player disconnection.');
                         }
+
+                        // Ensure room is deleted
                         await deleteGameRoom(roomId);
+                        await redisClient.del(`room:${roomId}`);
+                        console.log(`Confirmed deletion of room ${roomId}`);
                         await logGameRoomsState();
                         return;
                     }
@@ -1363,6 +1365,7 @@ io.on('connection', (socket) => {
                         ];
 
                         await handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, false, allPlayersForStats);
+                        await redisClient.del(`room:${roomId}`);
                         await logGameRoomsState();
                         return;
                     }
@@ -1371,6 +1374,7 @@ io.on('connection', (socket) => {
                     if (room.players.length === 0) {
                         console.log(`Room ${roomId} is now empty after ${disconnectedPlayer.username} left. Deleting room.`);
                         await deleteGameRoom(roomId);
+                        await redisClient.del(`room:${roomId}`);
                         await logGameRoomsState();
                         return;
                     }
@@ -1482,17 +1486,72 @@ async function startNextQuestion(roomId) {
         return;
     }
 
+    // Check if room is deleted
+    if (room.isDeleted) {
+        console.log(`Room ${roomId} is marked as deleted, stopping game`);
+        if (room.questionTimeout) {
+            clearTimeout(room.questionTimeout);
+            room.questionTimeout = null;
+        }
+        await redisClient.del(`room:${roomId}`); // Ensure deletion
+        await logGameRoomsState();
+        return;
+    }
+
+    // Check if there are any human players
+    const humanPlayers = room.players.filter(p => !p.isBot);
+    if (humanPlayers.length === 0) {
+        console.log(`No human players in room ${roomId}. Stopping game.`);
+        if (room.questionTimeout) {
+            clearTimeout(room.questionTimeout);
+            room.questionTimeout = null;
+        }
+        room.isDeleted = true;
+        await updateGameRoom(roomId, room);
+        await redisClient.del(`room:${roomId}`);
+        await logGameRoomsState();
+        return;
+    }
+
+    if (room.currentQuestionIndex >= room.questions.length) {
+        console.log(`No more questions for room ${roomId}. Ending game.`);
+        await handleGameOver(room, roomId);
+        return;
+    }
+
     const currentQuestion = room.questions[room.currentQuestionIndex];
+    if (!currentQuestion || !currentQuestion.options || currentQuestion.correctAnswer === undefined) {
+        console.error(`Invalid question data for room ${roomId}, question index ${room.currentQuestionIndex}`);
+        io.to(roomId).emit('gameError', 'Invalid question data');
+        room.isDeleted = true;
+        await updateGameRoom(roomId, room);
+        await redisClient.del(`room:${roomId}`);
+        return;
+    }
+
     room.questionStartTime = Date.now();
     room.answersReceived = 0;
+    room.players.forEach(player => {
+        player.answered = false;
+        player.lastAnswer = null;
+        player.lastResponseTime = null;
+    });
 
     const shuffledOptions = shuffleArray([...currentQuestion.options]);
     const shuffledCorrectAnswer = shuffledOptions.indexOf(currentQuestion.options[currentQuestion.correctAnswer]);
+    if (shuffledCorrectAnswer === -1) {
+        console.error(`Failed to find correct answer in shuffled options for room ${roomId}`);
+        io.to(roomId).emit('gameError', 'Invalid question configuration');
+        room.isDeleted = true;
+        await updateGameRoom(roomId, room);
+        await redisClient.del(`room:${roomId}`);
+        return;
+    }
+
     currentQuestion.shuffledOptions = shuffledOptions;
     currentQuestion.shuffledCorrectAnswer = shuffledCorrectAnswer;
     room.questionIdMap.set(currentQuestion.tempId, { ...currentQuestion });
 
-    // Update room once with initial question state
     await updateGameRoom(roomId, room);
     console.log(`Question ${room.currentQuestionIndex + 1} started at timestamp: ${room.questionStartTime} for room ${roomId}`);
 
@@ -1505,6 +1564,7 @@ async function startNextQuestion(roomId) {
         totalQuestions: room.questions.length
     });
 
+    // Handle bot answer if applicable
     const botData = room.players.find(p => p.isBot);
     if (botData) {
         const bot = new TriviaBot(botData.username, botData.difficultyLevelString || 'MEDIUM');
@@ -1512,9 +1572,6 @@ async function startNextQuestion(roomId) {
         bot.totalResponseTime = botData.totalResponseTime || 0;
         bot.currentQuestionIndex = botData.currentQuestionIndex || 0;
         bot.answersGiven = botData.answersGiven || [];
-        bot.answered = botData.answered || false;
-        bot.lastAnswer = botData.lastAnswer || null;
-        bot.lastResponseTime = botData.lastResponseTime || null;
 
         try {
             const botAnswer = await bot.answerQuestion(
@@ -1523,12 +1580,17 @@ async function startNextQuestion(roomId) {
                 shuffledCorrectAnswer
             );
 
+            // Re-check room state before updating
+            room = await getGameRoom(roomId);
+            if (!room || room.isDeleted) {
+                console.log(`Room ${roomId} deleted or not found during bot answer processing`);
+                return;
+            }
+
             const botIndex = room.players.findIndex(p => p.isBot);
             if (botIndex !== -1) {
                 room.players[botIndex] = {
-                    username: bot.username,
-                    difficultyLevelString: bot.difficultyLevelString,
-                    isBot: true,
+                    ...room.players[botIndex],
                     score: bot.score,
                     totalResponseTime: bot.totalResponseTime,
                     currentQuestionIndex: bot.currentQuestionIndex,
@@ -1537,28 +1599,46 @@ async function startNextQuestion(roomId) {
                     lastAnswer: botAnswer.answer,
                     lastResponseTime: botAnswer.responseTime
                 };
-                // Update room after bot answer
+                room.answersReceived += 1;
                 await updateGameRoom(roomId, room);
             }
 
-            console.log(`Bot ${bot.username} answered question ${currentQuestion.tempId} with answer ${botAnswer.answer} (correct: ${botAnswer.isCorrect}, responseTime: ${botAnswer.responseTime}ms)`);
+            console.log(`Bot ${bot.username} answered question ${currentQuestion.tempId}: ${botAnswer.answer} (correct: ${botAnswer.isCorrect}, time: ${botAnswer.responseTime}ms)`);
             io.to(roomId).emit('playerAnswered', {
                 username: bot.username,
                 isBot: true,
-                responseTime: botAnswer.responseTime
+                responseTime: botAnswer.responseTime,
+                timedOut: false
             });
         } catch (error) {
             console.error(`Error processing bot answer in room ${roomId}:`, error);
             io.to(roomId).emit('gameError', 'Error processing bot response. Game ended.');
-            await deleteGameRoom(roomId);
+            room.isDeleted = true;
+            await updateGameRoom(roomId, room);
+            await redisClient.del(`room:${roomId}`);
             return;
         }
     }
 
     room.questionTimeout = setTimeout(async () => {
         room = await getGameRoom(roomId);
-        if (!room) {
-            console.log(`Room ${roomId} not found during timeout`);
+        if (!room || room.isDeleted) {
+            console.log(`Room ${roomId} not found or deleted during timeout`);
+            return;
+        }
+
+        // Check again for human players
+        const remainingHumanPlayers = room.players.filter(p => !p.isBot);
+        if (remainingHumanPlayers.length === 0) {
+            console.log(`No human players remaining in room ${roomId} during timeout. Stopping game.`);
+            if (room.questionTimeout) {
+                clearTimeout(room.questionTimeout);
+                room.questionTimeout = null;
+            }
+            room.isDeleted = true;
+            await updateGameRoom(roomId, room);
+            await redisClient.del(`room:${roomId}`);
+            await logGameRoomsState();
             return;
         }
 
@@ -1569,6 +1649,7 @@ async function startNextQuestion(roomId) {
                 player.lastAnswer = -1;
                 const timeoutResponseTime = Date.now() - room.questionStartTime;
                 player.lastResponseTime = timeoutResponseTime;
+                room.answersReceived += 1;
                 timedOut = true;
 
                 console.log(`Player ${player.username} timed out on question ${currentQuestion.tempId} with responseTime: ${timeoutResponseTime}ms`);
@@ -1581,33 +1662,9 @@ async function startNextQuestion(roomId) {
             }
         });
 
-        // Update room after timeout
         if (timedOut) {
             await updateGameRoom(roomId, room);
         }
-
-        console.log(`Question timeout completed in room ${roomId}`);
-        io.to(roomId).emit('roundComplete', {
-            questionId: currentQuestion.tempId,
-            playerResults: room.players.map(p => ({
-                username: p.username,
-                isCorrect: p.lastAnswer === currentQuestion.shuffledCorrectAnswer,
-                answer: p.lastAnswer,
-                responseTime: p.lastResponseTime || 0,
-                isBot: p.isBot || false
-            }))
-        });
-
-        setTimeout(async () => {
-            room = await getGameRoom(roomId);
-            if (room) {
-                console.log(`Emitting revealCorrectAnswer for room ${roomId}, question ${currentQuestion.tempId}: ${currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer]}`);
-                io.to(roomId).emit('revealCorrectAnswer', {
-                    questionId: currentQuestion.tempId,
-                    correctAnswerText: currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer]
-                });
-            }
-        }, 2000);
 
         await completeQuestion(roomId);
     }, 10000);
@@ -1640,33 +1697,80 @@ async function determineBotDifficulty(playerUsername) {
 
 async function completeQuestion(roomId) {
     let room = await getGameRoom(roomId);
-    if (!room) return;
+    if (!room) {
+        console.error(`Room ${roomId} not found in completeQuestion`);
+        io.to(roomId).emit('gameError', 'Room not found');
+        return;
+    }
+
+    // Check if room is deleted
+    if (room.isDeleted) {
+        console.log(`Room ${roomId} is marked as deleted, stopping game`);
+        if (room.questionTimeout) {
+            clearTimeout(room.questionTimeout);
+            room.questionTimeout = null;
+        }
+        await redisClient.del(`room:${roomId}`);
+        await logGameRoomsState();
+        return;
+    }
+
+    // Check if there are any human players
+    const humanPlayers = room.players.filter(p => !p.isBot);
+    if (humanPlayers.length === 0) {
+        console.log(`No human players in room ${roomId}. Stopping game.`);
+        if (room.questionTimeout) {
+            clearTimeout(room.questionTimeout);
+            room.questionTimeout = null;
+        }
+        room.isDeleted = true;
+        await updateGameRoom(roomId, room);
+        await redisClient.del(`room:${roomId}`);
+        await logGameRoomsState();
+        return;
+    }
+
+    const currentQuestion = room.questions[room.currentQuestionIndex];
+    if (!currentQuestion || !currentQuestion.shuffledOptions || currentQuestion.shuffledCorrectAnswer === undefined) {
+        console.error(`Invalid question data for room ${roomId}, index ${room.currentQuestionIndex}`);
+        io.to(roomId).emit('gameError', 'Invalid question data');
+        room.isDeleted = true;
+        await updateGameRoom(roomId, room);
+        await redisClient.del(`room:${roomId}`);
+        return;
+    }
+
+    io.to(roomId).emit('roundComplete', {
+        questionId: currentQuestion.tempId,
+        playerResults: room.players.map(p => ({
+            username: p.username,
+            isCorrect: p.lastAnswer === currentQuestion.shuffledCorrectAnswer,
+            answer: p.lastAnswer || -1,
+            responseTime: p.lastResponseTime || 0,
+            isBot: p.isBot || false
+        })),
+        correctAnswerText: currentQuestion.shuffledOptions[currentQuestion.shuffledCorrectAnswer]
+    });
+
+    // Emit score update
+    io.to(roomId).emit('scoreUpdate', room.players.map(p => ({
+        username: p.username,
+        score: p.score || 0,
+        totalResponseTime: p.totalResponseTime || 0,
+        isBot: p.isBot || false,
+        difficulty: p.isBot ? p.difficultyLevelString : undefined
+    })));
 
     room.questionStartTime = null;
     room.roundStartTime = null;
-
     room.players.forEach(player => {
         player.answered = false;
         player.lastResponseTime = null;
+        player.lastAnswer = null;
     });
-
-    await updateGameRoom(roomId, room);
-
-    io.to(roomId).emit('updateScores', room.players.map(p => ({
-        username: p.username,
-        score: p.score,
-        totalResponseTime: p.totalResponseTime || 0,
-        isBot: p.isBot || false
-    })));
-
-    if (room.questionTimeout) {
-        clearTimeout(room.questionTimeout);
-        room.questionTimeout = null;
-        await updateGameRoom(roomId, room);
-    }
-
     room.currentQuestionIndex += 1;
     room.answersReceived = 0;
+
     await updateGameRoom(roomId, room);
 
     if (room.playerLeft) {
@@ -1700,25 +1804,20 @@ async function handleGameOver(room, roomId) {
     if (botOpponent && sortedPlayers.length >= 1) {
         const humanPlayer = room.players.find(p => !p.isBot);
         const botPlayer = room.players.find(p => p.isBot);
-
         if (humanPlayer && botPlayer) {
             if (humanPlayer.score > botPlayer.score) {
                 winner = humanPlayer.username;
             } else if (botPlayer.score > humanPlayer.score) {
                 winner = botPlayer.username;
             } else {
-                if ((humanPlayer.totalResponseTime || 0) <= (botPlayer.totalResponseTime || 0)) {
-                    winner = humanPlayer.username;
-                } else {
-                    winner = botPlayer.username;
-                }
+                winner = (humanPlayer.totalResponseTime || 0) <= (botPlayer.totalResponseTime || 0)
+                    ? humanPlayer.username
+                    : botPlayer.username;
             }
         } else if (botPlayer && !humanPlayer) {
             winner = botPlayer.username;
         } else if (humanPlayer && !botPlayer) {
             winner = humanPlayer.username;
-        } else if (sortedPlayers.length > 0) {
-            winner = sortedPlayers[0].username;
         }
     } else if (sortedPlayers.length === 1) {
         winner = sortedPlayers[0].username;
@@ -1741,23 +1840,11 @@ async function handleGameOver(room, roomId) {
         });
 
         const winnerIsActuallyHuman = winner && !room.players.find(p => p.username === winner && p.isBot);
+        let payoutSignature = null;
 
         if (winnerIsActuallyHuman) {
             try {
-                const payoutSignature = await sendWinnings(winner, room.betAmount, botOpponent);
-                io.to(roomId).emit('gameOver', {
-                    players: sortedPlayers.map(p => ({
-                        username: p.username,
-                        score: p.score,
-                        totalResponseTime: p.totalResponseTime || 0,
-                        isBot: p.isBot || false
-                    })),
-                    winner: winner,
-                    betAmount: room.betAmount,
-                    payoutSignature,
-                    singlePlayerMode: isSinglePlayerEncounter,
-                    botOpponent: botOpponent
-                });
+                payoutSignature = await sendWinnings(winner, room.betAmount, botOpponent);
             } catch (error) {
                 console.error('Error processing payout:', error);
                 io.to(roomId).emit('gameOver', {
@@ -1773,21 +1860,24 @@ async function handleGameOver(room, roomId) {
                     singlePlayerMode: isSinglePlayerEncounter,
                     botOpponent: botOpponent
                 });
+                await deleteGameRoom(roomId);
+                return;
             }
-        } else {
-            io.to(roomId).emit('gameOver', {
-                players: sortedPlayers.map(p => ({
-                    username: p.username,
-                    score: p.score,
-                    totalResponseTime: p.totalResponseTime || 0,
-                    isBot: p.isBot || false
-                })),
-                winner: winner,
-                betAmount: room.betAmount,
-                singlePlayerMode: isSinglePlayerEncounter,
-                botOpponent: botOpponent
-            });
         }
+
+        io.to(roomId).emit('gameOver', {
+            players: sortedPlayers.map(p => ({
+                username: p.username,
+                score: p.score,
+                totalResponseTime: p.totalResponseTime || 0,
+                isBot: p.isBot || false
+            })),
+            winner: winner,
+            betAmount: room.betAmount,
+            payoutSignature,
+            singlePlayerMode: isSinglePlayerEncounter,
+            botOpponent: botOpponent
+        });
 
         await deleteGameRoom(roomId);
         await logGameRoomsState();
@@ -1795,7 +1885,6 @@ async function handleGameOver(room, roomId) {
         console.error('Error handling game over:', error);
         io.to(roomId).emit('gameError', 'An error occurred while ending the game.');
         await deleteGameRoom(roomId);
-        await logGameRoomsState();
     }
 }
 
@@ -1977,17 +2066,18 @@ async function createGameRoom(roomId, betAmount, roomMode = null) {
         players: [],
         betAmount,
         questions: [],
-        questionIdMap: {}, // Will be serialized to JSON
+        questionIdMap: {},
         currentQuestionIndex: 0,
         answersReceived: 0,
         gameStarted: false,
         roomMode: roomMode,
-        waitingTimeout: null, // Not stored in Redis (ephemeral)
-        questionTimeout: null, // Not stored in Redis (ephemeral)
+        waitingTimeout: null,
+        questionTimeout: null,
         playerLeft: false,
         hasBot: false,
         questionStartTime: null,
-        roundStartTime: null
+        roundStartTime: null,
+        isDeleted: false // New flag
     };
 
     try {
@@ -2004,9 +2094,10 @@ async function createGameRoom(roomId, betAmount, roomMode = null) {
             hasBot: room.hasBot.toString(),
             playerLeft: room.playerLeft.toString(),
             questionStartTime: room.questionStartTime ? room.questionStartTime.toString() : '',
-            roundStartTime: room.roundStartTime ? room.roundStartTime.toString() : ''
+            roundStartTime: room.roundStartTime ? room.roundStartTime.toString() : '',
+            isDeleted: room.isDeleted.toString()
         });
-        await redisClient.expire(`room:${roomId}`, 3600); // Set TTL to 1 hour
+        await redisClient.expire(`room:${roomId}`, 3600);
         console.log(`Created room ${roomId} in Redis with bet amount ${betAmount}`);
     } catch (error) {
         console.error(`Error creating room ${roomId} in Redis:`, error);
@@ -2034,8 +2125,9 @@ async function getGameRoom(roomId) {
             playerLeft: roomData.playerLeft === 'true',
             questionStartTime: roomData.questionStartTime ? parseInt(roomData.questionStartTime) : null,
             roundStartTime: roomData.roundStartTime ? parseInt(roomData.roundStartTime) : null,
-            questionTimeout: null, // Ephemeral, not stored
-            waitingTimeout: null // Ephemeral, not stored
+            questionTimeout: null,
+            waitingTimeout: null,
+            isDeleted: roomData.isDeleted === 'true' // Parse isDeleted
         };
     } catch (error) {
         console.error(`Error fetching room ${roomId} from Redis:`, error);
@@ -2045,6 +2137,12 @@ async function getGameRoom(roomId) {
 
 async function updateGameRoom(roomId, room) {
     try {
+        // Check if room is marked as deleted
+        if (room.isDeleted) {
+            console.log(`Room ${roomId} is marked as deleted, skipping update`);
+            return;
+        }
+
         const roomData = {
             ...room,
             players: JSON.stringify(room.players),
@@ -2058,11 +2156,14 @@ async function updateGameRoom(roomId, room) {
             hasBot: room.hasBot.toString(),
             playerLeft: room.playerLeft.toString(),
             questionStartTime: room.questionStartTime ? room.questionStartTime.toString() : '',
-            roundStartTime: room.roundStartTime ? room.roundStartTime.toString() : ''
+            roundStartTime: room.roundStartTime ? room.roundStartTime.toString() : '',
+            isDeleted: room.isDeleted.toString()
         };
 
-        await redisClient.hset(`room:${roomId}`, roomData);
-        await redisClient.expire(`room:${roomId}`, 3600); // Refresh TTL
+        const multi = redisClient.multi();
+        multi.hset(`room:${roomId}`, roomData);
+        multi.expire(`room:${roomId}`, 3600);
+        await multi.exec();
         console.log(`Updated room ${roomId} in Redis`);
     } catch (error) {
         console.error(`Error updating room ${roomId} in Redis:`, error);
@@ -2070,10 +2171,28 @@ async function updateGameRoom(roomId, room) {
     }
 }
 
+
 async function deleteGameRoom(roomId) {
     try {
-        await redisClient.del(`room:${roomId}`);
-        console.log(`Deleted room ${roomId} from Redis`);
+        let room = await getGameRoom(roomId);
+        if (room) {
+            if (room.questionTimeout) {
+                clearTimeout(room.questionTimeout);
+                room.questionTimeout = null;
+            }
+            room.isDeleted = true;
+            await updateGameRoom(roomId, room); // Mark as deleted
+        }
+
+        const multi = redisClient.multi();
+        multi.del(`room:${roomId}`);
+        await multi.exec();
+        console.log(`Deleted room ${roomId} from Redis via transaction`);
+        const roomExists = await redisClient.exists(`room:${roomId}`);
+        if (roomExists) {
+            console.error(`Room ${roomId} still exists after deletion attempt`);
+            await redisClient.del(`room:${roomId}`);
+        }
     } catch (error) {
         console.error(`Error deleting room ${roomId} from Redis:`, error);
         throw error;
