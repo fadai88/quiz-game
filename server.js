@@ -4,7 +4,6 @@ const socketIo = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
 require('dotenv').config();
-const moment = require('moment');
 const { v4: uuidv4 } = require('uuid');
 const User = require('./models/User');
 const axios = require('axios');
@@ -141,56 +140,6 @@ initializeRedis().catch((err) => {
     console.error(err.message);
     process.exit(1); // Exit if Redis is unavailable
 });
-
-const verifyUSDCTransaction = async (transactionSignature, expectedAmount, senderAddress, recipientAddress) => {
-    try {
-        const connection = new Connection(process.env.SOLANA_RPC_URL, 'confirmed');
-        
-        const transaction = await connection.getTransaction(transactionSignature, {
-            commitment: 'confirmed',
-            maxSupportedTransactionVersion: 0 // Support legacy and versioned transactions
-        });
-        
-        if (!transaction) {
-            console.error('Transaction not found');
-            return false;
-        }
-
-        // Find the token transfer instruction
-        const transferInstruction = transaction.transaction.message.instructions.find(
-            ix => ix.programId.equals(TOKEN_PROGRAM_ID)
-        );
-
-        if (!transferInstruction) {
-            console.error('No token transfer instruction found');
-            return false;
-        }
-
-        // Decode the transfer instruction
-        const decodedInstruction = SPLToken.decodeTransferInstruction(transferInstruction);
-        
-        // Get amount in USDC (convert from raw amount)
-        const amount = decodedInstruction.amount.toNumber() / Math.pow(10, 6);
-
-        // Verify amount and addresses
-        const amountMatches = Math.abs(amount - expectedAmount) < 0.01; // Allow small rounding differences
-        const senderMatches = decodedInstruction.source.equals(new PublicKey(senderAddress));
-        const recipientMatches = decodedInstruction.destination.equals(new PublicKey(recipientAddress));
-
-        console.log('Transaction verification:', {
-            amountMatches,
-            senderMatches,
-            recipientMatches,
-            expectedAmount,
-            actualAmount: amount
-        });
-
-        return amountMatches && senderMatches && recipientMatches;
-    } catch (error) {
-        console.error('Error verifying USDC transaction:', error);
-        return false;
-    }
-};
 
 async function verifyAndValidateTransaction(signature, expectedAmount, senderAddress, recipientAddress, maxRetries = 3, retryDelay = 500) {
     console.log(`Verifying transaction ${signature} for ${expectedAmount} USDC from ${senderAddress} to ${recipientAddress}`);
@@ -2303,34 +2252,6 @@ async function sendWinnings(winnerAddress, betAmount, botOpponent = false) {
     } catch (error) {
         console.error('Error sending winnings:', error);
         throw error;
-    }
-}
-
-async function verifyPayout(signature, expectedAmount, recipientAddress) {
-    try {
-        const transaction = await connection.getTransaction(signature, {
-            commitment: 'confirmed',
-            maxSupportedTransactionVersion: 0
-        });
-
-        if (!transaction || transaction.meta.err) {
-            return false;
-        }
-
-        const postBalances = transaction.meta.postTokenBalances;
-        const recipientBalance = postBalances.find(b => 
-            b.owner === recipientAddress
-        );
-
-        if (!recipientBalance) {
-            return false;
-        }
-
-        const receivedAmount = recipientBalance.uiTokenAmount.uiAmount;
-        return Math.abs(receivedAmount - expectedAmount) < 0.001;
-    } catch (error) {
-        console.error('Error verifying payout:', error);
-        return false;
     }
 }
 

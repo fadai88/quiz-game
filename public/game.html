@@ -145,7 +145,6 @@
         const config = {
             USDC_MINT: new solanaWeb3.PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
             TREASURY_WALLET: new solanaWeb3.PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
-            HOUSE_FEE_PERCENT: 2.5,
         };
 
         const connection = new solanaWeb3.Connection(
@@ -1520,51 +1519,12 @@
                     countdownTimer.textContent = '';
                     countdownTimer.style.display = 'none';
                 }
-
-                // Update player scores
-                updatePlayerUI(playerResults.map(result => ({
-                    username: result.username,
-                    score: result.isCorrect ? (playersDiv.querySelector(`p:contains('${result.username}')`)?.score || 0) + 1 : (playersDiv.querySelector(`p:contains('${result.username}')`)?.score || 0),
-                    totalResponseTime: result.responseTime,
-                    isBot: result.isBot,
-                    difficulty: result.isBot ? playersDiv.querySelector(`p:contains('${result.username}') .difficulty-badge`)?.textContent : undefined
-                })));
             } catch (error) {
                 console.error('Error in roundComplete:', error);
                 waitingMessage.innerHTML = `<p class="error-message">Error displaying round results</p>`;
             }
         });
-        /*
-        socket.on('revealCorrectAnswer', (data) => {
-            const { questionId, correctAnswerText } = data;
-            console.log(`Received revealCorrectAnswer: questionId=${questionId}, correctAnswerText=${correctAnswerText}`);
-            try {
-                if (questionId !== currentQuestionId) {
-                    console.warn('Received revealCorrectAnswer for incorrect question ID:', questionId);
-                    return;
-                }
-                waitingMessage.innerHTML = `<p class="correct-answer">Correct Answer: ${correctAnswerText}</p>`;
-                const options = document.querySelectorAll('#options label');
-                const normalizeText = (text) => text.trim().toLowerCase().replace(/\s+/g, ' ');
-                options.forEach((label) => {
-                    if (normalizeText(label.textContent) === normalizeText(correctAnswerText)) {
-                        label.parentElement.classList.add('correct');
-                    }
-                });
-                submitAnswerBtn.disabled = true;
-                submitAnswerBtn.style.display = 'none';
-                if (countdownInterval) {
-                    clearInterval(countdownInterval);
-                    countdownTimer.textContent = '';
-                    countdownTimer.style.display = 'none';
-                }
-            } catch (error) {
-                console.error('Error in revealCorrectAnswer:', error);
-                waitingMessage.innerHTML = `<p class="error-message">Error displaying correct answer</p>`;
-            }
-        });
-        */
-
+   
         // Add bot-related CSS
         const botStyles = document.createElement('style');
         botStyles.textContent = `
