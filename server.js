@@ -12,24 +12,28 @@ const path = require('path');
 const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, Keypair } = require('@solana/web3.js');
 const Joi = require('joi');
 const BotDetector = require('./botDetector');
+const crypto = require('crypto');
 
 const transactionSchema = Joi.object({
     walletAddress: Joi.string().required(),
-    betAmount: Joi.number().min(1).max(100).required(),
+    betAmount: Joi.number().valid(3, 10, 15, 20, 30).required(),
     transactionSignature: Joi.string().required(),
-    gameMode: Joi.string().optional()
+    gameMode: Joi.string().optional(),
+    recaptchaToken: Joi.string().required()
 });
 
 const submitAnswerSchema = Joi.object({
     roomId: Joi.string().required(),
     questionId: Joi.string().required(),
-    answer: Joi.number().integer().min(-1).required(), // Allow -1 for timeout cases
-    username: Joi.string().required()
+    answer: Joi.number().integer().min(-1).required(),
+    username: Joi.string().required(),
+    recaptchaToken: Joi.string().allow(null, '').optional()  // Allow null/empty
 });
 
 const playerReadySchema = Joi.object({
     roomId: Joi.string().required(),
-    preferredMode: Joi.string().valid('human', 'bot').optional()
+    preferredMode: Joi.string().valid('human', 'bot').optional(),
+    recaptchaToken: Joi.string().optional()
 });
 
 const switchToBotSchema = Joi.object({
@@ -76,6 +80,19 @@ const io = socketIo(server, {
 
 app.use(cors());
 app.use(express.json());
+app.get('/game.html', (req, res) => {
+    let gameHtml = fs.readFileSync(path.join(__dirname, 'public', 'game.html'), 'utf8');
+    const recaptchaEnabled = process.env.ENABLE_RECAPTCHA === 'true';
+    const recaptchaSiteKey = process.env.RECAPTCHA_SITE_KEY || '';
+    gameHtml = gameHtml.replace('YOUR_SITE_KEY', recaptchaSiteKey);
+    const recaptchaConfigScript = `<script>
+        window.recaptchaEnabled = ${recaptchaEnabled};
+        window.recaptchaSiteKey = "${recaptchaSiteKey}";
+        console.log("Injection test: Globals set", { enabled: ${recaptchaEnabled}, key: "${recaptchaSiteKey}" });
+    </script>`;
+    gameHtml = gameHtml.replace('</head>', `${recaptchaConfigScript}</head>`);
+    res.send(gameHtml);
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 // LOOKT AT THIS FUNCTION AGAIN WHEN THE GAME IS LIVE!!!
@@ -351,6 +368,9 @@ io.on('connection', (socket) => {
         sessionId: socket.id
     };
     
+    // Integrate BotDetector for connection analysis
+    botDetector.trackConnection(connectionData.ip, connectionData.userAgent, socket.id);
+    
     // Check if IP is in blocklist
     if (redisClient) {  // Add check for redisClient existence
         (async () => {
@@ -376,6 +396,12 @@ io.on('connection', (socket) => {
         try {
             console.log('Wallet login attempt:', { walletAddress, recaptchaToken: !!recaptchaToken });
             
+            // Mandate reCAPTCHA: require token
+            if (!recaptchaToken) {
+                console.warn(`reCAPTCHA token missing for wallet ${walletAddress}`);
+                return socket.emit('loginFailure', 'reCAPTCHA verification required.');
+            }
+            
             // Rate limiting check
             if (redisClient) {
                 const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
@@ -389,25 +415,18 @@ io.on('connection', (socket) => {
                 await redisClient.set(loginLimitKey, parseInt(loginAttempts) + 1, 'EX', 3600);
             }
             
-            // reCAPTCHA verification
-            if (process.env.ENABLE_RECAPTCHA && recaptchaToken) {
-                console.log('reCAPTCHA enabled, attempting verification');
-                try {
-                    const recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                    console.log('reCAPTCHA verification result:', recaptchaResult);
-                    if (!recaptchaResult.success) {
-                        console.warn(`reCAPTCHA verification failed for wallet ${walletAddress}`);
-                        return socket.emit('loginFailure', 'Verification failed. Please try again.');
-                    }
-                } catch (error) {
-                    console.error('reCAPTCHA verification error:', error);
-                    return socket.emit('loginFailure', 'Verification service unavailable. Please try again later.');
+            // reCAPTCHA verification (mandated)
+            console.log('reCAPTCHA enabled, attempting verification');
+            try {
+                const recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                console.log('reCAPTCHA verification result:', recaptchaResult);
+                if (!recaptchaResult.success) {
+                    console.warn(`reCAPTCHA verification failed for wallet ${walletAddress}`);
+                    return socket.emit('loginFailure', 'Verification failed. Please try again.');
                 }
-            } else {
-                console.log('reCAPTCHA disabled or token missing', { 
-                    enabled: process.env.ENABLE_RECAPTCHA === 'true', 
-                    tokenProvided: !!recaptchaToken 
-                });
+            } catch (error) {
+                console.error('reCAPTCHA verification error:', error);
+                return socket.emit('loginFailure', 'Verification service unavailable. Please try again later.');
             }
 
             try {
@@ -440,7 +459,8 @@ io.on('connection', (socket) => {
                         registrationDate: new Date(),
                         lastLoginIP: connectionData.ip,
                         lastLoginDate: new Date(),
-                        userAgent: connectionData.userAgent
+                        userAgent: connectionData.userAgent,
+                        recentQuestions: []
                     });
                 } else {
                     // Update login information
@@ -449,6 +469,14 @@ io.on('connection', (socket) => {
                     user.userAgent = connectionData.userAgent;
                     await user.save();
                 }
+
+                // Device fingerprinting
+                const fingerprint = crypto.createHash('sha256').update(JSON.stringify(clientData)).digest('hex');
+                user.deviceFingerprint = fingerprint;
+                await user.save();
+
+                // Set on socket for later checks
+                socket.user = { walletAddress, fingerprint };
 
                 // Log successful login
                 console.log('Login successful for wallet:', walletAddress);
@@ -476,6 +504,8 @@ io.on('connection', (socket) => {
                     walletAddress: user.walletAddress,
                     virtualBalance: user.virtualBalance
                 });
+                // Restore socket.user
+                socket.user = { walletAddress };
             } else {
                 socket.emit('loginFailure', 'Wallet not found');
             }
@@ -523,9 +553,9 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('playerReady', async ({ roomId, preferredMode }) => {
+    socket.on('playerReady', async ({ roomId, preferredMode, recaptchaToken }) => {
         try {
-            const { error } = playerReadySchema.validate({ roomId, preferredMode });
+            const { error } = playerReadySchema.validate({ roomId, preferredMode, recaptchaToken });
             if (error) {
                 console.error('Validation error in playerReady:', error.message);
                 socket.emit('gameError', `Invalid input: ${error.message}`);
@@ -540,6 +570,35 @@ io.on('connection', (socket) => {
                 socket.emit('gameError', 'Room not found');
                 return;
             }
+
+            const player = room.players.find(p => p.id === socket.id);
+            if (!player) {
+                socket.emit('gameError', 'Player not found in room');
+                return;
+            }
+            const username = player.username;
+
+            // Device fingerprint check
+            const user = await User.findOne({ walletAddress: username });
+            if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint) {
+                console.warn(`Device fingerprint mismatch for ${username} in playerReady`);
+                botDetector.trackEvent(username, 'fingerprint_mismatch', { event: 'playerReady' });
+                if (!recaptchaToken || !(await verifyRecaptcha(recaptchaToken)).success) {
+                    socket.emit('gameError', 'Device verification failed. Please relogin.');
+                    return;
+                }
+            }
+
+            // High-win streak captcha check
+            if (user && user.gamesPlayed > 5 && (user.wins / user.gamesPlayed) > 0.8) {
+                if (!recaptchaToken || !(await verifyRecaptcha(recaptchaToken)).success) {
+                    socket.emit('gameError', 'Additional verification required due to high win rate.');
+                    return;
+                }
+            }
+
+            // BotDetector integration
+            botDetector.trackEvent(username, 'player_ready', { preferredMode, roomId });
 
             if (room.roomMode === 'bot') {
                 console.log(`Room ${roomId} is set for bot play, not starting regular game`);
@@ -621,8 +680,16 @@ io.on('connection', (socket) => {
             return;
         }
 
-        const { walletAddress, betAmount, transactionSignature, gameMode } = data;
+        const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken } = data;
         console.log('Human matchmaking request:', { walletAddress, betAmount, gameMode });
+
+        // Mandate reCAPTCHA verification
+        const recaptchaResult = await verifyRecaptcha(recaptchaToken);
+        if (!recaptchaResult.success) {
+            console.error('reCAPTCHA failed for human matchmaking');
+            socket.emit('joinGameFailure', 'Captcha verification failed.');
+            return;
+        }
 
         const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
         const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
@@ -734,8 +801,16 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            const { walletAddress, betAmount, transactionSignature, gameMode } = data;
+            const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken } = data;
             console.log('Bot game request:', { walletAddress, betAmount, gameMode });
+
+            // Mandate reCAPTCHA verification
+            const recaptchaResult = await verifyRecaptcha(recaptchaToken);
+            if (!recaptchaResult.success) {
+                console.error('reCAPTCHA failed for bot game');
+                socket.emit('joinGameFailure', 'Captcha verification failed.');
+                return;
+            }
 
             const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
             const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
@@ -1068,9 +1143,9 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('submitAnswer', async ({ roomId, questionId, answer, username }) => {
+    socket.on('submitAnswer', async ({ roomId, questionId, answer, username, recaptchaToken }) => {
         try {
-            const { error } = submitAnswerSchema.validate({ roomId, questionId, answer, username });
+            const { error } = submitAnswerSchema.validate({ roomId, questionId, answer, username, recaptchaToken });
             if (error) {
                 console.error('Validation error in submitAnswer:', error.message);
                 socket.emit('answerError', `Invalid input: ${error.message}`);
@@ -1122,6 +1197,45 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            // Bot suspicion score
+            const botSuspicion = botDetector.getSuspicionScore(username);
+            console.log(`Bot suspicion for ${username}: ${botSuspicion}`);
+
+            // reCAPTCHA: Skip if null or low suspicion; otherwise verify
+            let skipCaptcha = !recaptchaToken || botSuspicion < 30;  // FIXED: Use recaptchaToken, not data
+            if (!skipCaptcha) {
+                const recaptchaResult = await verifyRecaptcha(recaptchaToken);  // FIXED: Use recaptchaToken
+                if (!recaptchaResult.success) {
+                    socket.emit('answerError', 'Verification failed for answer submission.');
+                    return;
+                }
+                console.log(`reCAPTCHA verified for ${username} (score: ${recaptchaResult.score || 'N/A'})`);
+            } else {
+                console.log(`Skipping reCAPTCHA for ${username} (suspicion: ${botSuspicion})`);
+            }
+
+            // Device fingerprint check (only if not skipping)
+            const user = await User.findOne({ walletAddress: username });
+            if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint && !skipCaptcha) {
+                console.warn(`Device fingerprint mismatch for ${username} in submitAnswer`);
+                botDetector.trackEvent(username, 'fingerprint_mismatch', { event: 'submitAnswer' });
+                // Re-verify if mismatch (even if low suspicion)
+                const recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                if (!recaptchaResult.success) {
+                    socket.emit('answerError', 'Device verification failed. Please relogin.');
+                    return;
+                }
+            }
+
+            // High-win streak captcha check (always verify if condition met)
+            if (user && user.gamesPlayed > 5 && (user.wins / user.gamesPlayed) > 0.8) {
+                if (!recaptchaToken || !(await verifyRecaptcha(recaptchaToken)).success) {
+                    socket.emit('answerError', 'Additional verification required due to high win rate.');
+                    return;
+                }
+                console.log(`High-win verification passed for ${username}`);
+            }
+
             console.log(`SERVER CALCULATED: ${username} response time: ${serverResponseTime}ms`);
 
             const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
@@ -1147,6 +1261,14 @@ io.on('connection', (socket) => {
                     console.error('Error updating user stats:', error);
                 }
             }
+
+            // BotDetector integration
+            botDetector.trackEvent(username, 'answer_submitted', {
+                responseTime: serverResponseTime,
+                isCorrect,
+                answer,
+                questionId
+            });
 
             room.answersReceived += 1;
             await updateGameRoom(roomId, room);
@@ -1356,10 +1478,22 @@ app.get('/login.html', (req, res) => {
     
     // Add a custom script tag with the reCAPTCHA configuration
     const recaptchaConfigScript = `<script>
-    // reCAPTCHA configuration 
-    window.recaptchaEnabled = ${recaptchaEnabled};
-    window.recaptchaSiteKey = "${recaptchaSiteKey}";
-    console.log("reCAPTCHA config loaded:", { enabled: window.recaptchaEnabled, siteKey: window.recaptchaSiteKey });
+        // reCAPTCHA configuration 
+        window.recaptchaEnabled = ${recaptchaEnabled};
+        window.recaptchaSiteKey = "${recaptchaSiteKey}";
+        console.log("reCAPTCHA config loaded:", { 
+            enabled: window.recaptchaEnabled, 
+            siteKey: window.recaptchaSiteKey,
+            grecaptchaLoaded: !!window.grecaptcha,
+            enterpriseLoaded: !!window.grecaptcha?.enterprise 
+        });
+        
+        // Wait for grecaptcha to load and log
+        if (window.grecaptcha) {
+            window.grecaptcha.enterprise.ready(() => {
+                console.log("reCAPTCHA Enterprise ready");
+            }).catch(err => console.error("reCAPTCHA Enterprise ready error:", err));
+        }
     </script>`;
     
     // Insert the script right before the closing </head> tag
@@ -1395,13 +1529,25 @@ async function startGame(roomId) {
     await updateGameRoom(roomId, room);
 
     try {
-        const rawQuestions = await Quiz.aggregate([{ $sample: { size: 7 } }]);
+        // Dynamic question rotation: exclude recent questions for human player
+        let matchStage = [];
+        const humanPlayer = room.players.find(p => !p.isBot);
+        if (humanPlayer) {
+            const user = await User.findOne({ walletAddress: humanPlayer.username });
+            if (user && user.recentQuestions && user.recentQuestions.length > 0) {
+                const recentIds = user.recentQuestions.map(id => new mongoose.Types.ObjectId(id));
+                matchStage = [{ $match: { _id: { $nin: recentIds } } }];
+            }
+        }
+
+        const rawQuestions = await Quiz.aggregate([...matchStage, { $sample: { size: 7 } }]);
         console.log(`Fetched ${rawQuestions.length} questions for room ${roomId}`);
 
         room.questions = rawQuestions.map((question, index) => {
             const tempId = `${roomId}-${uuidv4()}`;
             const questionData = {
                 tempId,
+                _id: question._id,  // Add for rotation tracking
                 question: question.question,
                 options: question.options,
                 correctAnswer: question.correctAnswer
@@ -1425,6 +1571,141 @@ async function startGame(roomId) {
     } catch (error) {
         console.error('Error starting game:', error);
         io.to(roomId).emit('gameError', 'Failed to start the game. Please try again.');
+    }
+}
+
+async function startSinglePlayerGame(roomId) {
+    console.log('Starting single player game with bot for room:', roomId);
+    let room = await getGameRoom(roomId);
+    if (!room) {
+        console.log('Room not found for bot creation');
+        return;
+    }
+
+    if (room.roomMode !== 'bot') {
+        console.log(`Room ${roomId} is no longer in bot mode, not adding bot`);
+        return;
+    }
+
+    try {
+        // Dynamic question rotation: exclude recent questions for human player
+        let matchStage = [];
+        let humanPlayer = room.players.find(p => !p.isBot);
+        if (humanPlayer) {
+            const user = await User.findOne({ walletAddress: humanPlayer.username });
+            if (user && user.recentQuestions && user.recentQuestions.length > 0) {
+                const recentIds = user.recentQuestions.map(id => new mongoose.Types.ObjectId(id));
+                matchStage = [{ $match: { _id: { $nin: recentIds } } }];
+            }
+        }
+
+        const rawQuestions = await Quiz.aggregate([...matchStage, { $sample: { size: 7 } }]);
+
+        room.questions = rawQuestions.map((question, index) => {
+            const tempId = `${roomId}-${uuidv4()}`;
+            const questionData = {
+                tempId,
+                _id: question._id,  // Add for rotation tracking
+                question: question.question,
+                options: question.options,
+                correctAnswer: question.correctAnswer
+            };
+            room.questionIdMap.set(tempId, questionData);
+            return questionData;
+        });
+
+        const humanPlayers = room.players.filter(p => !p.isBot);
+
+        if (humanPlayers.length !== 1) {
+            console.log(`Room ${roomId} has ${humanPlayers.length} human players, expected exactly 1`);
+            if (humanPlayers.length === 0) {
+                await deleteGameRoom(roomId);
+                await logGameRoomsState();
+            } else {
+                room.roomMode = 'multiplayer';
+                room.gameStarted = true;
+                await updateGameRoom(roomId, room);
+                io.to(roomId).emit('gameStart', {
+                    players: room.players,
+                    questionCount: room.questions.length,
+                    singlePlayerMode: false
+                });
+                await startNextQuestion(roomId);
+            }
+            return;
+        }
+
+        humanPlayer = humanPlayers[0];
+        console.log('Human player:', humanPlayer.username);
+
+        humanPlayer.score = 0;
+        humanPlayer.totalResponseTime = 0;
+        humanPlayer.answered = false;
+        humanPlayer.lastAnswer = null;
+
+        if (room.players.some(p => p.isBot)) {
+            console.log(`Room ${roomId} already has a bot player`);
+            if (!room.gameStarted) {
+                room.gameStarted = true;
+                await updateGameRoom(roomId, room);
+                await startNextQuestion(roomId);
+            }
+            return;
+        }
+
+        const difficultyString = await determineBotDifficulty(humanPlayer.username);
+        const botName = chooseBotName();
+        console.log('Creating bot with name:', botName, 'and difficulty:', difficultyString);
+
+        const bot = new TriviaBot(botName, difficultyString);
+        console.log('Bot instance created:', {
+            username: bot.username,
+            difficulty: bot.difficultyLevelString,
+            hasAnswerQuestion: typeof bot.answerQuestion === 'function'
+        });
+
+        room.players.push({
+            username: bot.username,
+            difficultyLevelString: bot.difficultyLevelString,
+            isBot: true,
+            score: bot.score,
+            totalResponseTime: bot.totalResponseTime,
+            currentQuestionIndex: bot.currentQuestionIndex,
+            answersGiven: bot.answersGiven,
+            answered: bot.answered,
+            lastAnswer: bot.lastAnswer,
+            lastResponseTime: bot.lastResponseTime
+        });
+        room.hasBot = true;
+        console.log('Bot added to room. Total players:', room.players.length);
+
+        await updateGameRoom(roomId, room);
+
+        io.to(roomId).emit('botGameReady', {
+            botName: bot.username,
+            difficulty: bot.difficultyLevelString
+        });
+
+        io.to(roomId).emit('gameStart', {
+            players: room.players.map(p => ({
+                username: p.username,
+                score: p.score,
+                isBot: p.isBot || false,
+                difficulty: p.isBot ? p.difficultyLevelString : undefined
+            })),
+            questionCount: room.questions.length,
+            singlePlayerMode: true,
+            botOpponent: bot.username
+        });
+
+        room.gameStarted = true;
+        await updateGameRoom(roomId, room);
+        await startNextQuestion(roomId);
+        await logGameRoomsState();
+    } catch (error) {
+        console.error('Error starting single player game with bot:', error);
+        io.to(roomId).emit('gameError', 'Failed to start the game. Please try again.');
+        await deleteGameRoom(roomId);
     }
 }
 
@@ -1788,6 +2069,16 @@ async function handleGameOver(room, roomId) {
             betAmount: room.betAmount
         });
 
+        // Dynamic question rotation: update recent questions for human players
+        for (const player of room.players.filter(p => !p.isBot)) {
+            const user = await User.findOne({ walletAddress: player.username });
+            if (user) {
+                const usedIds = room.questions.map(q => q._id.toString());
+                user.recentQuestions = [...new Set([...(user.recentQuestions || []), ...usedIds])].slice(-20);
+                await user.save();
+            }
+        }
+
         const winnerIsActuallyHuman = winner && !room.players.find(p => p.username === winner && p.isBot);
         let payoutSignature = null;
 
@@ -1885,128 +2176,6 @@ async function verifyRecaptcha(token) {
     } catch (error) {
         console.error('reCAPTCHA verification error:', error);
         return { success: false, error: 'Verification service error' };
-    }
-}
-
-async function startSinglePlayerGame(roomId) {
-    console.log('Starting single player game with bot for room:', roomId);
-    let room = await getGameRoom(roomId);
-    if (!room) {
-        console.log('Room not found for bot creation');
-        return;
-    }
-
-    if (room.roomMode !== 'bot') {
-        console.log(`Room ${roomId} is no longer in bot mode, not adding bot`);
-        return;
-    }
-
-    try {
-        const rawQuestions = await Quiz.aggregate([{ $sample: { size: 7 } }]);
-        room.questions = rawQuestions.map((question, index) => {
-            const tempId = `${roomId}-${uuidv4()}`;
-            const questionData = {
-                tempId,
-                question: question.question,
-                options: question.options,
-                correctAnswer: question.correctAnswer
-            };
-            room.questionIdMap.set(tempId, questionData);
-            return questionData;
-        });
-
-        const humanPlayers = room.players.filter(p => !p.isBot);
-
-        if (humanPlayers.length !== 1) {
-            console.log(`Room ${roomId} has ${humanPlayers.length} human players, expected exactly 1`);
-            if (humanPlayers.length === 0) {
-                await deleteGameRoom(roomId);
-                await logGameRoomsState();
-            } else {
-                room.roomMode = 'multiplayer';
-                room.gameStarted = true;
-                await updateGameRoom(roomId, room);
-                io.to(roomId).emit('gameStart', {
-                    players: room.players,
-                    questionCount: room.questions.length,
-                    singlePlayerMode: false
-                });
-                await startNextQuestion(roomId);
-            }
-            return;
-        }
-
-        const humanPlayer = humanPlayers[0];
-        console.log('Human player:', humanPlayer.username);
-
-        humanPlayer.score = 0;
-        humanPlayer.totalResponseTime = 0;
-        humanPlayer.answered = false;
-        humanPlayer.lastAnswer = null;
-
-        if (room.players.some(p => p.isBot)) {
-            console.log(`Room ${roomId} already has a bot player`);
-            if (!room.gameStarted) {
-                room.gameStarted = true;
-                await updateGameRoom(roomId, room);
-                await startNextQuestion(roomId);
-            }
-            return;
-        }
-
-        const difficultyString = await determineBotDifficulty(humanPlayer.username);
-        const botName = chooseBotName();
-        console.log('Creating bot with name:', botName, 'and difficulty:', difficultyString);
-
-        const bot = new TriviaBot(botName, difficultyString);
-        console.log('Bot instance created:', {
-            username: bot.username,
-            difficulty: bot.difficultyLevelString,
-            hasAnswerQuestion: typeof bot.answerQuestion === 'function'
-        });
-
-        room.players.push({
-            username: bot.username,
-            difficultyLevelString: bot.difficultyLevelString,
-            isBot: true,
-            score: bot.score,
-            totalResponseTime: bot.totalResponseTime,
-            currentQuestionIndex: bot.currentQuestionIndex,
-            answersGiven: bot.answersGiven,
-            answered: bot.answered,
-            lastAnswer: bot.lastAnswer,
-            lastResponseTime: bot.lastResponseTime
-        });
-        room.hasBot = true;
-        console.log('Bot added to room. Total players:', room.players.length);
-
-        await updateGameRoom(roomId, room);
-
-        io.to(roomId).emit('botGameReady', {
-            botName: bot.username,
-            difficulty: bot.difficultyLevelString
-        });
-
-        io.to(roomId).emit('gameStart', {
-            players: room.players.map(p => ({
-                username: p.username,
-                score: p.score,
-                isBot: p.isBot || false,
-                difficulty: p.isBot ? p.difficultyLevelString : undefined
-            })),
-            questionCount: room.questions.length,
-            singlePlayerMode: true,
-            botOpponent: bot.username
-        });
-
-        room.gameStarted = true;
-        await updateGameRoom(roomId, room);
-        await startNextQuestion(roomId);
-        await logGameRoomsState();
-    } catch (error) {
-        console.error('Error starting single player game with bot:', error);
-        io.to(roomId).emit('gameError', 'Failed to start the game. Please try again.');
-        await deleteGameRoom(roomId);
     }
 }
 

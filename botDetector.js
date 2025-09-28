@@ -1,6 +1,45 @@
 class BotDetector {
     constructor() {
         this.playerStats = new Map();
+        this.suspiciousEvents = new Map(); // Track events per user
+        this.blockedUsers = new Set();
+    }
+
+    trackConnection(ip, userAgent, socketId) {
+        console.log(`BotDetector: Tracking connection from IP ${ip}, UserAgent: ${userAgent}, Socket: ${socketId}`);
+        // Basic check: if userAgent is empty or suspicious
+        if (!userAgent || userAgent.length < 10) {
+            console.warn(`Suspicious connection detected: Empty or short UserAgent from ${ip}`);
+            this.flagUser(ip, 'suspicious_ua');
+        }
+        // Add more checks as needed, e.g., known bot patterns
+    }
+
+    trackEvent(username, eventType, metadata = {}) {
+        console.log(`BotDetector: Tracking event ${eventType} for ${username}:`, metadata);
+        if (!this.suspiciousEvents.has(username)) {
+            this.suspiciousEvents.set(username, []);
+        }
+        this.suspiciousEvents.get(username).push({ eventType, timestamp: Date.now(), metadata });
+
+        // Example: Flag if too many events in short time
+        const events = this.suspiciousEvents.get(username);
+        const recentEvents = events.filter(e => Date.now() - e.timestamp < 60000); // Last minute
+        if (recentEvents.length > 10) {
+            console.warn(`High event rate for ${username}: ${recentEvents.length} in 1min`);
+            this.flagUser(username, 'high_event_rate');
+        }
+
+        // Check for patterns, e.g., rapid answers
+        if (eventType === 'answer_submitted' && metadata.responseTime < 500) {
+            console.warn(`Suspicious fast answer from ${username}: ${metadata.responseTime}ms`);
+            this.flagUser(username, 'fast_answer');
+        }
+
+        // If it's an answer event, record it for stats
+        if (eventType === 'answer_submitted' && metadata.isCorrect !== undefined && metadata.responseTime !== undefined) {
+            this.recordAnswer(username, metadata.isCorrect, metadata.responseTime, metadata.questionDifficulty || 'medium');
+        }
     }
 
     recordAnswer(username, isCorrect, responseTime, questionDifficulty = 'medium') {
@@ -75,6 +114,22 @@ class BotDetector {
     isSuspicious(username, threshold = 60) {
         const stats = this.playerStats.get(username);
         return stats ? stats.suspicionScore > threshold : false;
+    }
+
+    flagUser(identifier, reason) {
+        console.warn(`BotDetector: Flagging ${identifier} for ${reason}`);
+        this.blockedUsers.add(identifier);
+        // Optionally integrate with Redis for blocking
+        // await redisClient.set(`blocklist:${identifier}`, 1, 'EX', 86400);
+    }
+
+    isBlocked(identifier) {
+        return this.blockedUsers.has(identifier);
+    }
+
+    getSuspicionScore(username) {
+        if (!this.playerStats.has(username)) return 0;
+        return this.playerStats.get(username).suspicionScore;
     }
 }
 

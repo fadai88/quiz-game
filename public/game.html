@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Trivia Game</title>
     <link rel="stylesheet" href="styles.css">
+    <script src="https://www.google.com/recaptcha/api.js?render=YOUR_SITE_KEY"></script>
     <script src="https://bundle.run/buffer@6.0.3"></script>
     <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@solana/spl-token@0.3.8/lib/index.iife.min.js"></script>
@@ -765,7 +766,7 @@
             joinGameBtn.disabled = false;
         });
 
-        submitAnswerBtn.addEventListener('click', () => {
+        submitAnswerBtn.addEventListener('click', async () => {
             const selectedOption = document.querySelector('input[name="answer"]:checked');
             if (!selectedOption) {
                 alert('Please select an answer!');
@@ -773,19 +774,32 @@
             }
             
             const selectedAnswer = parseInt(selectedOption.value);
+
+            // Get reCAPTCHA token (optional for submit, but try anyway)
+            let recaptchaToken = null;
+            if (window.recaptchaEnabled) {
+                try {
+                    recaptchaToken = await getRecaptchaToken('submit_answer');
+                } catch (error) {
+                    console.error('reCAPTCHA for submit failed:', error);
+                    recaptchaToken = null;  // Fallback
+                }
+            }
             
             console.log('Submitting answer:', {
                 roomId: currentRoomId,
                 questionId: currentQuestionId,
                 answer: selectedAnswer,
-                username: connectedWallet
+                username: connectedWallet,
+                hasRecaptcha: !!recaptchaToken
             });
             
             socket.emit('submitAnswer', { 
                 roomId: currentRoomId, 
                 questionId: currentQuestionId, 
                 answer: selectedAnswer,
-                username: connectedWallet 
+                username: connectedWallet,
+                recaptchaToken  // Send null if failed—server handles it
             });
             
             submitAnswerBtn.disabled = true;
@@ -1200,6 +1214,37 @@
             leaderboardContainer.style.display = 'block';
         }
 
+        async function getRecaptchaToken(action) {
+            console.log('getRecaptchaToken called for:', action, '- globals:', { 
+                enabled: window.recaptchaEnabled, 
+                siteKey: window.recaptchaSiteKey ? 'Set' : 'Undefined' 
+            });
+
+            if (!window.recaptchaEnabled || !window.grecaptcha || !window.recaptchaSiteKey) {
+                console.error('reCAPTCHA v3 not ready - globals or script missing');
+                return null;
+            }
+
+            // Wrap callback-based API in Promise
+            return new Promise((resolve, reject) => {
+                grecaptcha.ready(() => {
+                    console.log('reCAPTCHA ready - executing for action:', action);
+                    grecaptcha.execute(window.recaptchaSiteKey, { action: action })
+                        .then((token) => {
+                            console.log('Token generated successfully');
+                            resolve(token);
+                        })
+                        .catch((error) => {
+                            console.error('Execute failed:', error);
+                            reject(error);
+                        });
+                });
+            }).catch((error) => {
+                console.error('reCAPTCHA ready/execute error:', error);
+                return null;  // Graceful fallback
+            });
+        }
+
         function showGameChoiceModal() {
             console.log('Showing game choice modal');
             const modal = document.getElementById('gameChoiceModal');
@@ -1223,6 +1268,12 @@
                     const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
                     console.log('Transaction signature for human matchmaking:', txSignature);
                     
+                    // Get reCAPTCHA token (mandated)
+                    const recaptchaToken = await getRecaptchaToken('place_bet');
+                    if (!recaptchaToken) {
+                        throw new Error('reCAPTCHA token required for bet placement.');
+                    }
+                    
                     //waitingMessage.textContent = 'Testing fake signature for human matchmaking...';
                     //const fakeSignature = 'INVALID_SIGNATURE_12345'; // Fake signature
                     //console.log('Using fake transaction signature:', fakeSignature);
@@ -1233,7 +1284,8 @@
                         walletAddress: connectedWallet,
                         betAmount: currentBetAmount,
                         transactionSignature: txSignature,
-                        gameMode: 'human'
+                        gameMode: 'human',
+                        recaptchaToken
                     });
                     waitingMessage.textContent = 'Looking for another player...';
                     await updateBalance();
@@ -1263,6 +1315,12 @@
                     const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
                     console.log('Transaction signature for bot game:', txSignature);
                     
+                    // Get reCAPTCHA token (mandated)
+                    const recaptchaToken = await getRecaptchaToken('place_bet');
+                    if (!recaptchaToken) {
+                        throw new Error('reCAPTCHA token required for bet placement.');
+                    }
+                    
                     //waitingMessage.textContent = 'Testing fake signature for bot game...';
                     //const fakeBotSignature = 'INVALID_SIGNATURE_12345'; // Fake signature
                     //console.log('Using fake transaction signature:', fakeBotSignature);
@@ -1273,7 +1331,8 @@
                         walletAddress: connectedWallet,
                         betAmount: currentBetAmount,
                         transactionSignature: txSignature,
-                        gameMode: 'bot'
+                        gameMode: 'bot',
+                        recaptchaToken
                     });
                     waitingMessage.textContent = 'Creating a game with a bot opponent...';
                     await updateBalance();
@@ -1469,7 +1528,7 @@
             }, WAITING_TIMEOUT_DURATION);
         });
 
-        socket.on('matchFound', (data) => {
+        socket.on('matchFound', async (data) => {
             console.log('Match found:', data);
             currentRoomId = data.gameRoomId;
             waitingMessage.textContent = 'Match found! Game is starting...';
@@ -1477,12 +1536,28 @@
             if (waitingTimeout) {
                 clearTimeout(waitingTimeout);
             }
+
+            // Get reCAPTCHA token for playerReady
+            const recaptchaToken = await getRecaptchaToken('player_ready');
+            socket.emit('playerReady', { 
+                roomId: data.gameRoomId, 
+                preferredMode: 'human',
+                recaptchaToken
+            });
         });
 
-        socket.on('botGameCreated', (data) => {
+        socket.on('botGameCreated', async (data) => {
             console.log('Bot game created:', data);
             currentRoomId = data.gameRoomId;
             waitingMessage.textContent = `Starting game against ${data.botName}...`;
+
+            // Get reCAPTCHA token for playerReady
+            const recaptchaToken = await getRecaptchaToken('player_ready');
+            socket.emit('playerReady', { 
+                roomId: data.gameRoomId, 
+                preferredMode: 'bot',
+                recaptchaToken
+            });
         });
 
         socket.on('roundComplete', (data) => {
