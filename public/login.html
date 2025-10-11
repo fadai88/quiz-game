@@ -138,7 +138,38 @@
 
     <script src="/socket.io/socket.io.js"></script>
     <script>
-        const socket = io();
+        // const socket = io();
+        const socket = io('http://localhost:5000'); // Auto-upgrade
+        
+        /*
+        socket.on('connect_error', (err) => {
+            console.log('Connect error details:', {
+                message: err.message,      // e.g., "xhr poll error"
+                description: err.description, // e.g., HTTP status
+                context: err.context       // e.g., XHR object
+            });
+        });
+
+        socket.on('connect', () => {
+            console.log('Connected via transport:', socket.io.engine.transport.name); // "polling" or "websocket"
+            socket.io.engine.once('upgrade', () => {
+                console.log('Upgraded to:', socket.io.engine.transport.name);
+            });
+        });
+        */
+
+        socket.on('disconnect', (reason) => {
+            console.log('Disconnected:', reason);
+            if (reason === 'io server disconnect') {
+                // Server kicked—likely auth fail
+                showError('Session expired. Please reconnect.');
+            }
+        });
+
+        socket.on('reconnect_attempt', (attemptNumber) => {
+            console.log(`Reconnect attempt ${attemptNumber}...`);
+        });
+
         let connectedWallet = null;
         
         // Record page load time for bot detection

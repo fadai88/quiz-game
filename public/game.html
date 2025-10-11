@@ -9,7 +9,6 @@
     <script src="https://bundle.run/buffer@6.0.3"></script>
     <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@solana/spl-token@0.3.8/lib/index.iife.min.js"></script>
-    <script src="/socket.io/socket.io.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js"></script>
     <style>
         .non-copyable {
@@ -250,8 +249,25 @@
                 return accountInfo;
             }
         };
+        const socket = io('http://localhost:5000'); // Auto-upgrade (remove transports: ['polling'] if WS works)
 
-        const socket = io();
+        socket.on('connect_error', (err) => {
+            console.log('Connect error details:', {
+                message: err.message,      // e.g., "xhr poll error"
+                description: err.description, // e.g., HTTP status
+                context: err.context       // e.g., XHR object
+            });
+        });
+
+        socket.on('connect', () => {
+            console.log('Connected via transport:', socket.io.engine.transport.name); // "polling" or "websocket"
+            socket.io.engine.once('upgrade', () => {
+                console.log('Upgraded to:', socket.io.engine.transport.name);
+            });
+            // Trigger session init after connect
+            initializeFromSession();
+        });
+
         let connectedWallet = null;
         let currentRoomId = null;
         let currentBetAmount = null;
@@ -505,14 +521,36 @@
                 document.getElementById('walletStatus').textContent = 
                     `Connected: ${connectedWallet.slice(0,4)}...${connectedWallet.slice(-4)}`;
                     
-                // Initialize balance updates
-                await updateBalance();
-                balanceUpdateInterval = setInterval(updateBalance, 30000);
+                // CRITICAL: Re-authenticate socket with server to set socket.user
+                socket.emit('walletReconnect', connectedWallet);
                 
-                // After basic initialization, try to initialize the wallet connection
-                await initializeWallet();
+                // Listen for reconnect response
+                socket.once('loginSuccess', async (data) => {  // <-- FIXED: Add 'async' here
+                    console.log('Reconnect successful:', data);
+                    // Proceed with balance/UI init
+                    await updateBalance();
+                    balanceUpdateInterval = setInterval(updateBalance, 30000);
+                    await initializeWallet(); // Existing
+                });
+                
+                socket.once('loginFailure', (message) => {
+                    console.error('Reconnect failed:', message);
+                    alert(`Session invalid: ${message}. Redirecting to login.`);
+                    localStorage.removeItem('sessionData');
+                    window.location.href = 'login.html';
+                });
+                
+                // Fallback timeout (5s) if no response
+                setTimeout(() => {
+                    if (!socket.connected) {  // Check connection state instead of socket.user (client-side approx)
+                        console.error('Reconnect timeout—redirecting');
+                        window.location.href = 'login.html';
+                    }
+                }, 5000);
+                
             } catch (error) {
                 console.error('Session initialization error:', error);
+                window.location.href = 'login.html';
             }
         }
 
