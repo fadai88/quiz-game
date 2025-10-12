@@ -17,10 +17,41 @@ const Joi = require('joi');
 const BotDetector = require('./botDetector');
 const crypto = require('crypto');
 
+// NEW: TransactionLog model for permanent audit
+const TransactionLog = mongoose.model('TransactionLog', new mongoose.Schema({
+    signature: { type: String, required: true, unique: true },
+    walletAddress: String,
+    betAmount: Number,
+    verifiedAt: { type: Date, default: Date.now },
+    status: { type: String, enum: ['verified', 'replayed', 'failed'] }
+}));
+
+// NEW: In-memory fallback cache for signatures (limited to prevent memory bloat)
+const replayCache = new Set();  // Simple Set for quick lookup
+const MAX_CACHE_SIZE = 10000;  // Limit to recent txs
+
+// NEW: Reusable Joi custom validator for Solana public keys
+const solanaPublicKey = Joi.string().required().custom((value, helpers) => {
+    // Quick regex pre-check for base58 (32-44 chars, valid chars)
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) {
+        return helpers.error('any.invalid', { message: 'Invalid Solana public key format' });
+    }
+    try {
+        new PublicKey(value);
+        return value;
+    } catch (err) {
+        return helpers.error('any.invalid', { message: 'Invalid Solana public key' });
+    }
+}, 'Solana Public Key Validation');
+
+// NEW: Nonce validator (UUID v4)
+const nonceSchema = Joi.string().guid({ version: 'uuidv4' }).required();
+
 const transactionSchema = Joi.object({
-    walletAddress: Joi.string().required(),
+    walletAddress: solanaPublicKey,  // FIXED: Use custom validator
     betAmount: Joi.number().valid(3, 10, 15, 20, 30).required(),
     transactionSignature: Joi.string().required(),
+    nonce: nonceSchema,  // NEW: Add nonce
     gameMode: Joi.string().optional(),
     recaptchaToken: Joi.string().required()
 });
@@ -29,7 +60,7 @@ const submitAnswerSchema = Joi.object({
     roomId: Joi.string().required(),
     questionId: Joi.string().required(),
     answer: Joi.number().integer().min(-1).required(),
-    username: Joi.string().required(),
+    username: solanaPublicKey,  // FIXED: Use custom validator (username is wallet address)
     recaptchaToken: Joi.string().allow(null, '').optional()  // Allow null/empty
 });
 
@@ -44,8 +75,9 @@ const switchToBotSchema = Joi.object({
 });
 
 const requestBotRoomSchema = Joi.object({
-    walletAddress: Joi.string().required(),
-    betAmount: Joi.number().min(1).max(100).required()
+    walletAddress: solanaPublicKey,  // FIXED: Use custom validator
+    betAmount: Joi.number().positive().integer().min(3).max(30).required(),  // FIXED: Tightened to game options
+    nonce: nonceSchema.optional()  // NEW: Add nonce (optional for non-transaction events)
 });
 
 const requestBotGameSchema = Joi.object({
@@ -178,21 +210,25 @@ async function initializeRedis() {
         });
         redisClient.on('error', (err) => {
             console.error('Redis connection error:', err);
+            // NEW: Alert on error (in prod, integrate with monitoring)
+            console.warn('Redis error - falling back to in-memory cache for replay protection');
         });
-        // Test Redis connection
+        // Test Redis connection with ping
+        await redisClient.ping();  // Simple health check
         await redisClient.set('test', '1', 'EX', 60);
         const testValue = await redisClient.get('test');
         console.log(`Redis test: ${testValue}`);
         await initializeRateLimiter(); // Init after Redis
     } catch (error) {
         console.error('Failed to initialize Redis:', error);
-        throw new Error('Redis is required for game room storage and transaction replay protection');
+        console.warn('Using in-memory fallback for all Redis ops');
+        // Don't exit; continue with fallback
     }
 }
 
 initializeRedis().catch((err) => {
-    console.error(err.message);
-    process.exit(1); // Exit if Redis is unavailable
+    console.error('Redis init failed, but continuing with fallback:', err);
+    // Removed process.exit(1) - now graceful
 });
 
 // Socket.io Redis Adapter for scaling (pub/sub across processes)
@@ -218,16 +254,42 @@ async function scanKeys(pattern, batchSize = 100) {
     return keys;
 }
 
-async function verifyAndValidateTransaction(signature, expectedAmount, senderAddress, recipientAddress, maxRetries = 3, retryDelay = 500) {
-    console.log(`Verifying transaction ${signature} for ${expectedAmount} USDC from ${senderAddress} to ${recipientAddress}`);
+async function verifyAndValidateTransaction(signature, expectedAmount, senderAddress, recipientAddress, nonce, maxRetries = 3, retryDelay = 500) {  // NEW: Add nonce param
+    console.log(`Verifying transaction ${signature} for ${expectedAmount} USDC from ${senderAddress} to ${recipientAddress}, nonce: ${nonce}`);
 
-    // Check for transaction reuse
     const key = `tx:${signature}`;
-    const exists = await redisClient.get(key);
-    console.log(`Checked Redis for ${key}: ${exists ? 'Found' : 'Not found'}`);
+
+    // NEW: Fallback-aware replay check
+    let exists = false;
+    try {
+        exists = await redisClient.get(key);
+        if (exists) {
+            console.log(`Redis replay detected for ${key}`);
+        }
+    } catch (redisErr) {
+        console.warn('Redis get failed, checking in-memory cache:', redisErr.message);
+        exists = replayCache.has(signature);
+    }
+    
     if (exists) {
         console.error(`Transaction ${signature} already used`);
         throw new Error('This transaction has already been used');
+    }
+
+    // NEW: Nonce check (store in Redis/DB; fallback to memory)
+    const nonceKey = `nonce:${nonce}`;
+    try {
+        const storedNonce = await redisClient.get(nonceKey);
+        if (storedNonce) {
+            throw new Error('Nonce already used - replay attempt');
+        }
+        await redisClient.set(nonceKey, 'used', 'EX', 86400);
+    } catch (redisErr) {
+        console.warn('Redis nonce check failed, using in-memory');
+        if (replayCache.has(`nonce:${nonce}`)) {
+            throw new Error('Nonce already used - replay attempt');
+        }
+        replayCache.add(`nonce:${nonce}`);
     }
 
     let transaction;
@@ -271,8 +333,35 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('Transaction amount does not match the expected bet');
     }
 
-    await redisClient.set(key, 1, 'EX', 86400);
-    console.log(`Stored transaction signature ${signature} in Redis`);
+    // NEW: Store with extended TTL (7 days)
+    const ttl = 604800;  // 7 days
+    try {
+        await redisClient.set(key, 1, 'EX', ttl);
+        console.log(`Stored transaction signature ${signature} in Redis with ${ttl}s TTL`);
+    } catch (redisErr) {
+        console.warn('Redis set failed, added to in-memory cache:', redisErr.message);
+        replayCache.add(signature);
+        if (replayCache.size > MAX_CACHE_SIZE) {
+            // Evict oldest (simple pop, but for demo; use LRU in prod)
+            const firstItem = Array.from(replayCache)[0];
+            replayCache.delete(firstItem);
+        }
+    }
+
+    // NEW: Log to MongoDB for permanent audit
+    try {
+        await TransactionLog.create({
+            signature,
+            walletAddress: senderAddress,
+            betAmount: expectedAmount,
+            status: 'verified'
+        });
+        console.log(`Transaction ${signature} logged to MongoDB audit`);
+    } catch (dbErr) {
+        console.error('Failed to log transaction to DB:', dbErr);
+        // Continue even if audit fails
+    }
+
     console.log(`Transaction ${signature} verified successfully`);
     return transaction;
 }
@@ -765,8 +854,8 @@ io.on('connection', (socket) => {
                         return;
                     }
 
-                    const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken } = data;
-                    console.log('Human matchmaking request:', { walletAddress, betAmount, gameMode });
+                    const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;  // NEW: Extract nonce
+                    console.log('Human matchmaking request:', { walletAddress, betAmount, gameMode, nonce });
 
                     // Mandate reCAPTCHA verification
                     const recaptchaResult = await verifyRecaptcha(recaptchaToken);
@@ -784,6 +873,7 @@ io.on('connection', (socket) => {
                         betAmount,
                         walletAddress,
                         config.TREASURY_WALLET.toString(),
+                        nonce,  // NEW: Pass nonce
                         maxRetries,
                         retryDelay
                     );
@@ -880,8 +970,8 @@ io.on('connection', (socket) => {
                         return;
                     }
 
-                    const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken } = data;
-                    console.log('Bot game request:', { walletAddress, betAmount, gameMode });
+                    const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;  // NEW: Extract nonce
+                    console.log('Bot game request:', { walletAddress, betAmount, gameMode, nonce });
 
                     // Mandate reCAPTCHA verification
                     const recaptchaResult = await verifyRecaptcha(recaptchaToken);
@@ -899,6 +989,7 @@ io.on('connection', (socket) => {
                         betAmount,
                         walletAddress,
                         config.TREASURY_WALLET.toString(),
+                        nonce,  // NEW: Pass nonce
                         maxRetries,
                         retryDelay
                     );

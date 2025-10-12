@@ -249,6 +249,20 @@
                 return accountInfo;
             }
         };
+
+        // UUID v4 generator for nonces (replay protection)
+        function generateUUID() {
+            if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+                return crypto.randomUUID();
+            }
+            // Fallback for older browsers
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                const r = Math.random() * 16 | 0;
+                const v = c === 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+
         const socket = io('http://localhost:5000'); // Auto-upgrade (remove transports: ['polling'] if WS works)
 
         socket.on('connect_error', (err) => {
@@ -754,6 +768,18 @@
             console.log('UI reset after error');
         }
 
+        // NEW: Client-side pre-validation function for bet and wallet
+        function validateBetAndWallet(betAmount, wallet) {
+            // Validate bet amount
+            if (!Number.isInteger(betAmount) || betAmount < 3 || betAmount > 30) {
+                throw new Error('Invalid bet amount. Must be 3, 10, 15, 20, or 30 USDC.');
+            }
+            // Rough base58 regex for wallet (server will do full PublicKey check)
+            if (!wallet || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(wallet)) {
+                throw new Error('Invalid wallet address format.');
+            }
+            return true;
+        }
         
         joinGameBtn.addEventListener('click', async () => {
             try {
@@ -1300,6 +1326,9 @@
                         throw new Error('No bet amount available. Please start a new game.');
                     }
                     
+                    // FIXED: Client-side pre-validation
+                    validateBetAndWallet(currentBetAmount, connectedWallet);
+                    
                     waitingMessage.textContent = 'Preparing transaction for matchmaking...';
                     const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount);
                     const signedTransaction = await window.solana.signTransaction(transaction);
@@ -1312,18 +1341,17 @@
                         throw new Error('reCAPTCHA token required for bet placement.');
                     }
                     
-                    //waitingMessage.textContent = 'Testing fake signature for human matchmaking...';
-                    //const fakeSignature = 'INVALID_SIGNATURE_12345'; // Fake signature
-                    //console.log('Using fake transaction signature:', fakeSignature);
-                    //waitingMessage.textContent = 'Testing reused signature for human matchmaking...';
-                    //const reusedSignature = '5chazeT2yF1vfYnJUGxFhSsJ9DVJAEtM937bkiiKuRPVzbZcSmjqaUphsoRPnv1j7SumrcxJS8n4abzbE1bWa6WA'; // Replace with your signature
-                    //console.log('Using reused transaction signature:', reusedSignature);
+                    // Generate nonce for replay protection
+                    const nonce = generateUUID();
+                    console.log('Generated nonce for human matchmaking:', nonce);
+                    
                     socket.emit('joinHumanMatchmaking', {
                         walletAddress: connectedWallet,
                         betAmount: currentBetAmount,
                         transactionSignature: txSignature,
                         gameMode: 'human',
-                        recaptchaToken
+                        recaptchaToken,
+                        nonce  // NEW: Add nonce for replay protection
                     });
                     waitingMessage.textContent = 'Looking for another player...';
                     await updateBalance();
@@ -1347,6 +1375,9 @@
                         throw new Error('No bet amount available. Please start a new game.');
                     }
                     
+                    // FIXED: Client-side pre-validation
+                    validateBetAndWallet(currentBetAmount, connectedWallet);
+                    
                     waitingMessage.textContent = 'Preparing transaction for bot game...';
                     const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount);
                     const signedTransaction = await window.solana.signTransaction(transaction);
@@ -1359,18 +1390,17 @@
                         throw new Error('reCAPTCHA token required for bet placement.');
                     }
                     
-                    //waitingMessage.textContent = 'Testing fake signature for bot game...';
-                    //const fakeBotSignature = 'INVALID_SIGNATURE_12345'; // Fake signature
-                    //console.log('Using fake transaction signature:', fakeBotSignature);
-                    //waitingMessage.textContent = 'Testing reused signature for human matchmaking...';
-                    //const reusedSignature = '5chazeT2yF1vfYnJUGxFhSsJ9DVJAEtM937bkiiKuRPVzbZcSmjqaUphsoRPnv1j7SumrcxJS8n4abzbE1bWa6WA'; // Replace with your signature
-                    //console.log('Using reused transaction signature:', reusedSignature);
+                    // Generate nonce for replay protection
+                    const nonce = generateUUID();
+                    console.log('Generated nonce for bot game:', nonce);
+                    
                     socket.emit('joinBotGame', {
                         walletAddress: connectedWallet,
                         betAmount: currentBetAmount,
                         transactionSignature: txSignature,
                         gameMode: 'bot',
-                        recaptchaToken
+                        recaptchaToken,
+                        nonce  // NEW: Add nonce for replay protection
                     });
                     waitingMessage.textContent = 'Creating a game with a bot opponent...';
                     await updateBalance();
