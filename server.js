@@ -391,6 +391,17 @@ async function rateLimitEvent(walletAddress, eventName, maxRequests = 5, windowS
     await redisClient.set(key, parseInt(count) + 1, 'EX', windowSeconds);
 }
 
+// FIXED: Add Redis rate limiter for failed reCAPTCHA (max 5 per IP per hour)
+async function rateLimitFailedRecaptcha(ip) {
+    const key = `recaptcha_fail:${ip}`;
+    const attempts = await redisClient.get(key) || 0;
+    if (parseInt(attempts) >= 5) {
+        throw new Error('Too many failed verification attempts. Try again in 1 hour.');
+    }
+    await redisClient.incr(key);
+    await redisClient.expire(key, 3600); // 1 hour TTL
+}
+
 // Enhanced: Socket-specific rate-limit
 async function rateLimitSocket(socket, points = 100, duration = 60) {
     try {
@@ -575,11 +586,7 @@ io.on('connection', (socket) => {
             }
             console.log('Wallet login attempt:', { walletAddress, recaptchaToken: !!recaptchaToken });
             
-            if (!recaptchaToken) {
-                console.warn(`reCAPTCHA token missing for wallet ${walletAddress}`);
-                return socket.emit('loginFailure', 'reCAPTCHA verification required.');
-            }
-            
+            // FIXED: Rate limit login attempts (existing) + failed reCAPTCHA specifically
             if (redisClient) {
                 const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                 const loginLimitKey = `login:${clientIP}`;
@@ -590,19 +597,44 @@ io.on('connection', (socket) => {
                     return socket.emit('loginFailure', 'Too many login attempts. Please try again later.');
                 }
                 await redisClient.set(loginLimitKey, parseInt(loginAttempts) + 1, 'EX', 3600);
+                
+                // FIXED: New - rate limit failed reCAPTCHA attempts
+                try {
+                    await rateLimitFailedRecaptcha(clientIP);
+                } catch (rateError) {
+                    console.warn(`reCAPTCHA rate limit hit for IP ${clientIP}:`, rateError.message);
+                    return socket.emit('loginFailure', rateError.message);
+                }
             }
             
-            console.log('reCAPTCHA enabled, attempting verification');
+            // FIXED: Enforce reCAPTCHA - throw if fails (no fallback success)
+            let recaptchaResult;
             try {
-                const recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                console.log('reCAPTCHA verification result:', recaptchaResult);
-                if (!recaptchaResult.success) {
-                    console.warn(`reCAPTCHA verification failed for wallet ${walletAddress}`);
-                    return socket.emit('loginFailure', 'Verification failed. Please try again.');
-                }
+                recaptchaResult = await verifyRecaptcha(recaptchaToken);
             } catch (error) {
-                console.error('reCAPTCHA verification error:', error);
-                return socket.emit('loginFailure', 'Verification service unavailable. Please try again later.');
+                // FIXED: Log failure for rate limiting, then emit error
+                if (redisClient) {
+                    const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                    await rateLimitFailedRecaptcha(clientIP); // Increment on failure
+                }
+                console.warn(`reCAPTCHA verification failed for wallet ${walletAddress}: ${error.message}`);
+                return socket.emit('loginFailure', error.message);
+            }
+            console.log('reCAPTCHA verification result:', recaptchaResult);
+            
+            // FIXED: Fallback anomaly check if reCAPTCHA disabled (basic clientData validation)
+            if (process.env.ENABLE_RECAPTCHA !== 'true') {
+                const anomalies = [];
+                if (!clientData) anomalies.push('missing clientData');
+                else {
+                    // Example checks: impossible values
+                    if (clientData.timezone && !Intl.supportedValuesOf('timeZone').includes(clientData.timezone)) anomalies.push('invalid timezone');
+                    if (clientData.screenResolution && !/^\d+x\d+$/.test(clientData.screenResolution)) anomalies.push('invalid resolution');
+                }
+                if (anomalies.length > 0) {
+                    console.warn(`Client data anomalies for ${walletAddress}: ${anomalies.join(', ')}`);
+                    return socket.emit('loginFailure', 'Invalid client information. Please try again.');
+                }
             }
 
             try {
@@ -857,12 +889,19 @@ io.on('connection', (socket) => {
                     const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;  // NEW: Extract nonce
                     console.log('Human matchmaking request:', { walletAddress, betAmount, gameMode, nonce });
 
-                    // Mandate reCAPTCHA verification
-                    const recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                    if (!recaptchaResult.success) {
-                        console.error('reCAPTCHA failed for human matchmaking');
-                        socket.emit('joinGameFailure', 'Captcha verification failed.');
+                    // FIXED: Strict reCAPTCHA enforcement
+                    let recaptchaResult;
+                    try {
+                        recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                    } catch (error) {
+                        console.error('reCAPTCHA failed for human matchmaking:', error.message);
+                        socket.emit('joinGameFailure', error.message);  // Use error message directly
                         return;
+                    }
+                    // FIXED: Increment failed attempts
+                    if (redisClient) {
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitFailedRecaptcha(clientIP);
                     }
 
                     const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
@@ -973,12 +1012,19 @@ io.on('connection', (socket) => {
                     const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;  // NEW: Extract nonce
                     console.log('Bot game request:', { walletAddress, betAmount, gameMode, nonce });
 
-                    // Mandate reCAPTCHA verification
-                    const recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                    if (!recaptchaResult.success) {
-                        console.error('reCAPTCHA failed for bot game');
-                        socket.emit('joinGameFailure', 'Captcha verification failed.');
+                    // FIXED: Strict reCAPTCHA enforcement
+                    let recaptchaResult;
+                    try {
+                        recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                    } catch (error) {
+                        console.error('reCAPTCHA failed for bot game:', error.message);
+                        socket.emit('joinGameFailure', error.message);  // Use error message directly
                         return;
+                    }
+                    // FIXED: Increment failed attempts
+                    if (redisClient) {
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitFailedRecaptcha(clientIP);
                     }
 
                     const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
@@ -2323,10 +2369,15 @@ function generateRoomId() {
 }
 
 
+// FIXED: Enhanced verifyRecaptcha with strict enforcement and error throwing
 async function verifyRecaptcha(token) {
     if (process.env.ENABLE_RECAPTCHA !== 'true') {
         console.log('reCAPTCHA verification skipped (disabled in config)');
         return { success: true, score: 1.0 };
+    }
+    if (!token) {
+        console.error('reCAPTCHA token missing');
+        throw new Error('reCAPTCHA token required');
     }
     try {
         const secretKey = process.env.RECAPTCHA_SECRET_KEY;
@@ -2344,22 +2395,22 @@ async function verifyRecaptcha(token) {
         
         console.log('reCAPTCHA verification response:', response.data);
         
-        // Add proper validation
+        // FIXED: Strict enforcement - throw on failure
         if (!response.data.success) {
             console.warn('reCAPTCHA verification failed:', response.data['error-codes']);
-            return { success: false, error: response.data['error-codes'] };
+            throw new Error('reCAPTCHA verification failed');
         }
         
-        // Validate score for v3 (threshold 0.5 is recommended by Google)
+        // FIXED: Enforce score threshold for v3
         if (response.data.score !== undefined && response.data.score < 0.5) {
             console.warn(`reCAPTCHA score too low: ${response.data.score}`);
-            return { success: false, score: response.data.score, error: 'Bot activity suspected' };
+            throw new Error('Bot activity suspected (low reCAPTCHA score)');
         }
         
         return { success: true, score: response.data.score };
     } catch (error) {
         console.error('reCAPTCHA verification error:', error);
-        return { success: false, error: 'Verification service error' };
+        throw new Error('Verification service unavailable. Please try again later.');
     }
 }
 

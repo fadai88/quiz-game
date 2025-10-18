@@ -839,14 +839,14 @@
             
             const selectedAnswer = parseInt(selectedOption.value);
 
-            // Get reCAPTCHA token (optional for submit, but try anyway)
+            // FIXED: Also enforce in submitAnswer (if recaptchaToken is sent)
             let recaptchaToken = null;
             if (window.recaptchaEnabled) {
                 try {
                     recaptchaToken = await getRecaptchaToken('submit_answer');
                 } catch (error) {
-                    console.error('reCAPTCHA for submit failed:', error);
-                    recaptchaToken = null;  // Fallback
+                    alert('Verification required for answer submission. Please try again.');
+                    return;  // Block submission
                 }
             }
             
@@ -1278,34 +1278,25 @@
             leaderboardContainer.style.display = 'block';
         }
 
+        // FIXED: Update getRecaptchaToken to throw on failure (no null fallback)
         async function getRecaptchaToken(action) {
-            console.log('getRecaptchaToken called for:', action, '- globals:', { 
-                enabled: window.recaptchaEnabled, 
-                siteKey: window.recaptchaSiteKey ? 'Set' : 'Undefined' 
-            });
-
+            console.log('getRecaptchaToken called for:', action);
             if (!window.recaptchaEnabled || !window.grecaptcha || !window.recaptchaSiteKey) {
-                console.error('reCAPTCHA v3 not ready - globals or script missing');
-                return null;
+                if (window.recaptchaEnabled) {
+                    throw new Error('reCAPTCHA not ready - please refresh the page');
+                }
+                return null;  // Only skip if truly disabled
             }
 
-            // Wrap callback-based API in Promise
             return new Promise((resolve, reject) => {
                 grecaptcha.ready(() => {
-                    console.log('reCAPTCHA ready - executing for action:', action);
                     grecaptcha.execute(window.recaptchaSiteKey, { action: action })
                         .then((token) => {
-                            console.log('Token generated successfully');
-                            resolve(token);
+                            if (!token) reject(new Error('Empty reCAPTCHA token'));
+                            else resolve(token);
                         })
-                        .catch((error) => {
-                            console.error('Execute failed:', error);
-                            reject(error);
-                        });
+                        .catch(reject);
                 });
-            }).catch((error) => {
-                console.error('reCAPTCHA ready/execute error:', error);
-                return null;  // Graceful fallback
             });
         }
 
@@ -1335,10 +1326,11 @@
                     const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
                     console.log('Transaction signature for human matchmaking:', txSignature);
                     
-                    // Get reCAPTCHA token (mandated)
-                    const recaptchaToken = await getRecaptchaToken('place_bet');
-                    if (!recaptchaToken) {
-                        throw new Error('reCAPTCHA token required for bet placement.');
+                    // FIXED: Enforce token - throw and block on failure
+                    let recaptchaToken = null;
+                    if (window.recaptchaEnabled) {
+                        recaptchaToken = await getRecaptchaToken('place_bet');
+                        // No fallback - if fails, throw
                     }
                     
                     // Generate nonce for replay protection
@@ -1357,9 +1349,13 @@
                     await updateBalance();
                 } catch (error) {
                     console.error('Human matchmaking error:', error);
+                    if (error.message.includes('reCAPTCHA')) {
+                        alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
+                    } else {
+                        alert('Failed to join human matchmaking: ' + error.message);
+                    }
                     waitingMessage.textContent = 'Error starting matchmaking. Please try again.';
                     resetUIAfterError();
-                    alert('Failed to join human matchmaking: ' + error.message);
                 }
             };
 
@@ -1384,10 +1380,11 @@
                     const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
                     console.log('Transaction signature for bot game:', txSignature);
                     
-                    // Get reCAPTCHA token (mandated)
-                    const recaptchaToken = await getRecaptchaToken('place_bet');
-                    if (!recaptchaToken) {
-                        throw new Error('reCAPTCHA token required for bet placement.');
+                    // FIXED: Enforce token - throw and block on failure
+                    let recaptchaToken = null;
+                    if (window.recaptchaEnabled) {
+                        recaptchaToken = await getRecaptchaToken('place_bet');
+                        // No fallback - if fails, throw
                     }
                     
                     // Generate nonce for replay protection
@@ -1406,9 +1403,13 @@
                     await updateBalance();
                 } catch (error) {
                     console.error('Bot game error:', error);
+                    if (error.message.includes('reCAPTCHA')) {
+                        alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
+                    } else {
+                        alert('Failed to start bot game: ' + error.message);
+                    }
                     waitingMessage.textContent = 'Error starting bot game. Please try again.';
                     resetUIAfterError();
-                    alert('Failed to start bot game: ' + error.message);
                 }
             };
         }
