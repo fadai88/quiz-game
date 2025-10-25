@@ -209,7 +209,6 @@
                 if (document.getElementById('username').value !== '') {
                     console.log('Bot detected via honeypot field');
                     showError('Connection failed. Please try again later.');
-                    // Silently fail for bots
                     return;
                 }
                 
@@ -229,21 +228,33 @@
                     return;
                 }
 
-                // FIXED: Strict client-side enforcement - block if no token when enabled
+                // FIXED: Proper reCAPTCHA token generation
                 let recaptchaToken = null;
                 if (window.recaptchaEnabled) {
                     console.log('reCAPTCHA enabled - generating token');
                     try {
-                        await grecaptcha.ready();  // Ensure ready
-                        recaptchaToken = await grecaptcha.execute(window.recaptchaSiteKey, {action: 'wallet_connect'});
-                        if (!recaptchaToken) {
-                            throw new Error('Failed to generate reCAPTCHA token');
-                        }
+                        // Correct way to use grecaptcha.ready() with Promise wrapper
+                        recaptchaToken = await new Promise((resolve, reject) => {
+                            grecaptcha.ready(async () => {
+                                try {
+                                    const token = await grecaptcha.execute(window.recaptchaSiteKey, {
+                                        action: 'wallet_connect'
+                                    });
+                                    if (!token) {
+                                        reject(new Error('Failed to generate reCAPTCHA token'));
+                                    } else {
+                                        resolve(token);
+                                    }
+                                } catch (error) {
+                                    reject(error);
+                                }
+                            });
+                        });
                         console.log('reCAPTCHA token generated successfully');
                     } catch (error) {
                         console.error('reCAPTCHA generation failed:', error);
                         showError('Verification required. Please complete the reCAPTCHA challenge and try again.');
-                        return;  // FIXED: Block login - no fallback
+                        return;
                     }
                 } else {
                     console.log('reCAPTCHA disabled - skipping');
@@ -269,7 +280,6 @@
                     // Convert Uint8Array to base64 string for transmission
                     const signature = btoa(String.fromCharCode.apply(null, signedData.signature));
                     
-                    // FIXED: Only emit if we have the token (when required)
                     if (window.recaptchaEnabled && !recaptchaToken) {
                         throw new Error('reCAPTCHA token required for login');
                     }
@@ -304,7 +314,6 @@
                 connectButton.disabled = false;
                 connectButton.innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
                 
-                // FIXED: More specific error handling for reCAPTCHA
                 if (err.message.includes('reCAPTCHA')) {
                     showError(err.message + ' Please refresh and try again.');
                 } else {

@@ -839,12 +839,13 @@
             
             const selectedAnswer = parseInt(selectedOption.value);
 
-            // FIXED: Also enforce in submitAnswer (if recaptchaToken is sent)
+            // FIXED: Proper reCAPTCHA token generation with error handling
             let recaptchaToken = null;
             if (window.recaptchaEnabled) {
                 try {
                     recaptchaToken = await getRecaptchaToken('submit_answer');
                 } catch (error) {
+                    console.error('reCAPTCHA error on answer submission:', error);
                     alert('Verification required for answer submission. Please try again.');
                     return;  // Block submission
                 }
@@ -854,7 +855,6 @@
                 roomId: currentRoomId,
                 questionId: currentQuestionId,
                 answer: selectedAnswer,
-                username: connectedWallet,
                 hasRecaptcha: !!recaptchaToken
             });
             
@@ -862,8 +862,7 @@
                 roomId: currentRoomId, 
                 questionId: currentQuestionId, 
                 answer: selectedAnswer,
-                username: connectedWallet,
-                recaptchaToken  // Send null if failed—server handles it
+                recaptchaToken
             });
             
             submitAnswerBtn.disabled = true;
@@ -1278,9 +1277,9 @@
             leaderboardContainer.style.display = 'block';
         }
 
-        // FIXED: Update getRecaptchaToken to throw on failure (no null fallback)
         async function getRecaptchaToken(action) {
             console.log('getRecaptchaToken called for:', action);
+            
             if (!window.recaptchaEnabled || !window.grecaptcha || !window.recaptchaSiteKey) {
                 if (window.recaptchaEnabled) {
                     throw new Error('reCAPTCHA not ready - please refresh the page');
@@ -1288,17 +1287,29 @@
                 return null;  // Only skip if truly disabled
             }
 
-            return new Promise((resolve, reject) => {
-                grecaptcha.ready(() => {
-                    grecaptcha.execute(window.recaptchaSiteKey, { action: action })
-                        .then((token) => {
-                            if (!token) reject(new Error('Empty reCAPTCHA token'));
-                            else resolve(token);
-                        })
-                        .catch(reject);
+            try {
+                // Correct Promise wrapper for grecaptcha.ready()
+                const token = await new Promise((resolve, reject) => {
+                    grecaptcha.ready(() => {
+                        grecaptcha.execute(window.recaptchaSiteKey, { action: action })
+                            .then((token) => {
+                                if (!token) {
+                                    reject(new Error('Empty reCAPTCHA token'));
+                                } else {
+                                    resolve(token);
+                                }
+                            })
+                            .catch(reject);
+                    });
                 });
-            });
+                
+                return token;
+            } catch (error) {
+                console.error('reCAPTCHA token generation failed:', error);
+                throw new Error('Verification failed. Please try again.');
+            }
         }
+
 
         function showGameChoiceModal() {
             console.log('Showing game choice modal');
@@ -1317,7 +1328,6 @@
                         throw new Error('No bet amount available. Please start a new game.');
                     }
                     
-                    // FIXED: Client-side pre-validation
                     validateBetAndWallet(currentBetAmount, connectedWallet);
                     
                     waitingMessage.textContent = 'Preparing transaction for matchmaking...';
@@ -1326,14 +1336,20 @@
                     const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
                     console.log('Transaction signature for human matchmaking:', txSignature);
                     
-                    // FIXED: Enforce token - throw and block on failure
+                    // FIXED: Proper token generation with try-catch
                     let recaptchaToken = null;
                     if (window.recaptchaEnabled) {
-                        recaptchaToken = await getRecaptchaToken('place_bet');
-                        // No fallback - if fails, throw
+                        try {
+                            recaptchaToken = await getRecaptchaToken('place_bet');
+                        } catch (error) {
+                            console.error('reCAPTCHA failed for human matchmaking:', error);
+                            alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
+                            waitingMessage.textContent = 'Verification failed. Please try again.';
+                            resetUIAfterError();
+                            return;
+                        }
                     }
                     
-                    // Generate nonce for replay protection
                     const nonce = generateUUID();
                     console.log('Generated nonce for human matchmaking:', nonce);
                     
@@ -1343,13 +1359,13 @@
                         transactionSignature: txSignature,
                         gameMode: 'human',
                         recaptchaToken,
-                        nonce  // NEW: Add nonce for replay protection
+                        nonce
                     });
                     waitingMessage.textContent = 'Looking for another player...';
                     await updateBalance();
                 } catch (error) {
                     console.error('Human matchmaking error:', error);
-                    if (error.message.includes('reCAPTCHA')) {
+                    if (error.message.includes('reCAPTCHA') || error.message.includes('Verification')) {
                         alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
                     } else {
                         alert('Failed to join human matchmaking: ' + error.message);
@@ -1371,7 +1387,6 @@
                         throw new Error('No bet amount available. Please start a new game.');
                     }
                     
-                    // FIXED: Client-side pre-validation
                     validateBetAndWallet(currentBetAmount, connectedWallet);
                     
                     waitingMessage.textContent = 'Preparing transaction for bot game...';
@@ -1380,14 +1395,20 @@
                     const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
                     console.log('Transaction signature for bot game:', txSignature);
                     
-                    // FIXED: Enforce token - throw and block on failure
+                    // FIXED: Proper token generation with try-catch
                     let recaptchaToken = null;
                     if (window.recaptchaEnabled) {
-                        recaptchaToken = await getRecaptchaToken('place_bet');
-                        // No fallback - if fails, throw
+                        try {
+                            recaptchaToken = await getRecaptchaToken('place_bet');
+                        } catch (error) {
+                            console.error('reCAPTCHA failed for bot game:', error);
+                            alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
+                            waitingMessage.textContent = 'Verification failed. Please try again.';
+                            resetUIAfterError();
+                            return;
+                        }
                     }
                     
-                    // Generate nonce for replay protection
                     const nonce = generateUUID();
                     console.log('Generated nonce for bot game:', nonce);
                     
@@ -1397,13 +1418,13 @@
                         transactionSignature: txSignature,
                         gameMode: 'bot',
                         recaptchaToken,
-                        nonce  // NEW: Add nonce for replay protection
+                        nonce
                     });
                     waitingMessage.textContent = 'Creating a game with a bot opponent...';
                     await updateBalance();
                 } catch (error) {
                     console.error('Bot game error:', error);
-                    if (error.message.includes('reCAPTCHA')) {
+                    if (error.message.includes('reCAPTCHA') || error.message.includes('Verification')) {
                         alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
                     } else {
                         alert('Failed to start bot game: ' + error.message);

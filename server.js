@@ -60,8 +60,7 @@ const submitAnswerSchema = Joi.object({
     roomId: Joi.string().required(),
     questionId: Joi.string().required(),
     answer: Joi.number().integer().min(-1).required(),
-    username: solanaPublicKey,  // FIXED: Use custom validator (username is wallet address)
-    recaptchaToken: Joi.string().allow(null, '').optional()  // Allow null/empty
+    recaptchaToken: Joi.string().allow(null, '').optional()  // username removed - will use socket.user.walletAddress
 });
 
 const playerReadySchema = Joi.object({
@@ -526,7 +525,15 @@ class TriviaBot {
     }
 }
 
-// io.use(authMiddleware);
+// Enable authentication middleware with exemptions for login events
+io.use((socket, next) => {
+    // Allow these events without authentication
+    const eventName = socket.handshake.auth?.event;
+    
+    // For now, we'll check authentication in individual event handlers
+    // This allows us to have more granular control over which events require auth
+    next();
+});
 
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
@@ -1344,18 +1351,25 @@ io.on('connection', (socket) => {
                         socket.emit('gameError', `Error: ${error.message}`);
                     }
                 } else if (event === 'submitAnswer') {
-                    const { roomId, questionId, answer, username, recaptchaToken } = args[0];
+                    const { roomId, questionId, answer, recaptchaToken } = args[0];  // Remove username from destructure
                     try {
-                        const { error } = submitAnswerSchema.validate({ roomId, questionId, answer, username, recaptchaToken });
+                        const { error } = submitAnswerSchema.validate({ roomId, questionId, answer, recaptchaToken });
                         if (error) {
                             console.error('Validation error in submitAnswer:', error.message);
                             socket.emit('answerError', `Invalid input: ${error.message}`);
                             return;
                         }
 
-                        await rateLimitEvent(username, 'submitAnswer', 10, 60);
+                        // Use authenticated wallet from socket.user (set during login)
+                        if (!socket.user || !socket.user.walletAddress) {
+                            socket.emit('answerError', 'Not authenticated');
+                            return;
+                        }
 
-                        console.log(`Received answer from ${username} in room ${roomId} for question ${questionId}:`, { answer });
+                        const authenticatedUsername = socket.user.walletAddress;  // ✅ Secure
+                        await rateLimitEvent(authenticatedUsername, 'submitAnswer', 10, 60);
+
+                        console.log(`Received answer from ${authenticatedUsername} in room ${roomId} for question ${questionId}:`, { answer });
 
                         let room = await getGameRoom(roomId);
                         if (!room) {
@@ -1365,7 +1379,7 @@ io.on('connection', (socket) => {
                         }
 
                         if (!room.questionStartTime || room.currentQuestionIndex >= room.questions.length) {
-                            console.error(`No active question in room ${roomId} when ${username} submitted answer`);
+                            console.error(`No active question in room ${roomId} when ${authenticatedUsername} submitted answer`);
                             socket.emit('answerError', 'No active question');
                             return;
                         }
@@ -1377,30 +1391,30 @@ io.on('connection', (socket) => {
                             return;
                         }
 
-                        const player = room.players.find(p => p.username === username && !p.isBot);
+                        const player = room.players.find(p => p.username === authenticatedUsername && !p.isBot);
                         if (!player) {
-                            console.error(`Player ${username} not found in room ${roomId} or is a bot`);
+                            console.error(`Player ${authenticatedUsername} not found in room ${roomId} or is a bot`);
                             socket.emit('answerError', 'Player not found');
                             return;
                         }
 
                         if (player.answered) {
-                            console.log(`Player ${username} already answered this question`);
+                            console.log(`Player ${authenticatedUsername} already answered this question`);
                             socket.emit('answerError', 'Already answered');
                             return;
                         }
 
                         const serverResponseTime = Date.now() - room.questionStartTime;
                         if (serverResponseTime < 200 || serverResponseTime > 15000) {
-                            console.warn(`Invalid response time ${serverResponseTime}ms from ${username} in room ${roomId}`);
-                            await redisClient.set(`suspect:${username}`, 1, 'EX', 3600);
+                            console.warn(`Invalid response time ${serverResponseTime}ms from ${authenticatedUsername} in room ${roomId}`);
+                            await redisClient.set(`suspect:${authenticatedUsername}`, 1, 'EX', 3600);
                             socket.emit('answerError', 'Invalid response timing');
                             return;
                         }
 
                         // Bot suspicion score
-                        const botSuspicion = botDetector.getSuspicionScore(username);
-                        console.log(`Bot suspicion for ${username}: ${botSuspicion}`);
+                        const botSuspicion = botDetector.getSuspicionScore(authenticatedUsername);
+                        console.log(`Bot suspicion for ${authenticatedUsername}: ${botSuspicion}`);
 
                         // reCAPTCHA: Skip if null or low suspicion; otherwise verify
                         let skipCaptcha = !recaptchaToken || botSuspicion < 30;  // FIXED: Use recaptchaToken, not data
@@ -1410,16 +1424,16 @@ io.on('connection', (socket) => {
                                 socket.emit('answerError', 'Verification failed for answer submission.');
                                 return;
                             }
-                            console.log(`reCAPTCHA verified for ${username} (score: ${recaptchaResult.score || 'N/A'})`);
+                            console.log(`reCAPTCHA verified for ${authenticatedUsername} (score: ${recaptchaResult.score || 'N/A'})`);
                         } else {
-                            console.log(`Skipping reCAPTCHA for ${username} (suspicion: ${botSuspicion})`);
+                            console.log(`Skipping reCAPTCHA for ${authenticatedUsername} (suspicion: ${botSuspicion})`);
                         }
 
                         // Device fingerprint check (only if not skipping)
-                        const user = await User.findOne({ walletAddress: username });
+                        const user = await User.findOne({ walletAddress: authenticatedUsername });
                         if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint && !skipCaptcha) {
-                            console.warn(`Device fingerprint mismatch for ${username} in submitAnswer`);
-                            botDetector.trackEvent(username, 'fingerprint_mismatch', { event: 'submitAnswer' });
+                            console.warn(`Device fingerprint mismatch for ${authenticatedUsername} in submitAnswer`);
+                            botDetector.trackEvent(authenticatedUsername, 'fingerprint_mismatch', { event: 'submitAnswer' });
                             // Re-verify if mismatch (even if low suspicion)
                             const recaptchaResult = await verifyRecaptcha(recaptchaToken);
                             if (!recaptchaResult.success) {
@@ -1434,10 +1448,10 @@ io.on('connection', (socket) => {
                                 socket.emit('answerError', 'Additional verification required due to high win rate.');
                                 return;
                             }
-                            console.log(`High-win verification passed for ${username}`);
+                            console.log(`High-win verification passed for ${authenticatedUsername}`);
                         }
 
-                        console.log(`SERVER CALCULATED: ${username} response time: ${serverResponseTime}ms`);
+                        console.log(`SERVER CALCULATED: ${authenticatedUsername} response time: ${serverResponseTime}ms`);
 
                         const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
                         player.answered = true;
@@ -1447,10 +1461,10 @@ io.on('connection', (socket) => {
 
                         if (isCorrect) {
                             player.score = (player.score || 0) + 1;
-                            console.log(`Correct answer from ${username}. New score: ${player.score}`);
+                            console.log(`Correct answer from ${authenticatedUsername}. New score: ${player.score}`);
                             try {
                                 await User.findOneAndUpdate(
-                                    { walletAddress: username },
+                                    { walletAddress: authenticatedUsername },
                                     {
                                         $inc: {
                                             correctAnswers: 1,
@@ -1464,7 +1478,7 @@ io.on('connection', (socket) => {
                         }
 
                         // BotDetector integration
-                        botDetector.trackEvent(username, 'answer_submitted', {
+                        botDetector.trackEvent(authenticatedUsername, 'answer_submitted', {
                             responseTime: serverResponseTime,
                             isCorrect,
                             answer,
@@ -1482,7 +1496,7 @@ io.on('connection', (socket) => {
                         });
 
                         socket.to(roomId).emit('playerAnswered', {
-                            username,
+                            username: authenticatedUsername,
                             isBot: false,
                             responseTime: serverResponseTime,
                             timedOut: false
