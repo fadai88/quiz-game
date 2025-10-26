@@ -292,6 +292,7 @@
         let phantomProvider = null;
         let balanceUpdateInterval;
         let gameTransactionInfo = null;
+        let isProcessingBet = false;  // NEW: Prevent multi-clicks
 
 
         const joinGameBtn = document.getElementById('joinGameBtn');
@@ -484,6 +485,14 @@
                         data
                     });
 
+                    // NEW: Add unique memo for anti-dupe (prevents identical tx bytes across sessions)
+                    const memoText = `bet-${betAmount}-${generateUUID()}-${Date.now()}`;  // e.g., "bet-10-uuid-1234567890"
+                    const memoIx = new solanaWeb3.TransactionInstruction({
+                        keys: [],  // No accounts needed
+                        programId: new solanaWeb3.PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),  // Standard Memo program
+                        data: Buffer.from(memoText, 'utf8')  // ~20-40 unique bytes
+                    });
+
                     // Create transaction
                     const transaction = new solanaWeb3.Transaction();
                     
@@ -493,7 +502,9 @@
                     transaction.lastValidBlockHeight = lastValidBlockHeight;
                     transaction.feePayer = fromWallet;
                     
-                    // Add instruction
+                    // NEW: Add memo FIRST (ensures uniqueness in tx message)
+                    transaction.add(memoIx);
+                    // Add instruction (existing transfer)
                     transaction.add(transferInstruction);
 
                     console.log('Created transfer transaction:', {
@@ -502,6 +513,8 @@
                         amount: amount,
                         feePayer: fromWallet.toString()
                     });
+                    // NEW: Optional log for debugging uniqueness
+                    console.log('Created unique tx with memo:', memoText);
 
                     return transaction;
                 } catch (error) {
@@ -765,6 +778,12 @@
             currentRoomId = null;
             currentBetAmount = null;
             gameTransactionInfo = null;
+            // NEW: Re-enable choice buttons
+            document.getElementById('playAgainstBotBtn').disabled = false;
+            document.getElementById('playAgainstBotBtn').textContent = 'Play Against Bot';
+            document.getElementById('waitForPlayerBtn').disabled = false;
+            document.getElementById('waitForPlayerBtn').textContent = 'Playing against human';
+            isProcessingBet = false;
             console.log('UI reset after error');
         }
 
@@ -1317,6 +1336,11 @@
             modal.style.display = 'flex';
 
             document.getElementById('waitForPlayerBtn').onclick = async function() {
+                if (isProcessingBet) {  // NEW: Guard against multi-click
+                    console.log('Bet already in progress—ignoring click');
+                    return;
+                }
+                isProcessingBet = true;  // NEW: Set flag
                 try {
                     console.log('Player chose to play against human');
                     modal.style.display = 'none';
@@ -1330,7 +1354,11 @@
                     
                     validateBetAndWallet(currentBetAmount, connectedWallet);
                     
+                    // NEW: Disable the button immediately to prevent double-clicks
+                    this.disabled = true;
+                    this.textContent = 'Processing...';
                     waitingMessage.textContent = 'Preparing transaction for matchmaking...';
+                    
                     const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount);
                     const signedTransaction = await window.solana.signTransaction(transaction);
                     const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
@@ -1345,8 +1373,7 @@
                             console.error('reCAPTCHA failed for human matchmaking:', error);
                             alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
                             waitingMessage.textContent = 'Verification failed. Please try again.';
-                            resetUIAfterError();
-                            return;
+                            throw error;  // Re-throw to trigger reset
                         }
                     }
                     
@@ -1372,10 +1399,20 @@
                     }
                     waitingMessage.textContent = 'Error starting matchmaking. Please try again.';
                     resetUIAfterError();
+                } finally {
+                    isProcessingBet = false;  // NEW: Reset flag
+                    // NEW: Re-enable button only if not in error state (handled in resetUIAfterError)
+                    this.disabled = false;
+                    this.textContent = 'Playing against human';  // Reset text
                 }
             };
 
             document.getElementById('playAgainstBotBtn').onclick = async function() {
+                if (isProcessingBet) {  // NEW: Guard against multi-click
+                    console.log('Bet already in progress—ignoring click');
+                    return;
+                }
+                isProcessingBet = true;  // NEW: Set flag
                 try {
                     console.log('Player chose to play against bot');
                     modal.style.display = 'none';
@@ -1389,10 +1426,22 @@
                     
                     validateBetAndWallet(currentBetAmount, connectedWallet);
                     
+                    // NEW: Disable the button immediately to prevent double-clicks
+                    this.disabled = true;
+                    this.textContent = 'Processing...';
                     waitingMessage.textContent = 'Preparing transaction for bot game...';
+                    
                     const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount);
                     const signedTransaction = await window.solana.signTransaction(transaction);
-                    const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
+                    
+                    // NEW: Log the signature for debugging (remove in prod)
+                    const rawTx = signedTransaction.serialize();
+                    console.log('About to send tx (first 8 bytes for debug):', Array.from(rawTx.slice(0, 8)));
+                    
+                    const txSignature = await connection.sendRawTransaction(rawTx, {
+                        skipPreflight: false,  // Ensures simulation runs
+                        preflightCommitment: 'confirmed'
+                    });
                     console.log('Transaction signature for bot game:', txSignature);
                     
                     // FIXED: Proper token generation with try-catch
@@ -1404,8 +1453,7 @@
                             console.error('reCAPTCHA failed for bot game:', error);
                             alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
                             waitingMessage.textContent = 'Verification failed. Please try again.';
-                            resetUIAfterError();
-                            return;
+                            throw error;  // Re-throw to trigger reset
                         }
                     }
                     
@@ -1431,6 +1479,11 @@
                     }
                     waitingMessage.textContent = 'Error starting bot game. Please try again.';
                     resetUIAfterError();
+                } finally {
+                    isProcessingBet = false;  // NEW: Reset flag
+                    // NEW: Re-enable button only if not in error state (handled in resetUIAfterError)
+                    this.disabled = false;
+                    this.textContent = 'Play Against Bot';  // Reset text
                 }
             };
         }

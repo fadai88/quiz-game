@@ -75,7 +75,7 @@ const switchToBotSchema = Joi.object({
 
 const requestBotRoomSchema = Joi.object({
     walletAddress: solanaPublicKey,  // FIXED: Use custom validator
-    betAmount: Joi.number().positive().integer().min(3).max(30).required(),  // FIXED: Tightened to game options
+    betAmount: Joi.number().valid(3, 10, 15, 20, 30).required(),  // FIXED: Tightened to game options
     nonce: nonceSchema.optional()  // NEW: Add nonce (optional for non-transaction events)
 });
 
@@ -394,7 +394,7 @@ async function rateLimitEvent(walletAddress, eventName, maxRequests = 5, windowS
 async function rateLimitFailedRecaptcha(ip) {
     const key = `recaptcha_fail:${ip}`;
     const attempts = await redisClient.get(key) || 0;
-    if (parseInt(attempts) >= 5) {
+    if (parseInt(attempts) >= 5) {         
         throw new Error('Too many failed verification attempts. Try again in 1 hour.');
     }
     await redisClient.incr(key);
@@ -605,13 +605,6 @@ io.on('connection', (socket) => {
                 }
                 await redisClient.set(loginLimitKey, parseInt(loginAttempts) + 1, 'EX', 3600);
                 
-                // FIXED: New - rate limit failed reCAPTCHA attempts
-                try {
-                    await rateLimitFailedRecaptcha(clientIP);
-                } catch (rateError) {
-                    console.warn(`reCAPTCHA rate limit hit for IP ${clientIP}:`, rateError.message);
-                    return socket.emit('loginFailure', rateError.message);
-                }
             }
             
             // FIXED: Enforce reCAPTCHA - throw if fails (no fallback success)
@@ -622,7 +615,12 @@ io.on('connection', (socket) => {
                 // FIXED: Log failure for rate limiting, then emit error
                 if (redisClient) {
                     const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                    await rateLimitFailedRecaptcha(clientIP); // Increment on failure
+                    try {
+                        await rateLimitFailedRecaptcha(clientIP); // Increment on failure
+                    } catch (rateError) {
+                        console.warn(`reCAPTCHA rate limit hit for IP ${clientIP}:`, rateError.message);
+                        return socket.emit('loginFailure', rateError.message);
+                    }
                 }
                 console.warn(`reCAPTCHA verification failed for wallet ${walletAddress}: ${error.message}`);
                 return socket.emit('loginFailure', error.message);
@@ -902,13 +900,13 @@ io.on('connection', (socket) => {
                         recaptchaResult = await verifyRecaptcha(recaptchaToken);
                     } catch (error) {
                         console.error('reCAPTCHA failed for human matchmaking:', error.message);
+                        // FIXED: Increment failed attempts ONLY on reCAPTCHA failure
+                        if (redisClient) {
+                            const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                            await rateLimitFailedRecaptcha(clientIP);
+                        }
                         socket.emit('joinGameFailure', error.message);  // Use error message directly
                         return;
-                    }
-                    // FIXED: Increment failed attempts
-                    if (redisClient) {
-                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                        await rateLimitFailedRecaptcha(clientIP);
                     }
 
                     const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
@@ -1025,13 +1023,13 @@ io.on('connection', (socket) => {
                         recaptchaResult = await verifyRecaptcha(recaptchaToken);
                     } catch (error) {
                         console.error('reCAPTCHA failed for bot game:', error.message);
+                        // FIXED: Increment failed attempts ONLY on reCAPTCHA failure
+                        if (redisClient) {
+                            const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                            await rateLimitFailedRecaptcha(clientIP);
+                        }
                         socket.emit('joinGameFailure', error.message);  // Use error message directly
                         return;
-                    }
-                    // FIXED: Increment failed attempts
-                    if (redisClient) {
-                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                        await rateLimitFailedRecaptcha(clientIP);
                     }
 
                     const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
