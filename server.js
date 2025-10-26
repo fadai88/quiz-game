@@ -26,9 +26,8 @@ const TransactionLog = mongoose.model('TransactionLog', new mongoose.Schema({
     status: { type: String, enum: ['verified', 'replayed', 'failed'] }
 }));
 
-// NEW: In-memory fallback cache for signatures (limited to prevent memory bloat)
-const replayCache = new Set();  // Simple Set for quick lookup
-const MAX_CACHE_SIZE = 10000;  // Limit to recent txs
+// NEW: Global flag for Redis health - critical for transaction processing
+let redisHealthy = false;
 
 // NEW: Reusable Joi custom validator for Solana public keys
 const solanaPublicKey = Joi.string().required().custom((value, helpers) => {
@@ -203,46 +202,85 @@ let redisClient;
 
 async function initializeRedis() {
     try {
-        redisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+        redisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+            // NEW: Robust retry configuration
+            retryDelayOnFailover: 100,
+            enableReadyCheck: true,
+            maxRetriesPerRequest: 3,
+            lazyConnect: true,
+            connectTimeout: 10000,
+            commandTimeout: 5000
+        });
+        
+        // NEW: Health monitoring events
+        redisClient.on('ready', () => {
+            console.log('Redis ready');
+            redisHealthy = true;
+        });
+        
         redisClient.on('connect', () => {
-            console.log('Redis connected successfully');
+            console.log('Redis connected');
         });
+        
         redisClient.on('error', (err) => {
-            console.error('Redis connection error:', err);
-            // NEW: Alert on error (in prod, integrate with monitoring)
-            console.warn('Redis error - falling back to in-memory cache for replay protection');
+            console.error('Redis error:', err);
+            redisHealthy = false;
+            // In prod, trigger health check failure/alert
         });
+        
+        redisClient.on('close', () => {
+            console.warn('Redis connection closed');
+            redisHealthy = false;
+        });
+        
         // Test Redis connection with ping
         await redisClient.ping();  // Simple health check
         await redisClient.set('test', '1', 'EX', 60);
         const testValue = await redisClient.get('test');
         console.log(`Redis test: ${testValue}`);
+        redisHealthy = true;
         await initializeRateLimiter(); // Init after Redis
     } catch (error) {
         console.error('Failed to initialize Redis:', error);
-        console.warn('Using in-memory fallback for all Redis ops');
-        // Don't exit; continue with fallback
+        redisHealthy = false;
+        // CRITICAL: Do not fallback; log and set unhealthy
+        console.error('Redis unavailable - transaction processing disabled');
     }
 }
 
 initializeRedis().catch((err) => {
-    console.error('Redis init failed, but continuing with fallback:', err);
-    // Removed process.exit(1) - now graceful
+    console.error('Redis init failed:', err);
+    redisHealthy = false;
 });
 
 // Socket.io Redis Adapter for scaling (pub/sub across processes)
 let pubClient, subClient;
 async function initializeSocketAdapter() {
-    pubClient = redisClient.duplicate();
-    subClient = redisClient.duplicate();
-    io.adapter(createAdapter(pubClient, subClient));
-    console.log('Socket.io Redis adapter initialized for scaling');
+    if (!redisHealthy) {
+        console.warn('Skipping Socket.io Redis adapter - Redis unhealthy');
+        return;
+    }
+    try {
+        pubClient = redisClient.duplicate();
+        subClient = redisClient.duplicate();
+        io.adapter(createAdapter(pubClient, subClient));
+        console.log('Socket.io Redis adapter initialized for scaling');
+    } catch (error) {
+        console.error('Failed to initialize Socket.io adapter:', error);
+    }
 }
 
-initializeSocketAdapter().catch(console.error);
+if (redisHealthy) {
+    initializeSocketAdapter().catch(console.error);
+} else {
+    console.warn('Socket.io adapter skipped due to Redis unhealthiness');
+}
 
 // SCAN-based helper: Replace KEYS for non-blocking iteration
 async function scanKeys(pattern, batchSize = 100) {
+    if (!redisHealthy) {
+        throw new Error('Redis unavailable');
+    }
     let cursor = '0';
     let keys = [];
     do {
@@ -254,20 +292,25 @@ async function scanKeys(pattern, batchSize = 100) {
 }
 
 async function verifyAndValidateTransaction(signature, expectedAmount, senderAddress, recipientAddress, nonce, maxRetries = 3, retryDelay = 500) {  // NEW: Add nonce param
+    if (!redisHealthy) {
+        throw new Error('Service temporarily unavailable - please try again later');
+    }
+
     console.log(`Verifying transaction ${signature} for ${expectedAmount} USDC from ${senderAddress} to ${recipientAddress}, nonce: ${nonce}`);
 
     const key = `tx:${signature}`;
 
-    // NEW: Fallback-aware replay check
-    let exists = false;
+    // STRICT: No fallback - require Redis
+    let exists;
     try {
         exists = await redisClient.get(key);
         if (exists) {
             console.log(`Redis replay detected for ${key}`);
         }
     } catch (redisErr) {
-        console.warn('Redis get failed, checking in-memory cache:', redisErr.message);
-        exists = replayCache.has(signature);
+        console.error('Redis get failed:', redisErr.message);
+        redisHealthy = false;
+        throw new Error('Replay protection service unavailable');
     }
     
     if (exists) {
@@ -275,7 +318,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('This transaction has already been used');
     }
 
-    // NEW: Nonce check (store in Redis/DB; fallback to memory)
+    // STRICT: Nonce check - no fallback
     const nonceKey = `nonce:${nonce}`;
     try {
         const storedNonce = await redisClient.get(nonceKey);
@@ -284,11 +327,9 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         }
         await redisClient.set(nonceKey, 'used', 'EX', 86400);
     } catch (redisErr) {
-        console.warn('Redis nonce check failed, using in-memory');
-        if (replayCache.has(`nonce:${nonce}`)) {
-            throw new Error('Nonce already used - replay attempt');
-        }
-        replayCache.add(`nonce:${nonce}`);
+        console.error('Redis nonce check failed:', redisErr.message);
+        redisHealthy = false;
+        throw new Error('Replay protection service unavailable');
     }
 
     let transaction;
@@ -332,19 +373,15 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('Transaction amount does not match the expected bet');
     }
 
-    // NEW: Store with extended TTL (7 days)
+    // STRICT: Store with extended TTL - no fallback
     const ttl = 604800;  // 7 days
     try {
         await redisClient.set(key, 1, 'EX', ttl);
         console.log(`Stored transaction signature ${signature} in Redis with ${ttl}s TTL`);
     } catch (redisErr) {
-        console.warn('Redis set failed, added to in-memory cache:', redisErr.message);
-        replayCache.add(signature);
-        if (replayCache.size > MAX_CACHE_SIZE) {
-            // Evict oldest (simple pop, but for demo; use LRU in prod)
-            const firstItem = Array.from(replayCache)[0];
-            replayCache.delete(firstItem);
-        }
+        console.error('Redis set failed:', redisErr.message);
+        redisHealthy = false;
+        throw new Error('Replay protection service unavailable');
     }
 
     // NEW: Log to MongoDB for permanent audit
@@ -382,6 +419,11 @@ async function verifyTransactionWithStatus(signature, maxRetries = 3, retryDelay
 }
 
 async function rateLimitEvent(walletAddress, eventName, maxRequests = 5, windowSeconds = 60) {
+    if (!redisHealthy) {
+        // Graceful degradation for rate limiting - allow but log
+        console.warn(`Rate limiting skipped due to Redis unhealthiness for ${walletAddress}:${eventName}`);
+        return;
+    }
     const key = `rate:${walletAddress}:${eventName}`;
     const count = await redisClient.get(key) || 0;
     if (count >= maxRequests) {
@@ -392,6 +434,10 @@ async function rateLimitEvent(walletAddress, eventName, maxRequests = 5, windowS
 
 // FIXED: Add Redis rate limiter for failed reCAPTCHA (max 5 per IP per hour)
 async function rateLimitFailedRecaptcha(ip) {
+    if (!redisHealthy) {
+        console.warn(`reCAPTCHA rate limiting skipped due to Redis unhealthiness for ${ip}`);
+        return;
+    }
     const key = `recaptcha_fail:${ip}`;
     const attempts = await redisClient.get(key) || 0;
     if (parseInt(attempts) >= 5) {         
@@ -403,6 +449,10 @@ async function rateLimitFailedRecaptcha(ip) {
 
 // Enhanced: Socket-specific rate-limit
 async function rateLimitSocket(socket, points = 100, duration = 60) {
+    if (!redisHealthy || !socketRateLimiter) {
+        console.warn(`Socket rate limiting skipped for ${socket.id}`);
+        return;
+    }
     try {
         await socketRateLimiter.consume(socket.id, points);
     } catch (rejRes) {
@@ -547,7 +597,7 @@ io.on('connection', (socket) => {
     
     botDetector.trackConnection(connectionData.ip, connectionData.userAgent, socket.id);
     
-    if (redisClient) {
+    if (redisHealthy && redisClient) {
         (async () => {
             try {
                 const isBlocked = await redisClient.get(`blocklist:${connectionData.ip}`);
@@ -569,6 +619,11 @@ io.on('connection', (socket) => {
                 return;
             }
             // Use a separate, burst-friendly limiter for packets
+            if (!redisHealthy) {
+                console.warn('Packet rate limiting skipped');
+                next();
+                return;
+            }
             const packetLimiter = new RateLimiterRedis({
                 storeClient: redisClient,
                 points: 10, // 10 packets/30s burst
@@ -585,16 +640,18 @@ io.on('connection', (socket) => {
 
     socket.on('walletLogin', async ({ walletAddress, signature, message, recaptchaToken, clientData }) => {
         try {
-            const isWalletBlocked = await redisClient.get(`blocklist:wallet:${walletAddress}`);
-            if (isWalletBlocked) {
-                console.warn(`Blocked wallet attempting to login: ${walletAddress}`);
-                socket.emit('loginFailure', 'This wallet is temporarily blocked.');
-                return;
+            if (redisHealthy && redisClient) {
+                const isWalletBlocked = await redisClient.get(`blocklist:wallet:${walletAddress}`);
+                if (isWalletBlocked) {
+                    console.warn(`Blocked wallet attempting to login: ${walletAddress}`);
+                    socket.emit('loginFailure', 'This wallet is temporarily blocked.');
+                    return;
+                }
             }
             console.log('Wallet login attempt:', { walletAddress, recaptchaToken: !!recaptchaToken });
             
             // FIXED: Rate limit login attempts (existing) + failed reCAPTCHA specifically
-            if (redisClient) {
+            if (redisHealthy && redisClient) {
                 const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                 const loginLimitKey = `login:${clientIP}`;
                 const loginAttempts = await redisClient.get(loginLimitKey) || 0;
@@ -613,7 +670,7 @@ io.on('connection', (socket) => {
                 recaptchaResult = await verifyRecaptcha(recaptchaToken);
             } catch (error) {
                 // FIXED: Log failure for rate limiting, then emit error
-                if (redisClient) {
+                if (redisHealthy && redisClient) {
                     const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                     try {
                         await rateLimitFailedRecaptcha(clientIP); // Increment on failure
@@ -882,6 +939,10 @@ io.on('connection', (socket) => {
 
                     await logGameRoomsState();
                 } else if (event === 'joinHumanMatchmaking') {
+                    if (!redisHealthy) {
+                        socket.emit('joinGameFailure', 'Service temporarily unavailable - please try again later');
+                        return;
+                    }
                     const data = args[0];
                     await rateLimitEvent(data.walletAddress, 'joinHumanMatchmaking');
                     const { error } = transactionSchema.validate(data);
@@ -901,7 +962,7 @@ io.on('connection', (socket) => {
                     } catch (error) {
                         console.error('reCAPTCHA failed for human matchmaking:', error.message);
                         // FIXED: Increment failed attempts ONLY on reCAPTCHA failure
-                        if (redisClient) {
+                        if (redisHealthy && redisClient) {
                             const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                             await rateLimitFailedRecaptcha(clientIP);
                         }
@@ -1005,6 +1066,10 @@ io.on('connection', (socket) => {
 
                     await logMatchmakingState();
                 } else if (event === 'joinBotGame') {
+                    if (!redisHealthy) {
+                        socket.emit('joinGameFailure', 'Service temporarily unavailable - please try again later');
+                        return;
+                    }
                     const data = args[0];
                     await rateLimitEvent(data.walletAddress, 'joinBotGame', 3, 60);
                     const { error } = transactionSchema.validate(data);
@@ -1024,7 +1089,7 @@ io.on('connection', (socket) => {
                     } catch (error) {
                         console.error('reCAPTCHA failed for bot game:', error.message);
                         // FIXED: Increment failed attempts ONLY on reCAPTCHA failure
-                        if (redisClient) {
+                        if (redisHealthy && redisClient) {
                             const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                             await rateLimitFailedRecaptcha(clientIP);
                         }
@@ -1405,7 +1470,9 @@ io.on('connection', (socket) => {
                         const serverResponseTime = Date.now() - room.questionStartTime;
                         if (serverResponseTime < 200 || serverResponseTime > 15000) {
                             console.warn(`Invalid response time ${serverResponseTime}ms from ${authenticatedUsername} in room ${roomId}`);
-                            await redisClient.set(`suspect:${authenticatedUsername}`, 1, 'EX', 3600);
+                            if (redisHealthy && redisClient) {
+                                await redisClient.set(`suspect:${authenticatedUsername}`, 1, 'EX', 3600);
+                            }
                             socket.emit('answerError', 'Invalid response timing');
                             return;
                         }
@@ -1541,22 +1608,26 @@ io.on('connection', (socket) => {
         console.log('Client disconnected:', socket.id);
 
         // 1. Check and remove from matchmaking pools in Redis
-        try {
-            const poolKeys = await scanKeys('matchmaking:human:*');
-            for (const key of poolKeys) {
-                const betAmount = key.replace('matchmaking:human:', '');
-                const pool = await getMatchmakingPool(betAmount);
-                const playerIndex = pool.findIndex(p => p.socketId === socket.id);
-                if (playerIndex !== -1) {
-                    const removedPlayer = await removeFromMatchmakingPool(betAmount, socket.id);
-                    if (removedPlayer) {
-                        console.log(`Player ${removedPlayer.walletAddress} (socket ${socket.id}) removed from matchmaking pool for bet ${betAmount}`);
+        if (!redisHealthy) {
+            console.warn('Skipping matchmaking cleanup due to Redis unhealthiness');
+        } else {
+            try {
+                const poolKeys = await scanKeys('matchmaking:human:*');
+                for (const key of poolKeys) {
+                    const betAmount = key.replace('matchmaking:human:', '');
+                    const pool = await getMatchmakingPool(betAmount);
+                    const playerIndex = pool.findIndex(p => p.socketId === socket.id);
+                    if (playerIndex !== -1) {
+                        const removedPlayer = await removeFromMatchmakingPool(betAmount, socket.id);
+                        if (removedPlayer) {
+                            console.log(`Player ${removedPlayer.walletAddress} (socket ${socket.id}) removed from matchmaking pool for bet ${betAmount}`);
+                        }
+                        await logMatchmakingState();
                     }
-                    await logMatchmakingState();
                 }
+            } catch (error) {
+                console.error(`Error cleaning up matchmaking pools for socket ${socket.id}:`, error);
             }
-        } catch (error) {
-            console.error(`Error cleaning up matchmaking pools for socket ${socket.id}:`, error);
         }
 
         // 2. Handle disconnection from active game rooms
@@ -2427,6 +2498,9 @@ async function verifyRecaptcha(token) {
 }
 
 async function createGameRoom(roomId, betAmount, roomMode = null) {
+    if (!redisHealthy) {
+        throw new Error('Service temporarily unavailable');
+    }
     const room = {
         players: [],
         betAmount,
@@ -2471,6 +2545,9 @@ async function createGameRoom(roomId, betAmount, roomMode = null) {
 }
 
 async function getGameRoom(roomId) {
+    if (!redisHealthy) {
+        throw new Error('Service temporarily unavailable');
+    }
     try {
         const roomData = await redisClient.hgetall(`room:${roomId}`);
         if (!roomData || Object.keys(roomData).length === 0) {
@@ -2496,11 +2573,15 @@ async function getGameRoom(roomId) {
         };
     } catch (error) {
         console.error(`Error fetching room ${roomId} from Redis:`, error);
-        return null;
+        redisHealthy = false;
+        throw error;
     }
 }
 
 async function updateGameRoom(roomId, room) {
+    if (!redisHealthy) {
+        throw new Error('Service temporarily unavailable');
+    }
     try {
         // Check if room is marked as deleted
         if (room.isDeleted) {
@@ -2532,12 +2613,17 @@ async function updateGameRoom(roomId, room) {
         console.log(`Updated room ${roomId} in Redis`);
     } catch (error) {
         console.error(`Error updating room ${roomId} in Redis:`, error);
+        redisHealthy = false;
         throw error;
     }
 }
 
 
 async function deleteGameRoom(roomId) {
+    if (!redisHealthy) {
+        console.warn('Skipping room deletion due to Redis unhealthiness');
+        return;
+    }
     try {
         let room = await getGameRoom(roomId);
         if (room) {
@@ -2560,21 +2646,30 @@ async function deleteGameRoom(roomId) {
         }
     } catch (error) {
         console.error(`Error deleting room ${roomId} from Redis:`, error);
+        redisHealthy = false;
         throw error;
     }
 }
 
 async function addToMatchmakingPool(betAmount, playerData) {
+    if (!redisHealthy) {
+        throw new Error('Service temporarily unavailable');
+    }
     try {
         await redisClient.lpush(`matchmaking:human:${betAmount}`, JSON.stringify(playerData));
         console.log(`Added player ${playerData.walletAddress} to matchmaking pool for ${betAmount}`);
     } catch (error) {
         console.error(`Error adding to matchmaking pool for ${betAmount}:`, error);
+        redisHealthy = false;
         throw error;
     }
 }
 
 async function removeFromMatchmakingPool(betAmount, socketId) {
+    if (!redisHealthy) {
+        console.warn('Skipping matchmaking removal due to Redis unhealthiness');
+        return null;
+    }
     try {
         const pool = await redisClient.lrange(`matchmaking:human:${betAmount}`, 0, -1) || [];
         if (!Array.isArray(pool)) {
@@ -2607,16 +2702,21 @@ async function removeFromMatchmakingPool(betAmount, socketId) {
         return null;
     } catch (error) {
         console.error(`Error removing from matchmaking pool for ${betAmount}:`, error);
+        redisHealthy = false;
         return null; // Return null instead of throwing to allow switchToBot to continue
     }
 }
 
 async function getMatchmakingPool(betAmount) {
+    if (!redisHealthy) {
+        return [];
+    }
     try {
         const pool = await redisClient.lrange(`matchmaking:human:${betAmount}`, 0, -1);
         return pool.map(p => JSON.parse(p));
     } catch (error) {
         console.error(`Error fetching matchmaking pool for ${betAmount}:`, error);
+        redisHealthy = false;
         return [];
     }
 }
@@ -2681,10 +2781,12 @@ async function findAssociatedTokenAddress(walletAddress, tokenMintAddress) {
     );
 }
 
-app.get('/api/tokens.json', (req, res) => {
+app.get('/api/tokens.json', async (req, res) => {
     const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     console.warn(`Potential bot detected accessing honeypot: ${clientIP}`);
-    redisClient.set(`blocklist:${clientIP}`, 1, 'EX', 86400); // Block for 24 hours
+    if (redisHealthy && redisClient) {
+        await redisClient.set(`blocklist:${clientIP}`, 1, 'EX', 86400); // Block for 24 hours
+    }
     
     // Return fake data
     res.json({ status: "success", data: { tokens: [] } });
@@ -2693,7 +2795,9 @@ app.get('/api/tokens.json', (req, res) => {
 app.get('/admin', (req, res) => {
     const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     console.warn(`Potential bot detected accessing admin honeypot: ${clientIP}`);
-    redisClient.set(`blocklist:${clientIP}`, 1, 'EX', 86400);
+    if (redisHealthy && redisClient) {
+        redisClient.set(`blocklist:${clientIP}`, 1, 'EX', 86400);
+    }
     
     // Redirect to home
     res.redirect('/');
@@ -2740,6 +2844,10 @@ async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, 
 }
 
 async function logGameRoomsState() {
+    if (!redisHealthy) {
+        console.warn('Skipping room state log due to Redis unhealthiness');
+        return;
+    }
     console.log('Current game rooms state:');
     const roomKeys = await scanKeys('room:*');
     console.log(`Total rooms: ${roomKeys.length}`);
@@ -2766,6 +2874,10 @@ async function logGameRoomsState() {
 }
 
 async function logMatchmakingState() {
+    if (!redisHealthy) {
+        console.warn('Skipping matchmaking state log due to Redis unhealthiness');
+        return;
+    }
     console.log('Current Matchmaking State:');
 
     try {
@@ -2791,6 +2903,9 @@ async function logMatchmakingState() {
 }
 
 setInterval(async () => {
+    if (!redisHealthy) {
+        return;
+    }
     const now = Date.now();
     const MAX_WAIT_TIME = 5 * 60 * 1000; // 5 minutes
 
