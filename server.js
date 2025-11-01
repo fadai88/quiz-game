@@ -784,15 +784,12 @@ io.on('connection', (socket) => {
     });
 
     // Apply rate-limit + auth to game events
-    const gameEvents = ['joinGame', 'playerReady', 'joinHumanMatchmaking', 'joinBotGame', 'switchToBot', 'matchFound', 'leaveRoom', 'requestBotRoom', 'requestBotGame', 'submitAnswer', 'getLeaderboard'];
+    const gameEvents = ['joinGame', 'playerReady', 'joinHumanMatchmaking', 'joinBotGame', 'switchToBot', 'matchFound', 'leaveRoom', 'requestBotRoom', 'requestBotGame', 'submitAnswer'];
     gameEvents.forEach(event => {
         socket.on(event, async (...args) => {
             try {
                 // await rateLimitSocket(socket);
-
-                if (event !== 'getLeaderboard') {
-                    if (!socket.user) throw new Error('Unauthorized');
-                }
+                if (!socket.user) throw new Error('Unauthorized');
                     
                 // Call original handler based on event type
                 if (event === 'joinGame') {
@@ -1582,22 +1579,7 @@ io.on('connection', (socket) => {
                         console.error('Error in submitAnswer:', error.message);
                         socket.emit('answerError', `Error submitting answer: ${error.message}`);
                     }
-                } else if (event === 'getLeaderboard') {
-                    try {
-                        // Apply rate-limiting
-                        await rateLimitEvent(socket.user?.walletAddress || socket.id, 'getLeaderboard', 5, 60);
-
-                        const leaderboard = await User.find({})
-                            .select('walletAddress gamesPlayed totalWinnings wins correctAnswers')
-                            .sort({ totalWinnings: -1 })
-                            .limit(20);
-                        
-                        socket.emit('leaderboardData', leaderboard);
-                    } catch (error) {
-                        console.error('Error fetching leaderboard:', error);
-                        socket.emit('leaderboardError', 'Failed to fetch leaderboard data');
-                    }
-                }
+                } 
             } catch (error) {
                 console.error(`Error in ${event}:`, error);
                 socket.emit(`${event}Error` || 'gameError', error.message);
@@ -2791,6 +2773,31 @@ app.get('/api/tokens.json', async (req, res) => {
     
     // Return fake data
     res.json({ status: "success", data: { tokens: [] } });
+});
+
+app.get('/api/leaderboard', async (req, res) => {
+    try {
+        const leaderboard = await User.find({})
+            .select('walletAddress gamesPlayed totalWinnings wins correctAnswers')
+            .sort({ totalWinnings: -1 })
+            .limit(20)
+            .lean();
+        
+        // Transform data
+        const transformedLeaderboard = leaderboard.map(user => ({
+            username: user.walletAddress,
+            correctAnswers: user.correctAnswers || 0,
+            gamesPlayed: user.gamesPlayed || 0,
+            totalPoints: user.correctAnswers || 0,
+            wins: user.wins || 0,
+            totalWinnings: user.totalWinnings || 0
+        }));
+        
+        res.json(transformedLeaderboard);
+    } catch (error) {
+        console.error('Error fetching leaderboard:', error);
+        res.status(500).json({ error: 'Failed to fetch leaderboard' });
+    }
 });
 
 app.get('/admin', (req, res) => {

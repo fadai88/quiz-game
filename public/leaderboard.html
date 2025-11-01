@@ -88,6 +88,11 @@
             background-color: var(--primary-color-dark, #3a7bc8);
         }
         
+        #refreshBtn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
         .loading {
             display: inline-block;
             width: 20px;
@@ -102,6 +107,22 @@
         
         @keyframes spin {
             to { transform: rotate(360deg); }
+        }
+        
+        .error-message {
+            background-color: #ffebee;
+            color: #c62828;
+            padding: 15px;
+            border-radius: 4px;
+            margin-top: 20px;
+            text-align: center;
+            border-left: 4px solid #c62828;
+        }
+        
+        .dark-theme .error-message {
+            background-color: #5d4037;
+            color: #ffccbc;
+            border-left-color: #ff5722;
         }
     </style>
 </head>
@@ -135,13 +156,14 @@
             <div id="noDataMessage" style="display: none; margin-top: 20px; text-align: center;">
                 No leaderboard data available yet. Be the first to play and win!
             </div>
+            <div id="errorMessage" style="display: none;"></div>
         </div>
     </main>
-    <script src="/socket.io/socket.io.js"></script>
     <script>
-        const socket = io();
         const leaderboardBody = document.getElementById('leaderboardBody');
         const noDataMessage = document.getElementById('noDataMessage');
+        const errorMessage = document.getElementById('errorMessage');
+        const leaderboardTable = document.getElementById('leaderboardTable');
         
         // Function to format wallet address
         function formatWalletAddress(address) {
@@ -150,74 +172,99 @@
             return `${address.slice(0, 6)}...${address.slice(-4)}`;
         }
         
-        // Fetch leaderboard data on page load
-        function refreshLeaderboard() {
+        // Function to load leaderboard data via REST API
+        async function loadLeaderboard() {
+            try {
+                // Hide error message
+                errorMessage.style.display = 'none';
+                
+                const response = await fetch('/api/leaderboard');
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const leaderboard = await response.json();
+                
+                // Clear existing data
+                leaderboardBody.innerHTML = '';
+                
+                // Check if leaderboard is empty
+                if (!leaderboard || leaderboard.length === 0) {
+                    noDataMessage.style.display = 'block';
+                    leaderboardTable.style.display = 'none';
+                    return;
+                }
+                
+                // Show table, hide no data message
+                noDataMessage.style.display = 'none';
+                leaderboardTable.style.display = 'table';
+                
+                // Populate leaderboard
+                leaderboard.forEach((user, index) => {
+                    const row = document.createElement('tr');
+                    
+                    // Create medal for top 3
+                    let rankDisplay = `${index + 1}`;
+                    if (index < 3) {
+                        const medalClass = ['gold', 'silver', 'bronze'][index];
+                        rankDisplay = `<span class="medal ${medalClass}">${index + 1}</span>`;
+                    }
+                    
+                    // Format wallet address
+                    const formattedAddress = formatWalletAddress(user.username || user.walletAddress);
+                    
+                    // Format total winnings
+                    const winnings = user.totalWinnings || 0;
+                    const formattedWinnings = winnings.toFixed(2);
+                    
+                    // Calculate win rate
+                    const gamesPlayed = user.gamesPlayed || 0;
+                    const wins = user.wins || 0;
+                    const winRate = gamesPlayed > 0 ? (wins / gamesPlayed * 100).toFixed(1) + '%' : '0%';
+                    
+                    row.innerHTML = `
+                        <td>${rankDisplay}</td>
+                        <td class="truncated-address">${formattedAddress}</td>
+                        <td>${gamesPlayed}</td>
+                        <td>${wins} (${winRate})</td>
+                        <td class="winnings">${formattedWinnings}</td>
+                    `;
+                    leaderboardBody.appendChild(row);
+                });
+                
+                console.log('Leaderboard loaded successfully:', leaderboard.length, 'entries');
+                
+            } catch (error) {
+                console.error('Error loading leaderboard:', error);
+                
+                // Show error message
+                errorMessage.className = 'error-message';
+                errorMessage.textContent = `Failed to load leaderboard: ${error.message}. Please try refreshing.`;
+                errorMessage.style.display = 'block';
+                
+                // Hide table
+                leaderboardTable.style.display = 'none';
+                noDataMessage.style.display = 'none';
+            }
+        }
+        
+        // Function to refresh leaderboard with UI feedback
+        async function refreshLeaderboard() {
             const refreshBtn = document.getElementById('refreshBtn');
             refreshBtn.disabled = true;
             refreshBtn.innerHTML = 'Refreshing... <span class="loading"></span>';
             
-            socket.emit('getLeaderboard');
-            
-            // Re-enable the button after a delay
-            setTimeout(() => {
-                refreshBtn.disabled = false;
-                refreshBtn.innerHTML = 'Refresh Leaderboard';
-            }, 2000);
-        }
-        
-        // Load leaderboard on page load
-        document.addEventListener('DOMContentLoaded', refreshLeaderboard);
-        
-        socket.on('leaderboardData', (leaderboard) => {
-            leaderboardBody.innerHTML = '';
-            
-            if (leaderboard.length === 0) {
-                noDataMessage.style.display = 'block';
-                leaderboardTable.style.display = 'none';
-                return;
+            try {
+                await loadLeaderboard();
+            } finally {
+                // Re-enable the button after a delay
+                setTimeout(() => {
+                    refreshBtn.disabled = false;
+                    refreshBtn.innerHTML = 'Refresh Leaderboard';
+                }, 1000);
             }
-            
-            noDataMessage.style.display = 'none';
-            leaderboardTable.style.display = 'table';
-            
-            leaderboard.forEach((user, index) => {
-                const row = document.createElement('tr');
-                
-                // Create medal for top 3
-                let rankDisplay = `${index + 1}`;
-                if (index < 3) {
-                    const medalClass = ['gold', 'silver', 'bronze'][index];
-                    rankDisplay = `<span class="medal ${medalClass}">${index + 1}</span>`;
-                }
-                
-                // Format wallet address
-                const formattedAddress = formatWalletAddress(user.walletAddress || user.username);
-                
-                // Format total winnings
-                const winnings = user.totalWinnings || 0;
-                const formattedWinnings = winnings.toFixed(2);
-                
-                // Calculate win rate
-                const gamesPlayed = user.gamesPlayed || 0;
-                const wins = user.wins || 0;
-                const winRate = gamesPlayed > 0 ? (wins / gamesPlayed * 100).toFixed(1) + '%' : '0%';
-                
-                row.innerHTML = `
-                    <td>${rankDisplay}</td>
-                    <td class="truncated-address">${formattedAddress}</td>
-                    <td>${gamesPlayed}</td>
-                    <td>${wins} (${winRate})</td>
-                    <td class="winnings">${formattedWinnings}</td>
-                `;
-                leaderboardBody.appendChild(row);
-            });
-        });
-
-        socket.on('leaderboardError', (message) => {
-            alert(`Error fetching leaderboard: ${message}`);
-            document.getElementById('refreshBtn').disabled = false;
-            document.getElementById('refreshBtn').innerHTML = 'Refresh Leaderboard';
-        });
+        }
         
         // Theme toggle functionality
         function toggleTheme() {
@@ -227,11 +274,18 @@
         
         // Set theme on load
         document.addEventListener('DOMContentLoaded', () => {
+            // Load saved theme
             const savedTheme = localStorage.getItem('theme');
             if (savedTheme === 'dark') {
                 document.body.classList.add('dark-theme');
             }
+            
+            // Load leaderboard data
+            loadLeaderboard();
         });
+        
+        // Auto-refresh every 30 seconds
+        setInterval(loadLeaderboard, 30000);
     </script>
 </body>
 </html>
