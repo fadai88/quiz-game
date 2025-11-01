@@ -148,7 +148,7 @@
         };
 
         const connection = new solanaWeb3.Connection(
-            'https://sleek-attentive-sponge.solana-devnet.quiknode.pro/5691751daf6a072717c6e927425e523d87218437/',
+            'https://devnet.helius-rpc.com/?api-key=8c34d064-0c20-401a-9c89-630ae042b567',
             'confirmed'
         );
 
@@ -263,7 +263,11 @@
             });
         }
 
-        const socket = io('http://localhost:5000'); // Auto-upgrade (remove transports: ['polling'] if WS works)
+        const socket = io('http://localhost:5000', { 
+            auth: { 
+                event: 'walletLogin'  // Exempts from middleware for initial auth
+            } 
+        });
 
         socket.on('connect_error', (err) => {
             console.log('Connect error details:', {

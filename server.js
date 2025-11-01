@@ -162,8 +162,7 @@ app.get('/game.html', (req, res) => {
 });
 app.use(express.static(path.join(__dirname, 'public')));
 
-// LOOKT AT THIS FUNCTION AGAIN WHEN THE GAME IS LIVE!!!
-mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+mongoose.connect(process.env.MONGODB_URI)  // <-- Remove options—modern default
     .then(async () => {
         console.log('Connected to MongoDB');
     })
@@ -577,12 +576,14 @@ class TriviaBot {
 
 // Enable authentication middleware with exemptions for login events
 io.use((socket, next) => {
-    // Allow these events without authentication
-    const eventName = socket.handshake.auth?.event;
+    // Exempt login/reconnect (no socket.user yet) - check handshake auth
+    const incomingEvent = socket.handshake.auth?.event || '';  // Client sends this on connect (e.g., { auth: { event: 'walletLogin' } })
+    if (incomingEvent === 'walletLogin' || incomingEvent === 'walletReconnect') {
+        return next();  // Allow without auth
+    }
     
-    // For now, we'll check authentication in individual event handlers
-    // This allows us to have more granular control over which events require auth
-    next();
+    // Otherwise, enforce full middleware for game events
+    authMiddleware(socket, next);
 });
 
 io.on('connection', (socket) => {
@@ -1753,7 +1754,7 @@ io.on('connection', (socket) => {
 });
 
 io.engine.on('connection_error', (err) => {
-    console.log('Server connection error:', {
+    console.warn('Socket.io connection error (non-fatal):', {
         req: err.req,     // Incoming request
         code: err.code,   // e.g., 1 = transport error
         message: err.message, // e.g., "Session ID unknown"

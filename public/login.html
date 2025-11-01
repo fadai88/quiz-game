@@ -138,8 +138,11 @@
 
     <script src="/socket.io/socket.io.js"></script>
     <script>
-        // const socket = io();
-        const socket = io('http://localhost:5000'); // Auto-upgrade
+        const socket = io('http://localhost:5000', { 
+            auth: { 
+                event: 'walletLogin'  // Exempts from middleware for initial auth
+            } 
+        });
         
         /*
         socket.on('connect_error', (err) => {
