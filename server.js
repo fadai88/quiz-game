@@ -17,6 +17,34 @@ const Joi = require('joi');
 const BotDetector = require('./botDetector');
 const crypto = require('crypto');
 
+// Validate critical configuration on startup
+const ENVIRONMENT = process.env.NODE_ENV || 'development';
+
+if (ENVIRONMENT === 'production') {
+    console.log('🚀 Starting in PRODUCTION mode');
+    
+    // Enforce reCAPTCHA in production
+    if (process.env.ENABLE_RECAPTCHA !== 'true') {
+        console.error('❌ FATAL: ENABLE_RECAPTCHA must be "true" in production!');
+        console.error('   Set ENABLE_RECAPTCHA=true in your .env file');
+        process.exit(1); // Don't start server
+    }
+    
+    if (!process.env.RECAPTCHA_SECRET_KEY) {
+        console.error('❌ FATAL: RECAPTCHA_SECRET_KEY missing in production!');
+        process.exit(1);
+    }
+    
+    console.log('✅ reCAPTCHA properly configured for production');
+} else {
+    console.log('🔧 Starting in DEVELOPMENT mode');
+    if (process.env.ENABLE_RECAPTCHA === 'true') {
+        console.log('   reCAPTCHA: ENABLED (for testing)');
+    } else {
+        console.log('   reCAPTCHA: DISABLED (faster development)');
+    }
+}
+
 // NEW: TransactionLog model for permanent audit
 const TransactionLog = mongoose.model('TransactionLog', new mongoose.Schema({
     signature: { type: String, required: true, unique: true },
@@ -1419,8 +1447,9 @@ io.on('connection', (socket) => {
                         socket.emit('gameError', `Error: ${error.message}`);
                     }
                 } else if (event === 'submitAnswer') {
-                    const { roomId, questionId, answer, recaptchaToken } = args[0];  // Remove username from destructure
+                    const { roomId, questionId, answer, recaptchaToken } = args[0];
                     try {
+                        // ===== 1. INPUT VALIDATION =====
                         const { error } = submitAnswerSchema.validate({ roomId, questionId, answer, recaptchaToken });
                         if (error) {
                             console.error('Validation error in submitAnswer:', error.message);
@@ -1428,17 +1457,18 @@ io.on('connection', (socket) => {
                             return;
                         }
 
-                        // Use authenticated wallet from socket.user (set during login)
+                        // ===== 2. AUTHENTICATION CHECK =====
                         if (!socket.user || !socket.user.walletAddress) {
                             socket.emit('answerError', 'Not authenticated');
                             return;
                         }
 
-                        const authenticatedUsername = socket.user.walletAddress;  // ✅ Secure
+                        const authenticatedUsername = socket.user.walletAddress;
                         await rateLimitEvent(authenticatedUsername, 'submitAnswer', 10, 60);
 
                         console.log(`Received answer from ${authenticatedUsername} in room ${roomId} for question ${questionId}:`, { answer });
 
+                        // ===== 3. ROOM & QUESTION VALIDATION =====
                         let room = await getGameRoom(roomId);
                         if (!room) {
                             console.error(`Room ${roomId} not found for answer submission`);
@@ -1472,6 +1502,7 @@ io.on('connection', (socket) => {
                             return;
                         }
 
+                        // ===== 4. TIMING VALIDATION =====
                         const serverResponseTime = Date.now() - room.questionStartTime;
                         if (serverResponseTime < 200 || serverResponseTime > 15000) {
                             console.warn(`Invalid response time ${serverResponseTime}ms from ${authenticatedUsername} in room ${roomId}`);
@@ -1482,45 +1513,112 @@ io.on('connection', (socket) => {
                             return;
                         }
 
-                        // Bot suspicion score
+                        // ===== 5. BOT DETECTION =====
                         const botSuspicion = botDetector.getSuspicionScore(authenticatedUsername);
                         console.log(`Bot suspicion for ${authenticatedUsername}: ${botSuspicion}`);
 
-                        // reCAPTCHA: Skip if null or low suspicion; otherwise verify
-                        let skipCaptcha = !recaptchaToken || botSuspicion < 30;  // FIXED: Use recaptchaToken, not data
-                        if (!skipCaptcha) {
-                            const recaptchaResult = await verifyRecaptcha(recaptchaToken);  // FIXED: Use recaptchaToken
-                            if (!recaptchaResult.success) {
-                                socket.emit('answerError', 'Verification failed for answer submission.');
+                        // ===== 6. RECAPTCHA VERIFICATION (ENVIRONMENT-AWARE) =====
+                        const isProduction = process.env.NODE_ENV === 'production';
+                        let recaptchaResult = null;
+
+                        if (isProduction) {
+                            // PRODUCTION: ALWAYS require reCAPTCHA (no exceptions)
+                            if (!recaptchaToken) {
+                                console.error(`Missing reCAPTCHA token from ${authenticatedUsername} in PRODUCTION`);
+                                socket.emit('answerError', 'Verification required');
                                 return;
                             }
-                            console.log(`reCAPTCHA verified for ${authenticatedUsername} (score: ${recaptchaResult.score || 'N/A'})`);
+
+                            try {
+                                recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                                console.log(`reCAPTCHA verified for ${authenticatedUsername} (score: ${recaptchaResult.score || 'N/A'})`);
+
+                                // Check score threshold (v3 only)
+                                if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
+                                    console.warn(`Low reCAPTCHA score ${recaptchaResult.score} for ${authenticatedUsername}`);
+                                    botDetector.trackEvent(authenticatedUsername, 'low_recaptcha_score', { 
+                                        score: recaptchaResult.score,
+                                        event: 'submitAnswer'
+                                    });
+                                    socket.emit('answerError', 'Suspicious activity detected. Please try again.');
+                                    return;
+                                }
+                            } catch (error) {
+                                console.error(`reCAPTCHA verification failed for ${authenticatedUsername}: ${error.message}`);
+                                
+                                // Track failed attempt for rate limiting
+                                if (redisHealthy && redisClient) {
+                                    const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                                    try {
+                                        await rateLimitFailedRecaptcha(clientIP);
+                                    } catch (rateError) {
+                                        console.warn(`reCAPTCHA rate limit hit for IP ${clientIP}:`, rateError.message);
+                                        socket.emit('answerError', rateError.message);
+                                        return;
+                                    }
+                                }
+                                socket.emit('answerError', error.message);
+                                return;
+                            }
+                        } else if (process.env.ENABLE_RECAPTCHA === 'true') {
+                            // DEVELOPMENT: Optional reCAPTCHA (for testing)
+                            if (recaptchaToken) {
+                                try {
+                                    recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                                    console.log(`✅ Dev reCAPTCHA verified (score: ${recaptchaResult.score || 'N/A'})`);
+                                    
+                                    // Still check score in dev for testing
+                                    if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
+                                        console.warn(`⚠️ Low score in dev: ${recaptchaResult.score} (allowing anyway)`);
+                                    }
+                                } catch (error) {
+                                    console.warn(`⚠️ Dev reCAPTCHA failed (allowing anyway): ${error.message}`);
+                                }
+                            } else {
+                                console.log(`🔓 Dev mode - no reCAPTCHA token provided`);
+                            }
                         } else {
-                            console.log(`Skipping reCAPTCHA for ${authenticatedUsername} (suspicion: ${botSuspicion})`);
+                            // DEVELOPMENT: reCAPTCHA disabled
+                            console.log(`🔓 Dev mode - reCAPTCHA disabled for ${authenticatedUsername}`);
                         }
 
-                        // Device fingerprint check (only if not skipping)
+                        // ===== 7. DEVICE FINGERPRINT CHECK (RISK-BASED) =====
                         const user = await User.findOne({ walletAddress: authenticatedUsername });
-                        if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint && !skipCaptcha) {
+                        if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint) {
                             console.warn(`Device fingerprint mismatch for ${authenticatedUsername} in submitAnswer`);
                             botDetector.trackEvent(authenticatedUsername, 'fingerprint_mismatch', { event: 'submitAnswer' });
-                            // Re-verify if mismatch (even if low suspicion)
-                            const recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                            if (!recaptchaResult.success) {
+                            
+                            // In production, if reCAPTCHA score is also suspicious = likely bot attack
+                            if (isProduction && recaptchaResult && recaptchaResult.score !== undefined && recaptchaResult.score < 0.7) {
+                                console.error(`Device mismatch + low reCAPTCHA score (${recaptchaResult.score}) for ${authenticatedUsername}`);
                                 socket.emit('answerError', 'Device verification failed. Please relogin.');
                                 return;
                             }
+                            
+                            // In development or if score is high, just log and continue
+                            console.log(`Allowing fingerprint mismatch (production: ${isProduction}, score: ${recaptchaResult?.score || 'N/A'})`);
                         }
 
-                        // High-win streak captcha check (always verify if condition met)
+                        // ===== 8. HIGH-WIN STREAK CHECK (USES STORED RESULT) =====
                         if (user && user.gamesPlayed > 5 && (user.wins / user.gamesPlayed) > 0.8) {
-                            if (!recaptchaToken || !(await verifyRecaptcha(recaptchaToken)).success) {
-                                socket.emit('answerError', 'Additional verification required due to high win rate.');
+                            // FIXED: Use stored recaptchaResult instead of re-verifying
+                            if (isProduction) {
+                                // In production, reCAPTCHA already verified above
+                                if (!recaptchaResult || !recaptchaResult.success) {
+                                    console.error(`High-win player ${authenticatedUsername} failed verification`);
+                                    socket.emit('answerError', 'Additional verification required due to high win rate.');
+                                    return;
+                                }
+                                console.log(`High-win verification passed for ${authenticatedUsername} (score: ${recaptchaResult.score})`);
+                            } else if (process.env.ENABLE_RECAPTCHA === 'true' && !recaptchaToken) {
+                                // In dev with reCAPTCHA enabled, require token for high-win players
+                                console.warn(`High-win player ${authenticatedUsername} in dev without reCAPTCHA`);
+                                socket.emit('answerError', 'Verification required for high win rate players.');
                                 return;
                             }
-                            console.log(`High-win verification passed for ${authenticatedUsername}`);
                         }
 
+                        // ===== 9. PROCESS ANSWER =====
                         console.log(`SERVER CALCULATED: ${authenticatedUsername} response time: ${serverResponseTime}ms`);
 
                         const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
@@ -1552,12 +1650,14 @@ io.on('connection', (socket) => {
                             responseTime: serverResponseTime,
                             isCorrect,
                             answer,
-                            questionId
+                            questionId,
+                            recaptchaScore: recaptchaResult?.score
                         });
 
                         room.answersReceived += 1;
                         await updateGameRoom(roomId, room);
 
+                        // ===== 10. EMIT RESULTS =====
                         socket.emit('answerResult', {
                             username: player.username,
                             isCorrect,
