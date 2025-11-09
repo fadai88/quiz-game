@@ -821,6 +821,7 @@ io.on('connection', (socket) => {
                     await updateGameRoom(roomId, room);
 
                     socket.join(roomId);
+                    socket.roomId = roomId;  // FIXED: Store roomId on socket for O(1) disconnect cleanup
                     console.log(`Player ${walletAddress} joined temporary room ${roomId}`);
                     socket.emit('gameJoined', roomId);
 
@@ -885,6 +886,7 @@ io.on('connection', (socket) => {
                         if (room.players.length === 1) {
                             let matchFound = false;
 
+                            // FIXED: Scan for matching rooms (retained, but infrequent—only on ready)
                             const roomKeys = await scanKeys('room:*');
                             for (const key of roomKeys) {
                                 const otherRoomId = key.replace('room:', '');
@@ -904,7 +906,9 @@ io.on('connection', (socket) => {
                                     await updateGameRoom(otherRoomId, otherRoom);
 
                                     socket.leave(roomId);
+                                    if (roomId === socket.roomId) socket.roomId = null;  // FIXED: Clear old roomId
                                     socket.join(otherRoomId);
+                                    socket.roomId = otherRoomId;  // FIXED: Set new roomId
 
                                     socket.emit('matchFound', { newRoomId: otherRoomId });
                                     io.to(otherRoomId).emit('playerJoined', player.username);
@@ -983,22 +987,22 @@ io.on('connection', (socket) => {
 
                     console.log('Transaction verified successfully');
 
-                    // FIXED: Use scanKeys instead of keys
-                    const roomKeys = await scanKeys('room:*');
-                    for (const key of roomKeys) {
-                        const roomId = key.replace('room:', '');
-                        let room = await getGameRoom(roomId);
-                        const playerIndex = room.players.findIndex(p => p.username === walletAddress);
-                        if (playerIndex !== -1) {
-                            room.players.splice(playerIndex, 1);
-                            await updateGameRoom(roomId, room);
-                            socket.leave(roomId);
-                            console.log(`Player ${walletAddress} left room ${roomId} for matchmaking`);
-                            if (room.players.length === 0) {
-                                await deleteGameRoom(roomId);
-                                console.log(`Deleted empty room ${roomId}`);
+                    // FIXED: Clean up existing room using socket.roomId (no scan needed)
+                    if (socket.roomId) {
+                        let existingRoom = await getGameRoom(socket.roomId);
+                        if (existingRoom) {
+                            const playerIndex = existingRoom.players.findIndex(p => p.username === walletAddress);
+                            if (playerIndex !== -1) {
+                                existingRoom.players.splice(playerIndex, 1);
+                                await updateGameRoom(socket.roomId, existingRoom);
+                                socket.leave(socket.roomId);
+                                socket.roomId = null;  // FIXED: Clear roomId
+                                console.log(`Player ${walletAddress} left room ${socket.roomId} for matchmaking`);
+                                if (existingRoom.players.length === 0) {
+                                    await deleteGameRoom(socket.roomId);
+                                    console.log(`Deleted empty room ${socket.roomId}`);
+                                }
                             }
-                            break;
                         }
                     }
 
@@ -1036,9 +1040,11 @@ io.on('connection', (socket) => {
                         await updateGameRoom(roomId, room);
 
                         socket.join(roomId);
+                        socket.roomId = roomId;  // FIXED: Set roomId on socket
                         const opponentSocket = io.sockets.sockets.get(opponent.socketId);
                         if (opponentSocket) {
                             opponentSocket.join(roomId);
+                            opponentSocket.roomId = roomId;  // FIXED: Set on opponent too
                         }
 
                         io.to(roomId).emit('matchFound', {
@@ -1110,22 +1116,21 @@ io.on('connection', (socket) => {
 
                     console.log('Transaction verified successfully');
 
-                    // Check existing rooms for this player
-                    const roomKeys = await scanKeys('room:*');
-                    for (const key of roomKeys) {
-                        const roomId = key.replace('room:', '');
-                        let room = await getGameRoom(roomId);
-                        if (!room || room.isDeleted) continue;
-
-                        const playerIndex = room.players.findIndex(p => p.username === walletAddress);
-                        if (playerIndex !== -1) {
-                            console.log(`Player ${walletAddress} already in room ${roomId}, cleaning up`);
-                            room.players.splice(playerIndex, 1);
-                            room.isDeleted = true;
-                            await updateGameRoom(roomId, room);
-                            socket.leave(roomId);
-                            await redisClient.del(`room:${roomId}`);
-                            console.log(`Deleted room ${roomId} due to new bot game request`);
+                    // FIXED: Clean up existing room using socket.roomId (no scan needed)
+                    if (socket.roomId) {
+                        let existingRoom = await getGameRoom(socket.roomId);
+                        if (existingRoom) {
+                            const playerIndex = existingRoom.players.findIndex(p => p.username === walletAddress);
+                            if (playerIndex !== -1) {
+                                console.log(`Player ${walletAddress} already in room ${socket.roomId}, cleaning up`);
+                                existingRoom.players.splice(playerIndex, 1);
+                                existingRoom.isDeleted = true;
+                                await updateGameRoom(socket.roomId, existingRoom);
+                                socket.leave(socket.roomId);
+                                socket.roomId = null;  // FIXED: Clear roomId
+                                await redisClient.del(`room:${socket.roomId}`);
+                                console.log(`Deleted room ${socket.roomId} due to new bot game request`);
+                            }
                         }
                     }
 
@@ -1143,6 +1148,7 @@ io.on('connection', (socket) => {
                     await updateGameRoom(roomId, room);
 
                     socket.join(roomId);
+                    socket.roomId = roomId;  // FIXED: Set roomId on socket
 
                     const botName = chooseBotName();
                     socket.emit('botGameCreated', {
@@ -1167,49 +1173,47 @@ io.on('connection', (socket) => {
                     let playerData = null;
                     let playerBetAmount = null;
 
-                    // Check all matchmaking pools in Redis
-                    const poolKeys = await scanKeys('matchmaking:human:*');
-                    for (const key of poolKeys) {
-                        const betAmount = key.replace('matchmaking:human:', '');
-                        const parsedBetAmount = parseFloat(betAmount);
-                        if (isNaN(parsedBetAmount)) {
-                            console.warn(`Invalid bet amount in Redis key ${key}`);
-                            continue;
-                        }
-                        const playerDataFromPool = await removeFromMatchmakingPool(betAmount, socket.id);
-                        if (playerDataFromPool) {
-                            playerData = playerDataFromPool;
-                            playerBetAmount = parsedBetAmount;
-                            playerFound = true;
-                            console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
-                            break;
+                    // FIXED: First, check if player is in a room (using socket.roomId, no scan)
+                    if (socket.roomId) {
+                        let existingRoom = await getGameRoom(socket.roomId);
+                        if (existingRoom) {
+                            const playerIndex = existingRoom.players.findIndex(p => p.id === socket.id);
+                            if (playerIndex !== -1) {
+                                playerData = existingRoom.players[playerIndex];
+                                playerBetAmount = existingRoom.betAmount;
+                                playerFound = true;
+                                console.log(`Found player ${playerData.username} in room ${socket.roomId} with bet ${playerBetAmount}`);
+                                existingRoom.players.splice(playerIndex, 1);
+                                socket.leave(socket.roomId);
+                                socket.roomId = null;  // FIXED: Clear roomId
+                                if (existingRoom.players.length === 0) {
+                                    await deleteGameRoom(socket.roomId);
+                                    console.log(`Deleted empty room ${socket.roomId}`);
+                                } else {
+                                    await updateGameRoom(socket.roomId, existingRoom);
+                                    io.to(socket.roomId).emit('playerLeft', playerData.username);
+                                }
+                            }
                         }
                     }
 
-                    // If player not found in matchmaking, check existing rooms
+                    // FIXED: If not in room, scan matchmaking pools (retained, infrequent)
                     if (!playerFound) {
-                        console.log(`Player ${socket.id} not found in matchmaking pools, checking existing rooms`);
-                        const roomKeys = await scanKeys('room:*');
-                        for (const key of roomKeys) {
-                            const existingRoomId = key.replace('room:', '');
-                            let room = await getGameRoom(existingRoomId);
-                            if (!room) continue;
-
-                            const playerIndex = room.players.findIndex(p => p.id === socket.id);
-                            if (playerIndex !== -1) {
-                                playerData = room.players[playerIndex];
-                                playerBetAmount = room.betAmount;
+                        console.log(`Player ${socket.id} not found in room, checking matchmaking pools`);
+                        const poolKeys = await scanKeys('matchmaking:human:*');
+                        for (const key of poolKeys) {
+                            const betAmount = key.replace('matchmaking:human:', '');
+                            const parsedBetAmount = parseFloat(betAmount);
+                            if (isNaN(parsedBetAmount)) {
+                                console.warn(`Invalid bet amount in Redis key ${key}`);
+                                continue;
+                            }
+                            const playerDataFromPool = await removeFromMatchmakingPool(betAmount, socket.id);
+                            if (playerDataFromPool) {
+                                playerData = playerDataFromPool;
+                                playerBetAmount = parsedBetAmount;
                                 playerFound = true;
-                                console.log(`Found player ${playerData.username} in room ${existingRoomId} with bet ${playerBetAmount}`);
-                                room.players.splice(playerIndex, 1);
-                                socket.leave(existingRoomId);
-                                if (room.players.length === 0) {
-                                    await deleteGameRoom(existingRoomId);
-                                    console.log(`Deleted empty room ${existingRoomId}`);
-                                } else {
-                                    await updateGameRoom(existingRoomId, room);
-                                    io.to(existingRoomId).emit('playerLeft', playerData.username);
-                                }
+                                console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
                                 break;
                             }
                         }
@@ -1248,6 +1252,7 @@ io.on('connection', (socket) => {
                     await updateGameRoom(newRoomId, room);
 
                     socket.join(newRoomId);
+                    socket.roomId = newRoomId;  // FIXED: Set roomId on socket
 
                     const botName = chooseBotName();
                     socket.emit('botGameCreated', {
@@ -1270,7 +1275,7 @@ io.on('connection', (socket) => {
                         }
 
                         console.log(`Match found, player ${socket.id} moved to room ${newRoomId}`);
-                        currentRoomId = newRoomId;
+                        socket.roomId = newRoomId;  // FIXED: Set roomId on socket
                         // Additional handling if needed
                     } catch (error) {
                         console.error('Error in matchFound:', error);
@@ -1307,6 +1312,7 @@ io.on('connection', (socket) => {
                             room.players.splice(playerIndex, 1);
 
                             socket.leave(roomId);
+                            if (roomId === socket.roomId) socket.roomId = null;  // FIXED: Clear roomId if matching
 
                             if (room.players.length === 0) {
                                 console.log(`Room ${roomId} is now empty, deleting it`);
@@ -1356,6 +1362,7 @@ io.on('connection', (socket) => {
                         await updateGameRoom(roomId, room);
 
                         socket.join(roomId);
+                        socket.roomId = roomId;  // FIXED: Set roomId on socket
                         socket.emit('botRoomCreated', roomId);
                         await logGameRoomsState();
                     } catch (error) {
@@ -1590,7 +1597,7 @@ io.on('connection', (socket) => {
     socket.on('disconnect', async () => {
         console.log('Client disconnected:', socket.id);
 
-        // 1. Check and remove from matchmaking pools in Redis
+        // 1. Check and remove from matchmaking pools in Redis (retained scan—fewer keys)
         if (!redisHealthy) {
             console.warn('Skipping matchmaking cleanup due to Redis unhealthiness');
         } else {
@@ -1613,13 +1620,15 @@ io.on('connection', (socket) => {
             }
         }
 
-        // 2. Handle disconnection from active game rooms
+        // 2. Handle disconnection from active game rooms (FIXED: Use socket.roomId—no scan!)
         try {
-            const roomKeys = await scanKeys('room:*');
-            for (const key of roomKeys) {
-                const roomId = key.replace('room:', '');
+            if (socket.roomId) {
+                const roomId = socket.roomId;
                 let room = await getGameRoom(roomId);
-                if (!room || room.isDeleted) continue;
+                if (!room || room.isDeleted) {
+                    socket.roomId = null;  // FIXED: Clear stale roomId
+                    return;
+                }
 
                 const playerIndex = room.players.findIndex(p => p.id === socket.id);
                 if (playerIndex !== -1) {
@@ -1683,6 +1692,7 @@ io.on('connection', (socket) => {
                         await redisClient.del(`room:${roomId}`);
                         console.log(`Confirmed deletion of room ${roomId}`);
                         await logGameRoomsState();
+                        socket.roomId = null;  // FIXED: Clear roomId
                         return;
                     }
 
@@ -1709,6 +1719,7 @@ io.on('connection', (socket) => {
                         await handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, room.betAmount, false, allPlayersForStats);
                         await redisClient.del(`room:${roomId}`);
                         await logGameRoomsState();
+                        socket.roomId = null;  // FIXED: Clear roomId
                         return;
                     }
 
@@ -1718,6 +1729,7 @@ io.on('connection', (socket) => {
                         await deleteGameRoom(roomId);
                         await redisClient.del(`room:${roomId}`);
                         await logGameRoomsState();
+                        socket.roomId = null;  // FIXED: Clear roomId
                         return;
                     }
 
@@ -1726,11 +1738,14 @@ io.on('connection', (socket) => {
                         io.to(roomId).emit('playerLeft', disconnectedPlayer.username);
                     }
 
-                    break; // Player found and processed
+                    socket.roomId = null;  // FIXED: Clear roomId
                 }
+            } else {
+                console.log(`No room associated with disconnected socket ${socket.id}`);
             }
         } catch (error) {
             console.error(`Error cleaning up game rooms for socket ${socket.id}:`, error);
+            socket.roomId = null;  // FIXED: Clear on error to avoid stale state
         }
     });
 });
