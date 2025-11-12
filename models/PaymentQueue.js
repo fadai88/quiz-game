@@ -5,19 +5,23 @@ const PaymentQueueSchema = new mongoose.Schema({
   recipientWallet: {
     type: String,
     required: true,
+    match: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, // Basic base58 for Solana addresses
     index: true
   },
   amount: {
     type: Number,
-    required: true
+    required: true,
+    min: [0.01, 'Amount must be greater than 0'] // Min 0.01 USDC
   },
   gameId: {
     type: String,
-    required: true
+    required: true,
+    unique: true // NEW: Prevent duplicate queues per game
   },
   betAmount: {
     type: Number,
-    required: true
+    required: true,
+    min: [0, 'Bet amount cannot be negative']
   },
   status: {
     type: String,
@@ -27,7 +31,8 @@ const PaymentQueueSchema = new mongoose.Schema({
   },
   attempts: {
     type: Number,
-    default: 0
+    default: 0,
+    min: 0
   },
   lastAttemptAt: {
     type: Date
@@ -56,8 +61,26 @@ const PaymentQueueSchema = new mongoose.Schema({
 // Index for finding payments that need processing
 PaymentQueueSchema.index({ status: 1, attempts: 1, lastAttemptAt: 1 });
 
+// NEW: Pre-save hook to ensure status is set and validate
+PaymentQueueSchema.pre('save', function(next) {
+  if (this.isNew && !this.status) {
+    this.status = 'pending';
+  }
+  next();
+});
+
 // Static method to add a payment to the queue
 PaymentQueueSchema.statics.queuePayment = async function(recipientWallet, amount, gameId, betAmount, metadata = {}) {
+  // NEW: Check for existing by gameId to prevent duplicates
+  const existing = await this.findOne({ gameId });
+  if (existing) {
+    if (existing.status === 'completed') {
+      throw new Error(`Payment for game ${gameId} already completed`);
+    }
+    if (existing.status === 'pending' || existing.status === 'processing') {
+      return existing; // Return existing if already queued
+    }
+  }
   return this.create({
     recipientWallet,
     amount,
@@ -84,30 +107,58 @@ PaymentQueueSchema.statics.getPendingPayments = async function(limit = 10) {
     ]
   })
   .sort({ createdAt: 1 })
-  .limit(limit);
+  .limit(limit)
+  .lean(); // NEW: Use lean() for performance
+};
+
+// NEW: Static method to cleanup old pending payments (call in cron)
+PaymentQueueSchema.statics.cleanupOldPendings = async function(hours = 24) {
+  const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000);
+  const result = await this.deleteMany({
+    status: 'pending',
+    createdAt: { $lt: cutoff }
+  });
+  console.log(`Cleaned up ${result.deletedCount} old pending payments`);
+  return result;
 };
 
 // Mark a payment as processing
 PaymentQueueSchema.methods.markProcessing = async function() {
-  this.status = 'processing';
-  this.attempts += 1;
-  this.lastAttemptAt = new Date();
-  return this.save();
+  try {
+    this.status = 'processing';
+    this.attempts += 1;
+    this.lastAttemptAt = new Date();
+    return await this.save();
+  } catch (error) {
+    // NEW: Rollback on DB error
+    console.error('Failed to mark payment as processing:', error);
+    throw new Error(`DB update failed: ${error.message}`);
+  }
 };
 
 // Mark a payment as completed
 PaymentQueueSchema.methods.markCompleted = async function(transactionSignature) {
-  this.status = 'completed';
-  this.transactionSignature = transactionSignature;
-  this.completedAt = new Date();
-  return this.save();
+  try {
+    this.status = 'completed';
+    this.transactionSignature = transactionSignature;
+    this.completedAt = new Date();
+    return await this.save();
+  } catch (error) {
+    console.error('Failed to mark payment as completed:', error);
+    throw new Error(`DB update failed: ${error.message}`);
+  }
 };
 
 // Mark a payment as failed
 PaymentQueueSchema.methods.markFailed = async function(errorMessage) {
-  this.status = 'failed';
-  this.errorMessage = errorMessage;
-  return this.save();
+  try {
+    this.status = 'failed';
+    this.errorMessage = errorMessage;
+    return await this.save();
+  } catch (error) {
+    console.error('Failed to mark payment as failed:', error);
+    throw new Error(`DB update failed: ${error.message}`);
+  }
 };
 
 const PaymentQueue = mongoose.model('PaymentQueue', PaymentQueueSchema);

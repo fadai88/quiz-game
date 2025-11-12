@@ -1,3 +1,4 @@
+server.js
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -16,6 +17,10 @@ const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransac
 const Joi = require('joi');
 const BotDetector = require('./botDetector');
 const crypto = require('crypto');
+
+// NEW: Import PaymentQueue and PaymentProcessor for resilient payouts
+const PaymentQueue = require('./models/PaymentQueue'); // Adjust path as needed
+const PaymentProcessor = require('./services/PaymentProcessor'); // Adjust path as needed
 
 // Validate critical configuration on startup
 const ENVIRONMENT = process.env.NODE_ENV || 'development';
@@ -210,9 +215,11 @@ const config = {
     TREASURY_KEYPAIR: Keypair.fromSecretKey(
         Buffer.from(JSON.parse(process.env.TREASURY_SECRET_KEY))
     ),
-    connection: new Connection(process.env.SOLANA_RPC_URL, 'confirmed')
+    connection: new Connection(process.env.SOLANA_RPC_URL, 'confirmed'),
+    // NEW: For PaymentProcessor - array of RPC endpoints for failover
+    rpcEndpoints: [process.env.SOLANA_RPC_URL], // Add more for production failover
+    io: io // Pass io for emitting events from processor
 };
-
 
 const connection = config.connection;
 
@@ -226,6 +233,14 @@ if (process.env.PROGRAM_ID) {
 }
 
 let redisClient;
+
+// NEW: Initialize PaymentProcessor after MongoDB connection
+let paymentProcessor;
+mongoose.connection.once('open', async () => {
+    paymentProcessor = new PaymentProcessor(config);
+    paymentProcessor.startProcessing(60000); // Process every 60s
+    console.log('PaymentProcessor initialized and started');
+});
 
 async function initializeRedis() {
     try {
@@ -808,6 +823,14 @@ io.on('connection', (socket) => {
         } catch (error) {
             console.error('Reconnect error:', error);
             socket.emit('loginFailure', error.message);
+        }
+    });
+
+    // NEW: Listen for payment completion/failure events from processor (broadcast to relevant sockets)
+    socket.on('connect', () => {
+        // Join a "wallet room" for payment notifications (use wallet as room name)
+        if (socket.user && socket.user.walletAddress) {
+            socket.join(`wallet:${socket.user.walletAddress}`);
         }
     });
 
@@ -1911,6 +1934,25 @@ app.get('/api/balance/:wallet', async (req, res) => {
     }
 });
 
+// NEW: API endpoint to check payment status
+app.get('/api/payment/:paymentId', async (req, res) => {
+    try {
+        const payment = await PaymentQueue.findById(req.params.paymentId);
+        if (!payment) {
+            return res.status(404).json({ error: 'Payment not found' });
+        }
+        res.json({
+            paymentId: payment._id,
+            status: payment.status,
+            amount: payment.amount,
+            transactionSignature: payment.transactionSignature,
+            errorMessage: payment.errorMessage
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 
 async function startGame(roomId) {
     console.log(`Attempting to start game in room ${roomId}`);
@@ -2492,14 +2534,27 @@ async function handleGameOver(room, roomId) {
 
         const winnerIsActuallyHuman = winner && !room.players.find(p => p.username === winner && p.isBot);
         let payoutSignature = null;
+        let paymentId = null;
 
-        if (winnerIsActuallyHuman) {
+        if (winnerIsActuallyHuman && paymentProcessor) {
             try {
-                payoutSignature = await sendWinnings(winner, room.betAmount, botOpponent);
+                const multiplier = botOpponent ? 1.5 : 1.8;
+                const winningAmount = room.betAmount * multiplier;
+                // FIXED: Queue the payout instead of sending directly
+                const queuedPayment = await paymentProcessor.queuePayment(
+                    winner,
+                    winningAmount,
+                    roomId, // Use roomId as gameId
+                    room.betAmount,
+                    { botOpponent, singlePlayerMode: isSinglePlayerEncounter }
+                );
+                paymentId = queuedPayment._id.toString();
+                console.log(`Payout queued for ${winner}: Payment ID ${paymentId}, Amount ${winningAmount} USDC`);
             } catch (error) {
-                console.error('Error processing payout:', error);
+                console.error('Error queueing payout:', error);
+                // Emit error but continue (payout is queued or will be retried)
                 io.to(roomId).emit('gameOver', {
-                    error: 'Error processing payout. Please contact support.',
+                    error: 'Payout queued but initial setup failed. Check your balance or contact support.',
                     players: sortedPlayers.map(p => ({
                         username: p.username,
                         score: p.score,
@@ -2509,7 +2564,8 @@ async function handleGameOver(room, roomId) {
                     winner: winner,
                     betAmount: room.betAmount,
                     singlePlayerMode: isSinglePlayerEncounter,
-                    botOpponent: botOpponent
+                    botOpponent: botOpponent,
+                    paymentId
                 });
                 await deleteGameRoom(roomId);
                 return;
@@ -2525,9 +2581,11 @@ async function handleGameOver(room, roomId) {
             })),
             winner: winner,
             betAmount: room.betAmount,
-            payoutSignature,
+            payoutSignature, // Will be null; use paymentId instead
+            paymentId, // NEW: Include queued payment ID
             singlePlayerMode: isSinglePlayerEncounter,
-            botOpponent: botOpponent
+            botOpponent: botOpponent,
+            message: paymentId ? `Payout queued! Check status with ID: ${paymentId}` : 'No payout required'
         });
 
         await deleteGameRoom(roomId);
@@ -2819,55 +2877,7 @@ async function getMatchmakingPool(betAmount) {
     }
 }
 
-async function sendWinnings(winnerAddress, betAmount, botOpponent = false) {
-    try {
-        const winnerPublicKey = new PublicKey(winnerAddress);
-        const multiplier = botOpponent ? 1.5 : 1.8;
-        const winningAmount = betAmount * multiplier;
-        
-        console.log(`Sending winnings: ${winningAmount} USDC to ${winnerAddress} (vs bot: ${botOpponent})`);
-        
-        // Handle the blockchain transaction
-        const treasuryTokenAccount = await findAssociatedTokenAddress(
-            config.TREASURY_WALLET,
-            config.USDC_MINT
-        );
-
-        const winnerTokenAccount = await findAssociatedTokenAddress(
-            winnerPublicKey,
-            config.USDC_MINT
-        );
-
-        const transferIx = createTransferCheckedInstruction(
-            treasuryTokenAccount,
-            config.USDC_MINT,
-            winnerTokenAccount,
-            config.TREASURY_WALLET,
-            Math.floor(winningAmount * Math.pow(10, 6)),
-            6
-        );
-
-        const transaction = new Transaction().add(transferIx);
-        transaction.feePayer = config.TREASURY_WALLET;
-        
-        // Use getLatestBlockhash instead of getRecentBlockhash
-        const { blockhash, lastValidBlockHeight } = await config.connection.getLatestBlockhash('confirmed');
-        transaction.recentBlockhash = blockhash;
-        transaction.lastValidBlockHeight = lastValidBlockHeight;
-
-        const signature = await sendAndConfirmTransaction(
-            config.connection,
-            transaction,
-            [config.TREASURY_KEYPAIR]
-        );
-
-        console.log('Payout successful:', signature);
-        return signature;
-    } catch (error) {
-        console.error('Error sending winnings:', error);
-        throw error;
-    }
-}
+// REMOVED: sendWinnings function - replaced by PaymentProcessor.queuePayment
 
 async function findAssociatedTokenAddress(walletAddress, tokenMintAddress) {
     return await getAssociatedTokenAddress(
@@ -2932,10 +2942,19 @@ async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, 
         const multiplier = botOpponent ? 1.5 : 1.8;
         const winningAmount = betAmount * multiplier;
 
-        // Process payout for the remaining player - transaction only
+        // FIXED: Queue payout instead of sending directly
         let payoutSignature = null;
-        if (!botOpponent) {
-            payoutSignature = await sendWinnings(remainingPlayer.username, betAmount, botOpponent);
+        let paymentId = null;
+        if (!botOpponent && paymentProcessor) {
+            const queuedPayment = await paymentProcessor.queuePayment(
+                remainingPlayer.username,
+                winningAmount,
+                roomId,
+                betAmount,
+                { botOpponent, forfeit: true }
+            );
+            paymentId = queuedPayment._id.toString();
+            console.log(`Forfeit payout queued for ${remainingPlayer.username}: Payment ID ${paymentId}`);
         }
 
         // Emit game over event with forfeit information
@@ -2944,8 +2963,9 @@ async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, 
             disconnectedPlayer: disconnectedPlayer.username,
             betAmount: betAmount,
             payoutSignature,
+            paymentId, // NEW: Include queued payment ID
             botOpponent,
-            message: `${disconnectedPlayer.username} left the game. ${remainingPlayer.username} wins by forfeit!`
+            message: `${disconnectedPlayer.username} left the game. ${remainingPlayer.username} wins by forfeit!${paymentId ? ` Payout queued (ID: ${paymentId})` : ''}`
         });
 
         // Update stats for all players

@@ -1,5 +1,5 @@
 // services/PaymentProcessor.js
-const { Connection, PublicKey, Transaction, sendAndConfirmTransaction } = require('@solana/web3.js');
+const { Connection, PublicKey, Transaction, sendAndConfirmTransaction, getLatestBlockhash } = require('@solana/web3.js'); // FIXED: Import getLatestBlockhash
 const { createTransferCheckedInstruction, getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } = require('@solana/spl-token');
 const PaymentQueue = require('../models/PaymentQueue');
 
@@ -37,6 +37,15 @@ class PaymentProcessor {
     // Queue a new payment
     async queuePayment(recipientWallet, amount, gameId, betAmount, metadata = {}) {
         try {
+            // NEW: Pre-check treasury SOL balance (needs ~0.005 SOL for fees + ATA)
+            const treasuryBalance = await this.config.connection.getBalance(this.config.TREASURY_WALLET);
+            const minSol = 0.005 * 1e9; // 0.005 SOL in lamports
+            if (treasuryBalance < minSol) {
+                const error = new Error(`Treasury low on SOL: ${treasuryBalance / 1e9} SOL (needs at least ${minSol / 1e9})`);
+                console.error({ level: 'error', event: 'queuePayment', gameId, error: error.message });
+                throw error;
+            }
+
             const payment = await PaymentQueue.queuePayment(
                 recipientWallet,
                 amount,
@@ -44,7 +53,7 @@ class PaymentProcessor {
                 betAmount,
                 metadata
             );
-            console.log(`Payment queued: ${amount} USDC to ${recipientWallet} (Game: ${gameId})`);
+            console.log({ level: 'info', event: 'queuePayment', paymentId: payment._id, amount, recipientWallet, gameId }); // NEW: Structured log
             
             // If we're not currently processing, kick off processing
             if (!this.isProcessing) {
@@ -53,7 +62,7 @@ class PaymentProcessor {
             
             return payment;
         } catch (error) {
-            console.error('Error queueing payment:', error);
+            console.error({ level: 'error', event: 'queuePayment', gameId, error: error.message }); // NEW: Structured log
             throw error;
         }
     }
@@ -65,18 +74,18 @@ class PaymentProcessor {
             return;
         }
         this.isProcessing = true;
-        console.log('Starting payment queue processing');
+        console.log({ level: 'info', event: 'processPaymentQueue', message: 'Starting batch' }); // NEW: Structured log
 
         try {
             const pendingPayments = await PaymentQueue.getPendingPayments(5); // Process 5 at a time
             
             if (pendingPayments.length === 0) {
-                console.log('No pending payments to process');
+                console.log({ level: 'info', event: 'processPaymentQueue', message: 'No pending payments' }); // NEW: Structured log
                 this.isProcessing = false;
                 return;
             }
             
-            console.log(`Processing ${pendingPayments.length} pending payments`);
+            console.log({ level: 'info', event: 'processPaymentQueue', count: pendingPayments.length }); // NEW: Structured log
             
             // Process each payment sequentially
             for (const payment of pendingPayments) {
@@ -87,7 +96,7 @@ class PaymentProcessor {
             }
             
         } catch (error) {
-            console.error('Error processing payment queue:', error);
+            console.error({ level: 'error', event: 'processPaymentQueue', error: error.message }); // NEW: Structured log
         } finally {
             this.isProcessing = false;
         }
@@ -95,10 +104,16 @@ class PaymentProcessor {
 
     // Process a single payment
     async processPayment(payment) {
-        console.log(`Processing payment ${payment._id} for ${payment.amount} USDC to ${payment.recipientWallet}`);
+        console.log({ level: 'info', event: 'processPayment', paymentId: payment._id, amount: payment.amount, wallet: payment.recipientWallet }); // NEW: Structured log
+        let dbUpdateError = null; // NEW: Track DB errors for rollback
         try {
-            // Mark as processing
-            await payment.markProcessing();
+            // Mark as processing (with try-catch for rollback)
+            try {
+                await payment.markProcessing();
+            } catch (dbError) {
+                dbUpdateError = dbError;
+                throw new Error(`Failed to update DB status: ${dbError.message}`);
+            }
             
             // Send the actual payment
             const signature = await this.sendPayment(
@@ -106,14 +121,20 @@ class PaymentProcessor {
                 payment.amount
             );
             
-            // Mark payment as completed
-            await payment.markCompleted(signature);
+            // Mark payment as completed (with try-catch)
+            try {
+                await payment.markCompleted(signature);
+            } catch (dbError) {
+                dbUpdateError = dbError;
+                // Rollback: Re-mark as processing? Or emit alert—here, throw to log
+                throw new Error(`DB completion update failed: ${dbError.message}. Tx succeeded but status not updated.`);
+            }
             
-            console.log(`Payment completed: ${signature}`);
+            console.log({ level: 'info', event: 'processPayment', paymentId: payment._id, signature, status: 'completed' }); // NEW: Structured log
             
             // Emit success event if socket is available
             if (this.config.io) {
-                this.config.io.to(payment.recipientWallet).emit('paymentCompleted', {
+                this.config.io.to(`wallet:${payment.recipientWallet}`).emit('paymentCompleted', {
                     amount: payment.amount,
                     transactionSignature: signature,
                     gameId: payment.gameId
@@ -122,14 +143,24 @@ class PaymentProcessor {
             
             return signature;
         } catch (error) {
-            console.error(`Payment ${payment._id} failed:`, error);
+            // NEW: Enhanced error handling with DB rollback
+            console.error({ level: 'error', event: 'processPayment', paymentId: payment._id, error: error.message, dbError: dbUpdateError?.message }); // NEW: Structured log
             
-            // Mark as failed with error message
-            await payment.markFailed(error.message || 'Unknown error');
+            if (dbUpdateError) {
+                // Critical: DB failed first—don't mark failed, as it might be inconsistent
+                console.error({ level: 'critical', event: 'processPayment', paymentId: payment._id, message: 'DB error during processing—manual intervention needed' });
+            } else {
+                // Mark as failed with error message
+                try {
+                    await payment.markFailed(error.message || 'Unknown error');
+                } catch (markError) {
+                    console.error({ level: 'error', event: 'processPayment', paymentId: payment._id, markError: markError.message });
+                }
+            }
             
             // Emit failure event if socket is available
             if (this.config.io) {
-                this.config.io.to(payment.recipientWallet).emit('paymentFailed', {
+                this.config.io.to(`wallet:${payment.recipientWallet}`).emit('paymentFailed', {
                     paymentId: payment._id.toString(),
                     error: error.message || 'Unknown error',
                     gameId: payment.gameId
@@ -144,11 +175,11 @@ class PaymentProcessor {
     async sendPayment(recipientWalletAddress, amount) {
         const MAX_RETRIES = 3;
         let currentRetry = 0;
-        let currentEndpointIndex = 0;
+        let currentEndpointIndex = Math.floor(Math.random() * this.config.rpcEndpoints.length); // NEW: Randomize initial endpoint
         let connection = this.config.connection;
         while (currentRetry < MAX_RETRIES) {
             try {
-                console.log(`Attempt ${currentRetry + 1} to send ${amount} USDC to ${recipientWalletAddress}`);
+                console.log({ level: 'info', event: 'sendPayment', attempt: currentRetry + 1, amount, wallet: recipientWalletAddress, rpc: connection.rpcEndpoint }); // NEW: Structured log
                 
                 const recipientPublicKey = new PublicKey(recipientWalletAddress);
                 
@@ -169,7 +200,7 @@ class PaymentProcessor {
                 // Check if recipient ATA exists and create if not
                 const recipientTokenAccountInfo = await connection.getAccountInfo(recipientTokenAccount);
                 if (!recipientTokenAccountInfo) {
-                    console.log(`Creating ATA for recipient ${recipientWalletAddress}`);
+                    console.log({ level: 'info', event: 'sendPayment', message: `Creating ATA for ${recipientWalletAddress}` }); // NEW: Structured log
                     transaction.add(
                         createAssociatedTokenAccountInstruction(
                             this.config.TREASURY_WALLET,  // payer (treasury pays the fee)
@@ -193,44 +224,14 @@ class PaymentProcessor {
                 
                 transaction.feePayer = this.config.TREASURY_WALLET;
                 
-                // Try to get recent blockhash with retry mechanism
-                let blockhashObj;
-                let blockhashRetries = 3;
-                
-                while (blockhashRetries > 0) {
-                    try {
-                        console.log('Getting recent blockhash...');
-                        blockhashObj = await connection.getRecentBlockhash('confirmed');
-                        break;
-                    } catch (blockhashError) {
-                        console.warn(`Blockhash fetch attempt ${4 - blockhashRetries} failed:`, blockhashError.message);
-                        blockhashRetries--;
-                        
-                        if (blockhashRetries === 0) {
-                            // Try a different RPC endpoint
-                            currentEndpointIndex = (currentEndpointIndex + 1) % this.config.rpcEndpoints.length;
-                            const newEndpoint = this.config.rpcEndpoints[currentEndpointIndex];
-                            console.log(`Switching to alternative RPC endpoint: ${newEndpoint}`);
-                            
-                            connection = new Connection(newEndpoint, {
-                                commitment: 'confirmed',
-                                confirmTransactionInitialTimeout: 60000
-                            });
-                            
-                            // Reset blockhash retries with new connection
-                            blockhashRetries = 2;
-                            await new Promise(resolve => setTimeout(resolve, 1000));
-                            continue;
-                        }
-                        
-                        await new Promise(resolve => setTimeout(resolve, 1000));
-                    }
-                }
-                
-                transaction.recentBlockhash = blockhashObj.blockhash;
+                // FIXED: Use getLatestBlockhash instead of getRecentBlockhash
+                console.log({ level: 'info', event: 'sendPayment', message: 'Getting latest blockhash...' }); // NEW: Structured log
+                const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                transaction.recentBlockhash = blockhash;
+                transaction.lastValidBlockHeight = lastValidBlockHeight;
                 
                 // Sign and send transaction
-                console.log('Signing and sending transaction...');
+                console.log({ level: 'info', event: 'sendPayment', message: 'Signing and sending...' }); // NEW: Structured log
                 const signature = await sendAndConfirmTransaction(
                     connection,
                     transaction,
@@ -243,21 +244,21 @@ class PaymentProcessor {
                     }
                 );
                 
-                console.log('Transaction successful:', signature);
+                console.log({ level: 'info', event: 'sendPayment', signature, status: 'success' }); // NEW: Structured log
                 return signature;
             } catch (error) {
-                console.error(`Payment attempt ${currentRetry + 1} failed:`, error);
+                console.error({ level: 'error', event: 'sendPayment', attempt: currentRetry + 1, error: error.message, rpc: connection.rpcEndpoint }); // NEW: Structured log
                 currentRetry++;
                 
                 if (currentRetry >= MAX_RETRIES) {
-                    console.error('Max retries reached, payment failed');
+                    console.error({ level: 'error', event: 'sendPayment', message: 'Max retries reached' }); // NEW: Structured log
                     throw error;
                 }
                 
                 // Try a different RPC endpoint
                 currentEndpointIndex = (currentEndpointIndex + 1) % this.config.rpcEndpoints.length;
                 const newEndpoint = this.config.rpcEndpoints[currentEndpointIndex];
-                console.log(`Switching to alternative RPC endpoint: ${newEndpoint}`);
+                console.log({ level: 'info', event: 'sendPayment', message: `Switching RPC to ${newEndpoint}` }); // NEW: Structured log
                 
                 connection = new Connection(newEndpoint, {
                     commitment: 'confirmed',
@@ -266,7 +267,7 @@ class PaymentProcessor {
                 
                 // Exponential backoff
                 const waitTime = Math.pow(2, currentRetry) * 1000;
-                console.log(`Waiting ${waitTime}ms before retry...`);
+                console.log({ level: 'info', event: 'sendPayment', message: `Waiting ${waitTime}ms before retry` }); // NEW: Structured log
                 await new Promise(resolve => setTimeout(resolve, waitTime));
             }
         }
@@ -303,7 +304,7 @@ class PaymentProcessor {
             attempts: { $lt: 5 }
         }).sort({ createdAt: 1 });
         
-        console.log(`Found ${failedPayments.length} failed payments to retry`);
+        console.log({ level: 'info', event: 'retryFailedPayments', count: failedPayments.length }); // NEW: Structured log
 
         if (failedPayments.length === 0) {
             return { success: true, message: 'No failed payments to retry' };
@@ -318,7 +319,7 @@ class PaymentProcessor {
                 successCount++;
             } catch (error) {
                 failCount++;
-                console.error(`Failed to retry payment ${payment._id}:`, error);
+                console.error({ level: 'error', event: 'retryFailedPayments', paymentId: payment._id, error: error.message }); // NEW: Structured log
             }
             
             // Add delay between retries
