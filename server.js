@@ -1,4 +1,3 @@
-server.js
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -1095,7 +1094,8 @@ io.on('connection', (socket) => {
                         const opponentSocket = io.sockets.sockets.get(opponent.socketId);
                         if (opponentSocket) {
                             opponentSocket.join(roomId);
-                            opponentSocket.roomId = roomId;  // FIXED: Set on opponent too
+                            opponentSocket.roomId = roomId;
+                            opponentSocket.matchmakingPool = null;
                         }
 
                         io.to(roomId).emit('matchFound', {
@@ -1112,6 +1112,8 @@ io.on('connection', (socket) => {
                             joinTime: Date.now(),
                             transactionSignature
                         });
+
+                        socket.matchmakingPool = betAmount;
 
                         socket.emit('matchmakingJoined', {
                             waitingRoomId: `matchmaking-${betAmount}`,
@@ -1248,23 +1250,32 @@ io.on('connection', (socket) => {
                         }
                     }
 
-                    // FIXED: If not in room, scan matchmaking pools (retained, infrequent)
+                    if (!playerFound && socket.matchmakingPool) {
+                        console.log(`Player ${socket.id} found in matchmaking pool via socket reference`);
+                        const playerDataFromPool = await removeFromMatchmakingPool(socket.matchmakingPool, socket.id);
+                        if (playerDataFromPool) {
+                            playerData = playerDataFromPool;
+                            playerBetAmount = socket.matchmakingPool;
+                            playerFound = true;
+                            socket.matchmakingPool = null;  // ✅ NEW: Clear reference after removal
+                            console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
+                        }
+                    }
+
                     if (!playerFound) {
-                        console.log(`Player ${socket.id} not found in room, checking matchmaking pools`);
+                        console.log(`Player ${socket.id} not found via socket ref, falling back to scan (investigate why)`);
                         const poolKeys = await scanKeys('matchmaking:human:*');
                         for (const key of poolKeys) {
                             const betAmount = key.replace('matchmaking:human:', '');
                             const parsedBetAmount = parseFloat(betAmount);
-                            if (isNaN(parsedBetAmount)) {
-                                console.warn(`Invalid bet amount in Redis key ${key}`);
-                                continue;
-                            }
+                            if (isNaN(parsedBetAmount)) continue;
                             const playerDataFromPool = await removeFromMatchmakingPool(betAmount, socket.id);
                             if (playerDataFromPool) {
                                 playerData = playerDataFromPool;
                                 playerBetAmount = parsedBetAmount;
                                 playerFound = true;
-                                console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
+                                socket.matchmakingPool = null;  // ✅ NEW: Clear if fallback used
+                                console.warn(`Fallback scan used for ${socket.id} - pool ref was missing`);
                                 break;
                             }
                         }
@@ -1374,6 +1385,9 @@ io.on('connection', (socket) => {
                                 io.to(roomId).emit('playerLeft', player.username);
                             }
                         }
+                        
+                        // ✅ NEW: Clear matchmaking ref if somehow set (edge case)
+                        socket.matchmakingPool = null;
 
                         socket.emit('leftRoom', { roomId });
                     } catch (error) {
@@ -1721,26 +1735,24 @@ io.on('connection', (socket) => {
         console.log('Client disconnected:', socket.id);
 
         // 1. Check and remove from matchmaking pools in Redis (retained scan—fewer keys)
-        if (!redisHealthy) {
-            console.warn('Skipping matchmaking cleanup due to Redis unhealthiness');
-        } else {
+        if (socket.matchmakingPool && redisHealthy) {
             try {
-                const poolKeys = await scanKeys('matchmaking:human:*');
-                for (const key of poolKeys) {
-                    const betAmount = key.replace('matchmaking:human:', '');
-                    const pool = await getMatchmakingPool(betAmount);
-                    const playerIndex = pool.findIndex(p => p.socketId === socket.id);
-                    if (playerIndex !== -1) {
-                        const removedPlayer = await removeFromMatchmakingPool(betAmount, socket.id);
-                        if (removedPlayer) {
-                            console.log(`Player ${removedPlayer.walletAddress} (socket ${socket.id}) removed from matchmaking pool for bet ${betAmount}`);
-                        }
-                        await logMatchmakingState();
-                    }
+                const removedPlayer = await removeFromMatchmakingPool(socket.matchmakingPool, socket.id);
+                if (removedPlayer) {
+                    console.log(`Player ${removedPlayer.walletAddress} (socket ${socket.id}) removed from matchmaking pool for bet ${socket.matchmakingPool} (O(1))`);
                 }
+                socket.matchmakingPool = null;  // ✅ Clear ref
+                await logMatchmakingState();
             } catch (error) {
-                console.error(`Error cleaning up matchmaking pools for socket ${socket.id}:`, error);
+                console.error(`Error in O(1) matchmaking cleanup for socket ${socket.id}:`, error);
+                // FALLBACK ALERT: Log if ref missing/unhealthy (no scan to avoid DoS)
+                if (!redisHealthy || !socket.matchmakingPool) {
+                    console.warn(`Fallback needed for disconnect ${socket.id} - ref missing/unhealthy. Investigate manually.`);
+                    // TODO: Metric/alert (e.g., via Sentry) - do NOT scan here
+                }
             }
+        } else if (!redisHealthy) {
+            console.warn('Skipping matchmaking cleanup due to Redis unhealthiness');
         }
 
         // 2. Handle disconnection from active game rooms (FIXED: Use socket.roomId—no scan!)
