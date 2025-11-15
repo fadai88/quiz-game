@@ -49,9 +49,13 @@ if (ENVIRONMENT === 'production') {
     }
 }
 
-// NEW: TransactionLog model for permanent audit
 const TransactionLog = mongoose.model('TransactionLog', new mongoose.Schema({
-    signature: { type: String, required: true, unique: true },
+    signature: { 
+        type: String, 
+        required: true, 
+        unique: true,  // ✅ Enforce at DB level
+        index: true 
+    },
     walletAddress: String,
     betAmount: Number,
     verifiedAt: { type: Date, default: Date.now },
@@ -332,65 +336,98 @@ async function scanKeys(pattern, batchSize = 100) {
     return keys;
 }
 
-async function verifyAndValidateTransaction(signature, expectedAmount, senderAddress, recipientAddress, nonce, maxRetries = 3, retryDelay = 500) {  // NEW: Add nonce param
-    if (!redisHealthy) {
-        throw new Error('Service temporarily unavailable - please try again later');
-    }
-
+async function verifyAndValidateTransaction(signature, expectedAmount, senderAddress, recipientAddress, nonce, maxRetries = 3, retryDelay = 500) {
     console.log(`Verifying transaction ${signature} for ${expectedAmount} USDC from ${senderAddress} to ${recipientAddress}, nonce: ${nonce}`);
 
     const key = `tx:${signature}`;
-
-    // STRICT: No fallback - require Redis
-    let exists;
-    try {
-        exists = await redisClient.get(key);
-        if (exists) {
-            console.log(`Redis replay detected for ${key}`);
-        }
-    } catch (redisErr) {
-        console.error('Redis get failed:', redisErr.message);
-        redisHealthy = false;
-        throw new Error('Replay protection service unavailable');
-    }
-    
-    if (exists) {
-        console.error(`Transaction ${signature} already used`);
-        throw new Error('This transaction has already been used');
-    }
-
-    // STRICT: Nonce check - no fallback
     const nonceKey = `nonce:${nonce}`;
+
+    // Step 1: MongoDB atomic check-and-insert (PRIMARY PROTECTION)
     try {
-        const storedNonce = await redisClient.get(nonceKey);
-        if (storedNonce) {
-            throw new Error('Nonce already used - replay attempt');
+        const result = await TransactionLog.findOneAndUpdate(
+            { signature },
+            {
+                $setOnInsert: {
+                    signature,
+                    walletAddress: senderAddress,
+                    betAmount: expectedAmount,
+                    verifiedAt: new Date(),
+                    status: 'verified'
+                }
+            },
+            { upsert: true, new: false, runValidators: true }
+        );
+
+        if (result !== null) {
+            console.error(`Duplicate transaction ${signature} (MongoDB atomic check)`);
+            throw new Error('Transaction already processed');
         }
-        await redisClient.set(nonceKey, 'used', 'EX', 86400);
-    } catch (redisErr) {
-        console.error('Redis nonce check failed:', redisErr.message);
-        redisHealthy = false;
-        throw new Error('Replay protection service unavailable');
+        console.log(`MongoDB audit entry created for ${signature}`);
+    } catch (dbErr) {
+        if (dbErr.code === 11000) {
+            console.error(`Race condition: ${signature} duplicate key`);
+            throw new Error('Transaction already processed');
+        }
+        console.error('MongoDB audit failed:', dbErr.message);
+        throw new Error('Audit service unavailable');
     }
 
+    // Step 2: Redis checks (fast path + nonce)
+    if (redisHealthy) {
+        try {
+            const exists = await redisClient.get(key);
+            if (exists) {
+                console.log(`Redis replay detected for ${key}`);
+                throw new Error('This transaction has already been used');
+            }
+
+            const storedNonce = await redisClient.get(nonceKey);
+            if (storedNonce) {
+                throw new Error('Nonce already used');
+            }
+            await redisClient.set(nonceKey, 'used', 'EX', 86400);
+        } catch (redisErr) {
+            console.error('Redis check failed:', redisErr.message);
+            redisHealthy = false;
+            // Continue - MongoDB is primary
+        }
+    }
+
+    // Step 3-4: Blockchain validation
     let transaction;
     try {
         transaction = await verifyTransactionWithStatus(signature, maxRetries, retryDelay);
     } catch (error) {
         if (error.message.includes('Invalid param: Invalid')) {
             console.error(`Invalid transaction signature: ${signature}`);
+            await TransactionLog.findOneAndUpdate(
+                { signature },
+                { status: 'failed', errorMessage: 'Invalid signature' }
+            );
             throw new Error('Invalid transaction signature');
         }
         console.error(`Error verifying transaction ${signature}: ${error.message}`);
+        await TransactionLog.findOneAndUpdate(
+            { signature },
+            { status: 'failed', errorMessage: error.message }
+        );
         throw new Error('Failed to verify transaction');
     }
 
     if (!transaction) {
         console.error(`Transaction ${signature} not found after ${maxRetries} retries`);
+        await TransactionLog.findOneAndUpdate(
+            { signature },
+            { status: 'failed', errorMessage: 'Transaction not found' }
+        );
         throw new Error('Transaction could not be verified');
     }
     if (transaction.meta.err) {
         console.error(`Transaction ${signature} failed on chain: ${JSON.stringify(transaction.meta.err)}`);
+        await TransactionLog.findOneAndUpdate(
+            { signature },
+            { status: 'failed', errorMessage: JSON.stringify(transaction.meta.err) }
+        );
         throw new Error('Transaction failed on the blockchain');
     }
 
@@ -398,6 +435,10 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     const preTokenBalances = transaction.meta.preTokenBalances;
     if (!postTokenBalances || !preTokenBalances) {
         console.error(`Transaction ${signature} missing token balances`);
+        await TransactionLog.findOneAndUpdate(
+            { signature },
+            { status: 'failed', errorMessage: 'Missing token balances' }
+        );
         throw new Error('Transaction missing required balance information');
     }
 
@@ -405,38 +446,30 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     const treasuryPreBalance = preTokenBalances.find(b => b.owner === recipientAddress);
     if (!treasuryPostBalance || !treasuryPreBalance) {
         console.error(`Transaction ${signature} missing treasury balance change`);
+        await TransactionLog.findOneAndUpdate(
+            { signature },
+            { status: 'failed', errorMessage: 'Missing treasury balance' }
+        );
         throw new Error('Transaction does not include treasury balance change');
     }
 
     const balanceChange = (treasuryPostBalance.uiTokenAmount.uiAmount || 0) - (treasuryPreBalance.uiTokenAmount.uiAmount || 0);
     if (Math.abs(balanceChange - expectedAmount) > 0.001) {
         console.error(`Transaction ${signature} amount mismatch: expected ${expectedAmount}, got ${balanceChange}`);
+        await TransactionLog.findOneAndUpdate(
+            { signature },
+            { status: 'failed', errorMessage: `Amount mismatch: expected ${expectedAmount}, got ${balanceChange}` }
+        );
         throw new Error('Transaction amount does not match the expected bet');
     }
 
-    // STRICT: Store with extended TTL - no fallback
-    const ttl = 604800;  // 7 days
-    try {
-        await redisClient.set(key, 1, 'EX', ttl);
-        console.log(`Stored transaction signature ${signature} in Redis with ${ttl}s TTL`);
-    } catch (redisErr) {
-        console.error('Redis set failed:', redisErr.message);
-        redisHealthy = false;
-        throw new Error('Replay protection service unavailable');
-    }
-
-    // NEW: Log to MongoDB for permanent audit
-    try {
-        await TransactionLog.create({
-            signature,
-            walletAddress: senderAddress,
-            betAmount: expectedAmount,
-            status: 'verified'
-        });
-        console.log(`Transaction ${signature} logged to MongoDB audit`);
-    } catch (dbErr) {
-        console.error('Failed to log transaction to DB:', dbErr);
-        // Continue even if audit fails
+    // Step 5: Cache in Redis (best-effort)
+    if (redisHealthy) {
+        try {
+            await redisClient.set(key, 1, 'EX', 604800);
+        } catch (redisErr) {
+            console.error('Redis cache failed (non-blocking):', redisErr.message);
+        }
     }
 
     console.log(`Transaction ${signature} verified successfully`);
@@ -1056,21 +1089,25 @@ io.on('connection', (socket) => {
                         }
                     }
 
+                    // Step 1: Check for duplicates (read-only, safe)
                     const pool = await getMatchmakingPool(betAmount);
                     const existingPlayer = pool.find(p => p.walletAddress === walletAddress);
                     if (existingPlayer) {
-                        console.log(`Player ${walletAddress} is already in matchmaking pool for ${betAmount}`);
                         socket.emit('matchmakingError', { message: 'You are already in matchmaking' });
                         return;
                     }
 
-                    if (pool.length > 0) {
-                        const opponent = pool.shift();
-                        await redisClient.ltrim(`matchmaking:human:${betAmount}`, 1, -1);
+                    // Step 2: ATOMIC get-and-remove in ONE operation
+                    // ✅ This is the critical fix!
+                    const opponentJson = await redisClient.lpop(`matchmaking:human:${betAmount}`);
 
+                    if (opponentJson) {
+                        // SUCCESS: We atomically got an opponent
+                        // No other server could have gotten this same player
+                        const opponent = JSON.parse(opponentJson);
                         const roomId = generateRoomId();
-                        console.log(`Creating game room ${roomId} for matched players ${walletAddress} and ${opponent.walletAddress}`);
-
+                        console.log(`✅ ATOMIC MATCH: Creating game room ${roomId} for ${walletAddress} vs ${opponent.walletAddress}`);
+                        
                         await createGameRoom(roomId, betAmount, 'multiplayer');
                         let room = await getGameRoom(roomId);
                         room.players.push(
@@ -1090,7 +1127,7 @@ io.on('connection', (socket) => {
                         await updateGameRoom(roomId, room);
 
                         socket.join(roomId);
-                        socket.roomId = roomId;  // FIXED: Set roomId on socket
+                        socket.roomId = roomId;
                         const opponentSocket = io.sockets.sockets.get(opponent.socketId);
                         if (opponentSocket) {
                             opponentSocket.join(roomId);
@@ -1105,7 +1142,9 @@ io.on('connection', (socket) => {
 
                         await startGame(roomId);
                     } else {
-                        console.log(`Adding player ${walletAddress} to matchmaking pool for ${betAmount}`);
+                        // FAILURE: Queue was empty
+                        // Add current player to matchmaking pool
+                        console.log(`No opponents available. Adding ${walletAddress} to matchmaking pool for ${betAmount}`);
                         await addToMatchmakingPool(betAmount, {
                             socketId: socket.id,
                             walletAddress,
@@ -2023,6 +2062,22 @@ async function startGame(roomId) {
 
         await updateGameRoom(roomId, room);  // Save with all shuffled data
 
+        // ✅ DEBUG: Verify shuffle data persisted
+        const verifyRoom = await getGameRoom(roomId);
+        console.log('🔍 Shuffle verification:', {
+            questionCount: verifyRoom.questions.length,
+            firstQuestionHasShuffle: !!verifyRoom.questions[0]?.shuffledOptions,
+            shuffledOptionsLength: verifyRoom.questions[0]?.shuffledOptions?.length,
+            mapSize: verifyRoom.questionIdMap.size,
+            mapHasShuffle: !!verifyRoom.questionIdMap.get(verifyRoom.questions[0]?.tempId)?.shuffledOptions
+        });
+
+        if (!verifyRoom.questions[0]?.shuffledOptions) {
+            console.error('❌ CRITICAL: Shuffle data NOT persisted to Redis!');
+            throw new Error('Redis shuffle data not persisted');
+        }
+        console.log('✅ Shuffle data verified in Redis');
+
         io.to(roomId).emit('gameStart', {
             players: room.players.map(p => ({
                 username: p.username,
@@ -2068,12 +2123,23 @@ async function startSinglePlayerGame(roomId) {
 
         room.questions = rawQuestions.map((question, index) => {
             const tempId = `${roomId}-${uuidv4()}`;
+            const options = question.options;
+            const shuffledOptions = shuffleArray([...options]); // Shuffle copy
+            const shuffledCorrectAnswer = shuffledOptions.indexOf(options[question.correctAnswer]);
+            
+            if (shuffledCorrectAnswer === -1) {
+                console.error(`Failed to shuffle question ${tempId} correctly`);
+                throw new Error('Question shuffle failed');
+            }
+            
             const questionData = {
                 tempId,
-                _id: question._id,  // Add for rotation tracking
+                _id: question._id,
                 question: question.question,
-                options: question.options,
-                correctAnswer: question.correctAnswer
+                options: options,   // Original for reference
+                correctAnswer: question.correctAnswer,  // Original index
+                shuffledOptions,    // ✅ Pre-computed
+                shuffledCorrectAnswer  // ✅ Pre-computed
             };
             room.questionIdMap.set(tempId, questionData);
             return questionData;
@@ -2145,6 +2211,22 @@ async function startSinglePlayerGame(roomId) {
         console.log('Bot added to room. Total players:', room.players.length);
 
         await updateGameRoom(roomId, room);
+
+        // ✅ DEBUG: Verify shuffle data persisted
+        const verifyRoom = await getGameRoom(roomId);
+        console.log('🔍 Shuffle verification:', {
+            questionCount: verifyRoom.questions.length,
+            firstQuestionHasShuffle: !!verifyRoom.questions[0]?.shuffledOptions,
+            shuffledOptionsLength: verifyRoom.questions[0]?.shuffledOptions?.length,
+            mapSize: verifyRoom.questionIdMap.size,
+            mapHasShuffle: !!verifyRoom.questionIdMap.get(verifyRoom.questions[0]?.tempId)?.shuffledOptions
+        });
+
+        if (!verifyRoom.questions[0]?.shuffledOptions) {
+            console.error('❌ CRITICAL: Shuffle data NOT persisted to Redis!');
+            throw new Error('Redis shuffle data not persisted');
+        }
+        console.log('✅ Shuffle data verified in Redis');
 
         io.to(roomId).emit('botGameReady', {
             botName: bot.username,
@@ -2232,10 +2314,32 @@ async function startNextQuestion(roomId) {
         player.lastResponseTime = null;
     });
 
-    const shuffledOptions = shuffleArray([...currentQuestion.options]);
-    const shuffledCorrectAnswer = shuffledOptions.indexOf(currentQuestion.options[currentQuestion.correctAnswer]);
-    if (shuffledCorrectAnswer === -1) {
-        console.error(`Failed to find correct answer in shuffled options for room ${roomId}`);
+    const shuffledOptions = currentQuestion.shuffledOptions;
+    const shuffledCorrectAnswer = currentQuestion.shuffledCorrectAnswer;
+
+    // ✅ Validation with recovery
+    if (!shuffledOptions || !Array.isArray(shuffledOptions) || shuffledOptions.length === 0) {
+        console.error(`❌ Missing shuffledOptions for question ${currentQuestion.tempId} in room ${roomId}`);
+        console.error('Current question data:', JSON.stringify(currentQuestion, null, 2));
+        
+        // Try recovery from room.questions array
+        const originalQ = room.questions.find(q => q.tempId === currentQuestion.tempId);
+        if (originalQ && originalQ.shuffledOptions && originalQ.shuffledOptions.length > 0) {
+            console.log('✅ Recovered shuffle data from room.questions array');
+            currentQuestion.shuffledOptions = originalQ.shuffledOptions;
+            currentQuestion.shuffledCorrectAnswer = originalQ.shuffledCorrectAnswer;
+        } else {
+            console.error('❌ CRITICAL: Cannot recover shuffle data. Aborting game.');
+            io.to(roomId).emit('gameError', 'Critical: shuffle data lost. Please restart the game.');
+            room.isDeleted = true;
+            await updateGameRoom(roomId, room);
+            await redisClient.del(`room:${roomId}`);
+            return;
+        }
+    }
+
+    if (shuffledCorrectAnswer === undefined || shuffledCorrectAnswer === -1) {
+        console.error(`❌ Invalid shuffledCorrectAnswer for question ${currentQuestion.tempId}`);
         io.to(roomId).emit('gameError', 'Invalid question configuration');
         room.isDeleted = true;
         await updateGameRoom(roomId, room);
@@ -2243,9 +2347,12 @@ async function startNextQuestion(roomId) {
         return;
     }
 
-    currentQuestion.shuffledOptions = shuffledOptions;
-    currentQuestion.shuffledCorrectAnswer = shuffledCorrectAnswer;
-    room.questionIdMap.set(currentQuestion.tempId, { ...currentQuestion });
+    // ✅ Update map with verified shuffle data (idempotent)
+    room.questionIdMap.set(currentQuestion.tempId, {
+        ...currentQuestion,
+        shuffledOptions,
+        shuffledCorrectAnswer
+    });
 
     await updateGameRoom(roomId, room);
     console.log(`Question ${room.currentQuestionIndex + 1} started at timestamp: ${room.questionStartTime} for room ${roomId}`);
@@ -2684,15 +2791,14 @@ async function createGameRoom(roomId, betAmount, roomMode = null) {
         hasBot: false,
         questionStartTime: null,
         roundStartTime: null,
-        isDeleted: false // New flag
+        isDeleted: false
     };
 
     try {
         await redisClient.hset(`room:${roomId}`, {
-            ...room,
             players: JSON.stringify(room.players),
             questions: JSON.stringify(room.questions),
-            questionIdMap: JSON.stringify(room.questionIdMap),
+            questionIdMap: JSON.stringify([]),  // ✅ Store as empty array, not {}
             betAmount: betAmount.toString(),
             currentQuestionIndex: room.currentQuestionIndex.toString(),
             answersReceived: room.answersReceived.toString(),
@@ -2722,11 +2828,59 @@ async function getGameRoom(roomId) {
             return null;
         }
 
+        // ✅ FIXED: Properly deserialize questions
+        const questions = JSON.parse(roomData.questions || '[]').map(q => ({
+            ...q,
+            _id: q._id ? new mongoose.Types.ObjectId(q._id) : null,
+            shuffledOptions: q.shuffledOptions || [],
+            shuffledCorrectAnswer: q.shuffledCorrectAnswer ?? -1
+        }));
+
+        // ✅ FIXED: Handle both empty array and legacy object format
+        let questionIdMap = new Map();
+        try {
+            const mapData = JSON.parse(roomData.questionIdMap || '[]');
+            
+            // Check if it's an array (new format) or object (legacy format)
+            if (Array.isArray(mapData)) {
+                // New format: array of {key, value} objects
+                questionIdMap = new Map(
+                    mapData.map(item => [
+                        item.key,
+                        {
+                            ...item.value,
+                            _id: item.value._id ? new mongoose.Types.ObjectId(item.value._id) : null,
+                            shuffledOptions: item.value.shuffledOptions || [],
+                            shuffledCorrectAnswer: item.value.shuffledCorrectAnswer ?? -1
+                        }
+                    ])
+                );
+            } else if (typeof mapData === 'object' && mapData !== null) {
+                // Legacy format: plain object (convert to Map)
+                console.warn(`Room ${roomId} using legacy questionIdMap format - converting`);
+                questionIdMap = new Map(
+                    Object.entries(mapData).map(([key, val]) => [
+                        key,
+                        {
+                            ...val,
+                            _id: val._id ? new mongoose.Types.ObjectId(val._id) : null,
+                            shuffledOptions: val.shuffledOptions || [],
+                            shuffledCorrectAnswer: val.shuffledCorrectAnswer ?? -1
+                        }
+                    ])
+                );
+            }
+        } catch (parseError) {
+            console.error(`Error parsing questionIdMap for room ${roomId}:`, parseError);
+            // Start with empty Map if parsing fails
+            questionIdMap = new Map();
+        }
+
         return {
             players: JSON.parse(roomData.players || '[]'),
             betAmount: parseFloat(roomData.betAmount) || 0,
-            questions: JSON.parse(roomData.questions || '[]'),
-            questionIdMap: new Map(Object.entries(JSON.parse(roomData.questionIdMap || '{}'))),
+            questions: questions,
+            questionIdMap: questionIdMap,
             currentQuestionIndex: parseInt(roomData.currentQuestionIndex) || 0,
             answersReceived: parseInt(roomData.answersReceived) || 0,
             gameStarted: roomData.gameStarted === 'true',
@@ -2737,7 +2891,7 @@ async function getGameRoom(roomId) {
             roundStartTime: roomData.roundStartTime ? parseInt(roomData.roundStartTime) : null,
             questionTimeout: null,
             waitingTimeout: null,
-            isDeleted: roomData.isDeleted === 'true' // Parse isDeleted
+            isDeleted: roomData.isDeleted === 'true'
         };
     } catch (error) {
         console.error(`Error fetching room ${roomId} from Redis:`, error);
@@ -2751,17 +2905,40 @@ async function updateGameRoom(roomId, room) {
         throw new Error('Service temporarily unavailable');
     }
     try {
-        // Check if room is marked as deleted
         if (room.isDeleted) {
             console.log(`Room ${roomId} is marked as deleted, skipping update`);
             return;
         }
 
+        // ✅ Serialize questions with explicit shuffle data
+        const serializedQuestions = room.questions.map(q => ({
+            tempId: q.tempId,
+            _id: q._id ? q._id.toString() : null,
+            question: q.question,
+            options: q.options,
+            correctAnswer: q.correctAnswer,
+            shuffledOptions: q.shuffledOptions || [],
+            shuffledCorrectAnswer: q.shuffledCorrectAnswer ?? -1
+        }));
+
+        // ✅ Serialize Map as array of {key, value} objects
+        const serializedMap = Array.from(room.questionIdMap.entries()).map(([key, val]) => ({
+            key: key,
+            value: {
+                tempId: val.tempId,
+                _id: val._id ? val._id.toString() : null,
+                question: val.question,
+                options: val.options,
+                correctAnswer: val.correctAnswer,
+                shuffledOptions: val.shuffledOptions || [],
+                shuffledCorrectAnswer: val.shuffledCorrectAnswer ?? -1
+            }
+        }));
+
         const roomData = {
-            ...room,
             players: JSON.stringify(room.players),
-            questions: JSON.stringify(room.questions),
-            questionIdMap: JSON.stringify(Object.fromEntries(room.questionIdMap)),
+            questions: JSON.stringify(serializedQuestions),
+            questionIdMap: JSON.stringify(serializedMap),
             betAmount: room.betAmount.toString(),
             currentQuestionIndex: room.currentQuestionIndex.toString(),
             answersReceived: room.answersReceived.toString(),
@@ -3093,22 +3270,30 @@ async function updatePlayerStats(players, roomData) {
     
     console.log(`Game stats: winner=${winner}, betAmount=${roomData.betAmount}, winnings=${winningAmount}`);
     
-    try {
-        for (const player of players) {
-            if (player.isBot) {
-                console.log(`Skipping stats update for bot: ${player.username}`);
-                continue;
-            }
-            
-            if (!player.username) {
-                console.log(`Skipping player with no username:`, player);
-                continue;
-            }
-            
-            const isWinner = player.username === winner;
-            console.log(`Updating stats for player: ${player.username} (winner: ${isWinner})`);
-            
-            try {
+    // ✅ Check if MongoDB supports transactions (replica set or Atlas)
+    const supportsTransactions = mongoose.connection.client.topology?.description?.type !== 'Single';
+    
+    if (supportsTransactions) {
+        // PRODUCTION: Use transactions for ACID guarantees
+        console.log('Using MongoDB transactions for player stats');
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        
+        try {
+            for (const player of players) {
+                if (player.isBot) {
+                    console.log(`Skipping bot: ${player.username}`);
+                    continue;
+                }
+                
+                if (!player.username) {
+                    console.log(`Skipping player with no username`);
+                    continue;
+                }
+                
+                const isWinner = player.username === winner;
+                console.log(`Updating ${player.username} (winner: ${isWinner})`);
+                
                 const updateObj = {
                     $inc: {
                         gamesPlayed: 1,
@@ -3121,25 +3306,85 @@ async function updatePlayerStats(players, roomData) {
                     updateObj.$inc.totalWinnings = winningAmount;
                 }
                 
-                console.log(`Update for ${player.username}:`, JSON.stringify(updateObj));
-                
                 const result = await User.findOneAndUpdate(
                     { walletAddress: player.username },
                     updateObj,
-                    { upsert: true, new: true }
+                    { 
+                        upsert: true, 
+                        new: true,
+                        session  // Include session for transaction
+                    }
                 );
                 
-                console.log(`Stats updated for ${player.username}:`, {
+                console.log(`Updated ${player.username}:`, {
                     gamesPlayed: result.gamesPlayed,
-                    correctAnswers: result.correctAnswers,
                     wins: result.wins,
                     totalWinnings: result.totalWinnings
                 });
-            } catch (error) {
-                console.error(`Error updating player ${player.username} stats:`, error);
             }
+            
+            await session.commitTransaction();
+            console.log('All player stats committed successfully (transaction)');
+        } catch (error) {
+            await session.abortTransaction();
+            console.error('Player stats transaction failed (rolled back):', error);
+            throw error;
+        } finally {
+            session.endSession();
         }
-    } catch (error) {
-        console.error('Error in updatePlayerStats:', error);
+    } else {
+        // DEVELOPMENT: Use atomic operations without transactions
+        console.log('⚠️ Using atomic updates (no transactions - standalone MongoDB)');
+        
+        try {
+            for (const player of players) {
+                if (player.isBot) {
+                    console.log(`Skipping bot: ${player.username}`);
+                    continue;
+                }
+                
+                if (!player.username) {
+                    console.log(`Skipping player with no username`);
+                    continue;
+                }
+                
+                const isWinner = player.username === winner;
+                console.log(`Updating ${player.username} (winner: ${isWinner})`);
+                
+                const updateObj = {
+                    $inc: {
+                        gamesPlayed: 1,
+                        correctAnswers: player.score || 0
+                    }
+                };
+                
+                if (isWinner) {
+                    updateObj.$inc.wins = 1;
+                    updateObj.$inc.totalWinnings = winningAmount;
+                }
+                
+                // ✅ Atomic $inc operations (safe without transactions for single-doc updates)
+                const result = await User.findOneAndUpdate(
+                    { walletAddress: player.username },
+                    updateObj,
+                    { 
+                        upsert: true, 
+                        new: true
+                        // No session - atomic at field level
+                    }
+                );
+                
+                console.log(`Updated ${player.username}:`, {
+                    gamesPlayed: result.gamesPlayed,
+                    wins: result.wins,
+                    totalWinnings: result.totalWinnings
+                });
+            }
+            
+            console.log('All player stats updated successfully (atomic)');
+        } catch (error) {
+            console.error('Error in updatePlayerStats (atomic mode):', error);
+            throw error;
+        }
     }
 }
