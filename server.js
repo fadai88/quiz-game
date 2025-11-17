@@ -336,6 +336,50 @@ async function scanKeys(pattern, batchSize = 100) {
     return keys;
 }
 
+// ✅ NEW: O(1) waiting room index management to replace O(N) room scans
+async function addWaitingRoom(betAmount, roomId) {
+    if (!redisHealthy) {
+        console.warn('Cannot add waiting room - Redis unhealthy');
+        return false;
+    }
+    try {
+        await redisClient.zadd(`waiting_rooms:${betAmount}`, Date.now(), roomId);
+        await redisClient.expire(`waiting_rooms:${betAmount}`, 3600);
+        console.log(`Added room ${roomId} to waiting index for bet ${betAmount}`);
+        return true;
+    } catch (error) {
+        console.error(`Error adding waiting room ${roomId}:`, error);
+        return false;
+    }
+}
+
+async function getWaitingRoom(betAmount) {
+    if (!redisHealthy) {
+        console.warn('Cannot get waiting room - Redis unhealthy');
+        return null;
+    }
+    try {
+        const roomIds = await redisClient.zrange(`waiting_rooms:${betAmount}`, 0, 0);
+        return roomIds.length > 0 ? roomIds[0] : null;
+    } catch (error) {
+        console.error(`Error getting waiting room for bet ${betAmount}:`, error);
+        return null;
+    }
+}
+
+async function removeWaitingRoom(betAmount, roomId) {
+    if (!redisHealthy) {
+        console.warn('Cannot remove waiting room - Redis unhealthy');
+        return;
+    }
+    try {
+        await redisClient.zrem(`waiting_rooms:${betAmount}`, roomId);
+        console.log(`Removed room ${roomId} from waiting index for bet ${betAmount}`);
+    } catch (error) {
+        console.error(`Error removing waiting room ${roomId}:`, error);
+    }
+}
+
 async function verifyAndValidateTransaction(signature, expectedAmount, senderAddress, recipientAddress, nonce, maxRetries = 3, retryDelay = 500) {
     console.log(`Verifying transaction ${signature} for ${expectedAmount} USDC from ${senderAddress} to ${recipientAddress}, nonce: ${nonce}`);
 
@@ -911,6 +955,10 @@ io.on('connection', (socket) => {
                     await logGameRoomsState();
                 } else if (event === 'playerReady') {
                     const { roomId, preferredMode, recaptchaToken } = args[0];
+                    
+                    // ✅ NEW: Rate limit playerReady to prevent DoS (max 3 per minute)
+                    await rateLimitEvent(socket.user.walletAddress, 'playerReady', 3, 60);
+                    
                     const { error } = playerReadySchema.validate({ roomId, preferredMode, recaptchaToken });
                     if (error) {
                         console.error('Validation error in playerReady:', error.message);
@@ -969,12 +1017,10 @@ io.on('connection', (socket) => {
                         if (room.players.length === 1) {
                             let matchFound = false;
 
-                            // FIXED: Scan for matching rooms (retained, but infrequent—only on ready)
-                            const roomKeys = await scanKeys('room:*');
-                            for (const key of roomKeys) {
-                                const otherRoomId = key.replace('room:', '');
-                                if (otherRoomId === roomId) continue;
-
+                            // ✅ FIXED: O(1) lookup instead of O(N) scanKeys
+                            const otherRoomId = await getWaitingRoom(room.betAmount);
+                            
+                            if (otherRoomId && otherRoomId !== roomId) {
                                 const otherRoom = await getGameRoom(otherRoomId);
                                 if (
                                     otherRoom &&
@@ -983,15 +1029,15 @@ io.on('connection', (socket) => {
                                     otherRoom.betAmount === room.betAmount &&
                                     otherRoom.players.length === 1
                                 ) {
-                                    console.log(`Found matching room ${otherRoomId} for player in room ${roomId}`);
+                                    console.log(`Found matching room ${otherRoomId} for player in room ${roomId} (O(1) lookup)`);
                                     const player = room.players[0];
                                     otherRoom.players.push(player);
                                     await updateGameRoom(otherRoomId, otherRoom);
 
                                     socket.leave(roomId);
-                                    if (roomId === socket.roomId) socket.roomId = null;  // FIXED: Clear old roomId
+                                    if (roomId === socket.roomId) socket.roomId = null;
                                     socket.join(otherRoomId);
-                                    socket.roomId = otherRoomId;  // FIXED: Set new roomId
+                                    socket.roomId = otherRoomId;
 
                                     socket.emit('matchFound', { newRoomId: otherRoomId });
                                     io.to(otherRoomId).emit('playerJoined', player.username);
@@ -1000,14 +1046,21 @@ io.on('connection', (socket) => {
                                     await updateGameRoom(otherRoomId, otherRoom);
                                     await startGame(otherRoomId);
 
+                                    // ✅ Clean up both rooms from waiting index
+                                    await removeWaitingRoom(room.betAmount, roomId);
+                                    await removeWaitingRoom(room.betAmount, otherRoomId);
                                     await deleteGameRoom(roomId);
                                     matchFound = true;
-                                    break;
+                                } else {
+                                    // Other room invalid/gone, remove from index and add current room
+                                    console.log(`Waiting room ${otherRoomId} no longer valid, replacing with ${roomId}`);
+                                    await removeWaitingRoom(room.betAmount, otherRoomId);
+                                    await addWaitingRoom(room.betAmount, roomId);
                                 }
-                            }
-
-                            if (!matchFound) {
-                                console.log(`No match found for player in room ${roomId}, waiting for others`);
+                            } else {
+                                // No waiting room found, add this one to index
+                                await addWaitingRoom(room.betAmount, roomId);
+                                console.log(`No match found for player in room ${roomId}, added to waiting index`);
                             }
                         }
                     }
@@ -1145,19 +1198,24 @@ io.on('connection', (socket) => {
                         // FAILURE: Queue was empty
                         // Add current player to matchmaking pool
                         console.log(`No opponents available. Adding ${walletAddress} to matchmaking pool for ${betAmount}`);
-                        await addToMatchmakingPool(betAmount, {
+                        // ✅ FIXED: Verify pool add succeeds before setting socket property
+                        const poolAdded = await addToMatchmakingPool(betAmount, {
                             socketId: socket.id,
                             walletAddress,
                             joinTime: Date.now(),
                             transactionSignature
                         });
 
-                        socket.matchmakingPool = betAmount;
-
-                        socket.emit('matchmakingJoined', {
-                            waitingRoomId: `matchmaking-${betAmount}`,
-                            position: (await getMatchmakingPool(betAmount)).length
-                        });
+                        if (poolAdded) {
+                            socket.matchmakingPool = betAmount;  // ✅ Only set if confirmed added
+                            socket.emit('matchmakingJoined', {
+                                waitingRoomId: `matchmaking-${betAmount}`,
+                                position: (await getMatchmakingPool(betAmount)).length
+                            });
+                        } else {
+                            // Should not happen (addToMatchmakingPool throws on error), but defensive
+                            throw new Error('Failed to join matchmaking pool');
+                        }
                     }
 
                     await logMatchmakingState();
@@ -1296,28 +1354,21 @@ io.on('connection', (socket) => {
                             playerData = playerDataFromPool;
                             playerBetAmount = socket.matchmakingPool;
                             playerFound = true;
-                            socket.matchmakingPool = null;  // ✅ NEW: Clear reference after removal
+                            socket.matchmakingPool = null;  // ✅ Clear reference after removal
                             console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
                         }
                     }
 
+                    // ✅ FIXED: Removed fallback scanKeys - force root cause fix
                     if (!playerFound) {
-                        console.log(`Player ${socket.id} not found via socket ref, falling back to scan (investigate why)`);
-                        const poolKeys = await scanKeys('matchmaking:human:*');
-                        for (const key of poolKeys) {
-                            const betAmount = key.replace('matchmaking:human:', '');
-                            const parsedBetAmount = parseFloat(betAmount);
-                            if (isNaN(parsedBetAmount)) continue;
-                            const playerDataFromPool = await removeFromMatchmakingPool(betAmount, socket.id);
-                            if (playerDataFromPool) {
-                                playerData = playerDataFromPool;
-                                playerBetAmount = parsedBetAmount;
-                                playerFound = true;
-                                socket.matchmakingPool = null;  // ✅ NEW: Clear if fallback used
-                                console.warn(`Fallback scan used for ${socket.id} - pool ref was missing`);
-                                break;
-                            }
-                        }
+                        console.error(`CRITICAL METRIC: socket.matchmakingPool missing for ${socket.id} - potential bug or race condition`);
+                        // TODO: Send to monitoring service (Sentry, Datadog, CloudWatch, etc.)
+                        // Example: await metrics.increment('matchmaking.missing_pool_ref', { socketId: socket.id });
+                        
+                        socket.emit('matchmakingError', { 
+                            message: 'Matchmaking state lost. Please try joining the queue again.' 
+                        });
+                        return;
                     }
 
                     if (!playerFound || !playerData) {
@@ -2978,6 +3029,11 @@ async function deleteGameRoom(roomId) {
             }
             room.isDeleted = true;
             await updateGameRoom(roomId, room); // Mark as deleted
+            
+            // ✅ NEW: Clean up from waiting room index if present
+            if (room.betAmount && room.roomMode === 'human') {
+                await removeWaitingRoom(room.betAmount, roomId);
+            }
         }
 
         const multi = redisClient.multi();
@@ -3003,10 +3059,11 @@ async function addToMatchmakingPool(betAmount, playerData) {
     try {
         await redisClient.lpush(`matchmaking:human:${betAmount}`, JSON.stringify(playerData));
         console.log(`Added player ${playerData.walletAddress} to matchmaking pool for ${betAmount}`);
+        return true;  // ✅ Return success for caller to verify
     } catch (error) {
         console.error(`Error adding to matchmaking pool for ${betAmount}:`, error);
         redisHealthy = false;
-        throw error;
+        throw error;  // ✅ Throw to propagate error
     }
 }
 
