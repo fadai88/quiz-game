@@ -336,22 +336,94 @@ setTimeout(() => {
     initializeSocketAdapter().catch(console.error);
 }, 1000);
 
-// SCAN-based helper: Replace KEYS for non-blocking iteration
-async function scanKeys(pattern, batchSize = 100) {
-    return await safeRedisOp(
-        async () => {
-            let cursor = '0';
-            let keys = [];
-            do {
-                const result = await redisClient.scan(cursor, 'MATCH', pattern, 'COUNT', batchSize);
-                cursor = result[0];
-                keys = keys.concat(result[1]);
-            } while (cursor !== '0');
-            return keys;
-        },
-        [],
-        `SCAN for pattern ${pattern}`
-    );
+
+// Get all active room IDs (O(N) but N is bounded by concurrent games, not all keys)
+async function getCleanActiveRooms() {
+    try {
+        // 1. Get all IDs from the set
+        const roomIds = await redisClient.smembers('active:rooms');
+        if (roomIds.length === 0) return [];
+
+        const validRooms = [];
+        const pipeline = redisClient.pipeline();
+
+        // 2. Check existence of every room efficiently
+        for (const roomId of roomIds) {
+            pipeline.exists(`room:${roomId}`);
+        }
+        
+        const results = await pipeline.exec(); // [ [null, 1], [null, 0] ... ]
+
+        // 3. Filter results and prepare cleanup
+        const cleanupPipeline = redisClient.pipeline();
+        
+        roomIds.forEach((roomId, index) => {
+            const exists = results[index][1] === 1;
+            if (exists) {
+                validRooms.push(roomId);
+            } else {
+                // Room data is gone, but ID is still in set -> Zombie!
+                // Queue it for removal
+                cleanupPipeline.srem('active:rooms', roomId);
+            }
+        });
+
+        // 4. Execute cleanup if needed
+        if (cleanupPipeline.length > 0) {
+            await cleanupPipeline.exec();
+            console.log(`🧹 Cleaned up ${roomIds.length - validRooms.length} zombie room IDs`);
+        }
+
+        return validRooms;
+    } catch (error) {
+        console.error('Error getting/cleaning active rooms:', error);
+        return [];
+    }
+}
+
+// Add wallet to matchmaking pool set
+async function trackMatchmakingPlayer(betAmount, walletAddress) {
+    try {
+        await redisClient.sadd(`active:matchmaking:${betAmount}`, walletAddress);
+        console.log(`✅ Tracking matchmaking player: ${walletAddress} in ${betAmount} pool`);
+    } catch (error) {
+        console.error('Error tracking matchmaking player:', error);
+    }
+}
+
+// Remove wallet from matchmaking pool set
+async function untrackMatchmakingPlayer(betAmount, walletAddress) {
+    try {
+        await redisClient.srem(`active:matchmaking:${betAmount}`, walletAddress);
+        console.log(`✅ Untracked matchmaking player: ${walletAddress} from ${betAmount} pool`);
+    } catch (error) {
+        console.error('Error untracking matchmaking player:', error);
+    }
+}
+
+// Get all wallets in a specific matchmaking pool
+async function getMatchmakingPoolWallets(betAmount) {
+    try {
+        return await redisClient.smembers(`active:matchmaking:${betAmount}`);
+    } catch (error) {
+        console.error('Error getting matchmaking pool wallets:', error);
+        return [];
+    }
+}
+
+// Get all active matchmaking bet amounts
+async function getAllMatchmakingPools() {
+    const validBets = [3, 10, 15, 20, 30];
+    const pools = {};
+    
+    for (const bet of validBets) {
+        const wallets = await getMatchmakingPoolWallets(bet);
+        if (wallets.length > 0) {
+            pools[bet] = wallets;
+        }
+    }
+    
+    return pools;
 }
 
 // ✅ NEW: O(1) waiting room index management to replace O(N) room scans
@@ -502,12 +574,19 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('Transaction does not include treasury balance change');
     }
 
-    const balanceChange = (treasuryPostBalance.uiTokenAmount.uiAmount || 0) - (treasuryPreBalance.uiTokenAmount.uiAmount || 0);
-    if (Math.abs(balanceChange - expectedAmount) > 0.001) {
-        console.error(`Transaction ${signature} amount mismatch: expected ${expectedAmount}, got ${balanceChange}`);
+    const postAmount = BigInt(treasuryPostBalance.uiTokenAmount.amount || '0');
+    const preAmount = BigInt(treasuryPreBalance.uiTokenAmount.amount || '0');
+    const balanceChangeBigInt = postAmount - preAmount;
+
+    // USDC has 6 decimals. Convert expectedAmount (e.g., 10) to 10000000
+    const expectedBigInt = BigInt(Math.round(expectedAmount * 1_000_000));
+
+    // Allow a tiny variance (optional) or strict equality
+    if (balanceChangeBigInt !== expectedBigInt) {
+        console.error(`Transaction ${signature} amount mismatch: expected ${expectedBigInt} (raw), got ${balanceChangeBigInt} (raw)`);
         await TransactionLog.findOneAndUpdate(
             { signature },
-            { status: 'failed', errorMessage: `Amount mismatch: expected ${expectedAmount}, got ${balanceChange}` }
+            { status: 'failed', errorMessage: `Amount mismatch: expected ${expectedAmount}, got ${Number(balanceChangeBigInt)/1000000}` }
         );
         throw new Error('Transaction amount does not match the expected bet');
     }
@@ -2814,7 +2893,7 @@ async function verifyRecaptcha(token) {
     }
 }
 
-async function createGameRoom(roomId, betAmount, roomMode = null) {
+async function createGameRoom(roomId, betAmount, roomMode = 'waiting') {
     const room = {
         players: [],
         betAmount,
@@ -2835,26 +2914,41 @@ async function createGameRoom(roomId, betAmount, roomMode = null) {
 
     await criticalRedisOp(
         async () => {
-            await redisClient.hset(`room:${roomId}`, {
-            players: JSON.stringify(room.players),
-            questions: JSON.stringify(room.questions),
-            questionIdMap: JSON.stringify([]),  // ✅ Store as empty array, not {}
-            betAmount: betAmount.toString(),
-            currentQuestionIndex: room.currentQuestionIndex.toString(),
-            answersReceived: room.answersReceived.toString(),
-            gameStarted: room.gameStarted.toString(),
-            roomMode: roomMode || '',
-            hasBot: room.hasBot.toString(),
-            playerLeft: room.playerLeft.toString(),
-            questionStartTime: room.questionStartTime ? room.questionStartTime.toString() : '',
-            roundStartTime: room.roundStartTime ? room.roundStartTime.toString() : '',
-            isDeleted: room.isDeleted.toString()
-        });
-            await redisClient.expire(`room:${roomId}`, 3600);
-            console.log(`Created room ${roomId} in Redis with bet amount ${betAmount}`);
+            // Prepare the Redis Transaction
+            const multi = redisClient.multi();
+
+            // 1. Set the Hash Data
+            multi.hset(`room:${roomId}`, {
+                players: JSON.stringify(room.players),
+                questions: JSON.stringify(room.questions),
+                questionIdMap: JSON.stringify([]), // Store as empty array
+                betAmount: betAmount.toString(),
+                currentQuestionIndex: room.currentQuestionIndex.toString(),
+                answersReceived: room.answersReceived.toString(),
+                gameStarted: room.gameStarted.toString(),
+                roomMode: roomMode || '',
+                hasBot: room.hasBot.toString(),
+                playerLeft: room.playerLeft.toString(),
+                questionStartTime: room.questionStartTime ? room.questionStartTime.toString() : '',
+                roundStartTime: room.roundStartTime ? room.roundStartTime.toString() : '',
+                isDeleted: room.isDeleted.toString()
+            });
+
+            // 2. Set Expiry (1 hour)
+            multi.expire(`room:${roomId}`, 3600);
+
+            // 3. ATOMIC FIX: Add to the active rooms set in the same transaction
+            multi.sadd('active:rooms', roomId);
+
+            // Execute all at once
+            await multi.exec();
+            
+            console.log(`Created & tracked room ${roomId} in Redis with bet ${betAmount}`);
         },
         `Create game room ${roomId}`
     );
+    
+    return room;
 }
 
 async function getGameRoom(roomId) {
@@ -2998,33 +3092,39 @@ async function updateGameRoom(roomId, room) {
 
 async function deleteGameRoom(roomId) {
     try {
+        // Fetch room first to check logic requirements (like waiting rooms)
         let room = await getGameRoom(roomId);
+        
+        // Clear Node.js timeouts if they exist in memory
         if (room) {
             if (room.questionTimeout) {
                 clearTimeout(room.questionTimeout);
                 room.questionTimeout = null;
             }
-            room.isDeleted = true;
-            await updateGameRoom(roomId, room); // Mark as deleted
-            
-            // ✅ NEW: Clean up from waiting room index if present
-            if (room.betAmount && room.roomMode === 'human') {
-                await removeWaitingRoom(room.betAmount, roomId);
-            }
+            // Note: We don't updateGameRoom here because we are about to delete it entirely
         }
 
+        // Prepare Redis Transaction
         const multi = redisClient.multi();
+
+        // 1. Delete the room data
         multi.del(`room:${roomId}`);
-        await multi.exec();
-        console.log(`Deleted room ${roomId} from Redis via transaction`);
-        const roomExists = await redisClient.exists(`room:${roomId}`);
-        if (roomExists) {
-            console.error(`Room ${roomId} still exists after deletion attempt`);
-            await redisClient.del(`room:${roomId}`);
+
+        // 2. ATOMIC FIX: Remove from the active rooms set
+        multi.srem('active:rooms', roomId);
+
+        // 3. Cleanup waiting room index if applicable
+        if (room && room.betAmount && room.roomMode === 'human') {
+            multi.zrem(`waiting_rooms:${room.betAmount}`, roomId);
+            console.log(`Queued removal from waiting_rooms:${room.betAmount}`);
         }
+
+        // Execute transaction
+        await multi.exec();
+        console.log(`Deleted room ${roomId} and cleaned up tracking sets`);
+
     } catch (error) {
         console.error(`Error deleting room ${roomId} from Redis:`, error);
-    // Redis health auto-managed by ioredis
         throw error;
     }
 }
@@ -3032,6 +3132,7 @@ async function deleteGameRoom(roomId) {
 async function addToMatchmakingPool(betAmount, playerData) {
     try {
         await redisClient.lpush(`matchmaking:human:${betAmount}`, JSON.stringify(playerData));
+        await trackMatchmakingPlayer(betAmount, playerData.walletAddress);
         console.log(`Added player ${playerData.walletAddress} to matchmaking pool for ${betAmount}`);
         return true;  // ✅ Return success for caller to verify
     } catch (error) {
@@ -3063,7 +3164,10 @@ async function removeFromMatchmakingPool(betAmount, socketId) {
             const removedPlayer = await redisClient.lrem(`matchmaking:human:${betAmount}`, 1, pool[playerIndex]);
             console.log(`Removed player with socketId ${socketId} from matchmaking pool for ${betAmount}`);
             try {
-                return removedPlayer ? JSON.parse(pool[playerIndex]) : null;
+                const playerData = JSON.parse(pool[playerIndex]);  // ← ADD THIS LINE
+                await untrackMatchmakingPlayer(betAmount, playerData.walletAddress);  // ← FIXED
+
+                return removedPlayer ? playerData : null;  // ← FIXED
             } catch (parseError) {
                 console.error(`Error parsing removed player data for ${betAmount}:`, parseError, pool[playerIndex]);
                 return null;
@@ -3199,11 +3303,11 @@ async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, 
 
 async function logGameRoomsState() {
     console.log('Current game rooms state:');
-    const roomKeys = await scanKeys('room:*');
-    console.log(`Total rooms: ${roomKeys.length}`);
+    
+    const roomIds = await getCleanActiveRooms(); 
+    console.log(`Total rooms: ${roomIds.length}`);
 
-    for (const key of roomKeys) {
-        const roomId = key.replace('room:', '');
+    for (const roomId of roomIds) {
         const room = await getGameRoom(roomId);
         if (room) {
             console.log(`Room ID: ${roomId}`);
@@ -3228,16 +3332,25 @@ async function logMatchmakingState() {
 
     try {
         console.log('Human Matchmaking Pools:');
-        const poolKeys = await scanKeys('matchmaking:human:*');
-        for (const key of poolKeys) {
-            const betAmount = key.replace('matchmaking:human:', '');
-            const pool = await getMatchmakingPool(betAmount);
-            console.log(`  Bet Amount ${betAmount}: ${pool.length} players waiting`);
-            if (pool.length > 0) {
-                pool.forEach((player, index) => {
-                    const waitTime = Math.round((Date.now() - player.joinTime) / 1000);
-                    console.log(`    - ${player.walletAddress} (waiting for ${waitTime}s)`);
-                });
+        
+        // FIXED: Use Set-based tracking instead of scanKeys
+        const pools = await getAllMatchmakingPools();
+        
+        for (const [betAmount, wallets] of Object.entries(pools)) {
+            console.log(`  Bet Amount ${betAmount}: ${wallets.length} players waiting`);
+            
+            // Get full player data for each wallet
+            const pool = await getMatchmakingPool(betAmount);  // ← FIXED
+            if (pool && pool.length > 0) {  // ← FIXED
+                const playersByWallet = new Map(pool.map(p => [p.walletAddress, p]));
+                
+                for (const wallet of wallets) {
+                    const player = playersByWallet.get(wallet);
+                    if (player) {
+                        const waitTime = Math.round((Date.now() - player.joinTime) / 1000);
+                        console.log(`    - ${wallet} (waiting for ${waitTime}s)`);
+                    }
+                }
             }
         }
 
@@ -3248,30 +3361,43 @@ async function logMatchmakingState() {
     }
 }
 
+// Cleanup expired matchmaking players (REFACTORED - No scanKeys!)
 setInterval(async () => {
     const now = Date.now();
     const MAX_WAIT_TIME = 5 * 60 * 1000; // 5 minutes
 
-    const poolKeys = await scanKeys('matchmaking:human:*');
-    for (const key of poolKeys) {
-        const betAmount = key.replace('matchmaking:human:', '');
-        const pool = await getMatchmakingPool(betAmount);
-        const expiredPlayers = pool.filter(player => (now - player.joinTime) > MAX_WAIT_TIME);
+    try {
+        // FIXED: Use Set-based tracking instead of scanKeys
+        const pools = await getAllMatchmakingPools();
+        
+        for (const [betAmount, wallets] of Object.entries(pools)) {
+            // Get full pool data
+            const pool = await getMatchmakingPool(betAmount);  // ← FIXED
+            if (!pool || pool.length === 0) continue;  // ← FIXED
+            
+            const expiredPlayers = pool.filter(player => (now - player.joinTime) > MAX_WAIT_TIME);
 
-        if (expiredPlayers.length > 0) {
-            console.log(`Removing ${expiredPlayers.length} expired players from matchmaking pool for ${betAmount}`);
-            for (const player of expiredPlayers) {
-                const playerSocket = io.sockets.sockets.get(player.socketId);
-                if (playerSocket) {
-                    playerSocket.emit('matchmakingExpired', {
-                        message: 'Your matchmaking request has expired'
-                    });
+            if (expiredPlayers.length > 0) {
+                console.log(`Removing ${expiredPlayers.length} expired players from matchmaking pool for ${betAmount}`);
+                
+                for (const player of expiredPlayers) {
+                    const playerSocket = io.sockets.sockets.get(player.socketId);
+                    if (playerSocket) {
+                        playerSocket.emit('matchmakingExpired', {
+                            message: 'Your matchmaking request has expired'
+                        });
+                    }
+                    
+                    // Remove from both Redis list and tracking Set
+                    await redisClient.lrem(`matchmaking:human:${betAmount}`, 1, JSON.stringify(player));
+                    await untrackMatchmakingPlayer(betAmount, player.walletAddress);
                 }
-                await redisClient.lrem(`matchmaking:human:${betAmount}`, 1, JSON.stringify(player));
             }
         }
+    } catch (error) {
+        console.error('Error in matchmaking cleanup:', error);
     }
-}, 60000);
+}, 60000); // Run every minute
 
 async function updatePlayerStats(players, roomData) {
     console.log('Updating stats for all players:', players);
