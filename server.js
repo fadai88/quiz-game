@@ -16,6 +16,7 @@ const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransac
 const Joi = require('joi');
 const BotDetector = require('./botDetector');
 const crypto = require('crypto');
+const bs58 = require('bs58');
 const { getCachedTreasurySecretKey } = require('./aws-secrets-integration');
 
 // NEW: Import PaymentQueue and PaymentProcessor for resilient payouts
@@ -516,24 +517,46 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('Audit service unavailable');
     }
 
-    // Step 2: Redis checks (fast path + nonce) - non-blocking
+    // Step 2a: Redis signature check (non-blocking, best-effort)
     await safeRedisOp(
         async () => {
             const exists = await redisClient.get(key);
             if (exists) {
                 console.log(`⚠️  Redis replay detected for ${key} (MongoDB already prevented it)`);
             }
-
-            const storedNonce = await redisClient.get(nonceKey);
-            if (storedNonce) {
-                console.log(`⚠️  Nonce already used: ${nonce} (MongoDB already prevented it)`);
-            } else {
-                await redisClient.set(nonceKey, 'used', 'EX', 86400);
-            }
         },
         null,
-        'Redis transaction/nonce check'
+        'Redis signature check'
     );
+
+    // Step 2b: Redis nonce check (STRICT BLOCKING - no bypass allowed)
+    try {
+        const storedNonce = await redisClient.get(nonceKey);
+        if (storedNonce) {
+            console.error(`Nonce already used: ${nonce} - possible replay attempt`);
+            await TransactionLog.findOneAndUpdate(
+                { signature },
+                { status: 'failed', errorMessage: 'Nonce already used' }
+            );
+            throw new Error('Nonce already used (duplicate request)');
+        }
+        
+        await redisClient.set(nonceKey, 'used', 'EX', 86400);
+        console.log(`Nonce ${nonce} registered in Redis`);
+    } catch (error) {
+        // STRICT MODE: Re-throw ALL errors (including Redis connection failures)
+        if (error.message.includes('Nonce already used')) {
+            throw error;
+        }
+        
+        // Redis infrastructure failure - reject transaction for safety
+        console.error(`CRITICAL: Redis nonce service unavailable: ${error.message}`);
+        await TransactionLog.findOneAndUpdate(
+            { signature },
+            { status: 'failed', errorMessage: 'Nonce verification service unavailable' }
+        );
+        throw new Error('Unable to verify transaction - please try again in a moment');
+    }
 
     // Step 3-4: Blockchain validation
     let transaction;
@@ -611,6 +634,89 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         );
         throw new Error('Transaction amount does not match the expected bet');
     }
+
+    // Step 4.5: Verify nonce in memo instruction matches request nonce
+    try {
+        const MEMO_PROGRAM_ID = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
+        
+        // Find memo instruction in the transaction
+        const memoInstruction = transaction.transaction.message.instructions.find(ix => {
+            const programId = transaction.transaction.message.accountKeys[ix.programIdIndex];
+            return programId.toString() === MEMO_PROGRAM_ID;
+        });
+        
+        if (!memoInstruction) {
+            console.error(`Transaction ${signature} missing memo instruction`);
+            await TransactionLog.findOneAndUpdate(
+                { signature },
+                { status: 'failed', errorMessage: 'Transaction missing required memo instruction' }
+            );
+            throw new Error('Transaction missing memo instruction for replay protection');
+        }
+        
+        // Decode memo data (handle both base58 and base64)
+        let memoText;
+        try {
+            // First try base58 (Solana's default encoding)
+            const memoDataBytes = bs58.decode(memoInstruction.data);
+            memoText = Buffer.from(memoDataBytes).toString('utf8');
+        } catch (e) {
+            // Fallback to base64 if base58 fails
+            try {
+                const memoData = Buffer.from(memoInstruction.data, 'base64');
+                memoText = memoData.toString('utf8');
+            } catch (e2) {
+                // If both fail, try treating it as raw UTF-8
+                memoText = memoInstruction.data;
+            }
+        }
+        console.log(`Memo text from transaction: ${memoText}`);
+        
+        // Verify nonce is in memo
+        if (!memoText.includes(nonce)) {
+            console.error(`Transaction ${signature} nonce mismatch: memo="${memoText}", expected nonce="${nonce}"`);
+            await TransactionLog.findOneAndUpdate(
+                { signature },
+                { status: 'failed', errorMessage: 'Nonce mismatch between transaction memo and request' }
+            );
+            throw new Error('Nonce mismatch - transaction does not match request');
+        }
+        
+        console.log(`Nonce verified: ${nonce} found in memo`);
+    } catch (error) {
+        if (error.message.includes('Nonce') || error.message.includes('memo')) {
+            throw error; // Re-throw our validation errors
+        }
+        // If error is from parsing, treat as missing memo
+        console.error(`Error parsing memo instruction:`, error);
+        await TransactionLog.findOneAndUpdate(
+            { signature },
+            { status: 'failed', errorMessage: 'Failed to parse memo instruction' }
+        );
+        throw new Error('Invalid memo instruction format');
+    }
+
+    // Step 4.6: Verify transaction is not too old (replay protection)
+    if (!transaction.blockTime) {
+        console.error(`Transaction ${signature} missing blockTime`);
+        await TransactionLog.findOneAndUpdate(
+            { signature },
+            { status: 'failed', errorMessage: 'Transaction missing timestamp' }
+        );
+        throw new Error('Transaction missing timestamp - try again in a few seconds');
+    }
+
+    const TX_MAX_AGE = 60000; // 1 minute
+    const txAge = Date.now() - (transaction.blockTime * 1000);
+    if (txAge > TX_MAX_AGE) {
+        console.error(`Transaction ${signature} is too old: ${txAge}ms (max ${TX_MAX_AGE}ms)`);
+        await TransactionLog.findOneAndUpdate(
+            { signature },
+            { status: 'failed', errorMessage: 'Transaction expired (must be used within 1 minute)' }
+        );
+        throw new Error('Transaction expired - please create a new transaction');
+    }
+    console.log(`Transaction age verified: ${txAge}ms (within ${TX_MAX_AGE}ms limit)`);
 
     // Step 5: Cache in Redis (best-effort)
     // Redis operation wrapped in safeRedisOp

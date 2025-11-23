@@ -444,7 +444,7 @@
                 }
             }
 
-            async createTransferTransaction(walletAddress, betAmount) {
+            async createTransferTransaction(walletAddress, betAmount, nonce) {
                 try {
                     if (betAmount < config.MIN_BET_AMOUNT || betAmount > config.MAX_BET_AMOUNT) {
                         throw new Error(`Bet amount must be between ${config.MIN_BET_AMOUNT} and ${config.MAX_BET_AMOUNT} USDC`);
@@ -490,7 +490,7 @@
                     });
 
                     // NEW: Add unique memo for anti-dupe (prevents identical tx bytes across sessions)
-                    const memoText = `bet-${betAmount}-${generateUUID()}-${Date.now()}`;  // e.g., "bet-10-uuid-1234567890"
+                    const memoText = `bet-${betAmount}-${nonce}-${Date.now()}`;
                     const memoIx = new solanaWeb3.TransactionInstruction({
                         keys: [],  // No accounts needed
                         programId: new solanaWeb3.PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),  // Standard Memo program
@@ -1363,11 +1363,15 @@
                     this.textContent = 'Processing...';
                     waitingMessage.textContent = 'Preparing transaction for matchmaking...';
                     
-                    const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount);
+                    // Generate nonce FIRST, before creating transaction
+                    const nonce = generateUUID();
+                    console.log('Generated nonce for human matchmaking:', nonce);
+
+                    const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount, nonce);  // Pass nonce here
                     const signedTransaction = await window.solana.signTransaction(transaction);
                     const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
                     console.log('Transaction signature for human matchmaking:', txSignature);
-                    
+
                     // FIXED: Proper token generation with try-catch
                     let recaptchaToken = null;
                     if (window.recaptchaEnabled) {
@@ -1377,12 +1381,9 @@
                             console.error('reCAPTCHA failed for human matchmaking:', error);
                             alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
                             waitingMessage.textContent = 'Verification failed. Please try again.';
-                            throw error;  // Re-throw to trigger reset
+                            throw error;
                         }
                     }
-                    
-                    const nonce = generateUUID();
-                    console.log('Generated nonce for human matchmaking:', nonce);
                     
                     socket.emit('joinHumanMatchmaking', {
                         walletAddress: connectedWallet,
@@ -1435,19 +1436,23 @@
                     this.textContent = 'Processing...';
                     waitingMessage.textContent = 'Preparing transaction for bot game...';
                     
-                    const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount);
+                    // Generate nonce FIRST, before creating transaction
+                    const nonce = generateUUID();
+                    console.log('Generated nonce for bot game:', nonce);
+
+                    const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount, nonce);  // Pass nonce here
                     const signedTransaction = await window.solana.signTransaction(transaction);
-                    
+
                     // NEW: Log the signature for debugging (remove in prod)
                     const rawTx = signedTransaction.serialize();
                     console.log('About to send tx (first 8 bytes for debug):', Array.from(rawTx.slice(0, 8)));
-                    
+
                     const txSignature = await connection.sendRawTransaction(rawTx, {
-                        skipPreflight: false,  // Ensures simulation runs
+                        skipPreflight: false,
                         preflightCommitment: 'confirmed'
                     });
                     console.log('Transaction signature for bot game:', txSignature);
-                    
+
                     // FIXED: Proper token generation with try-catch
                     let recaptchaToken = null;
                     if (window.recaptchaEnabled) {
@@ -1457,12 +1462,10 @@
                             console.error('reCAPTCHA failed for bot game:', error);
                             alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
                             waitingMessage.textContent = 'Verification failed. Please try again.';
-                            throw error;  // Re-throw to trigger reset
+                            throw error;
                         }
                     }
                     
-                    const nonce = generateUUID();
-                    console.log('Generated nonce for bot game:', nonce);
                     
                     socket.emit('joinBotGame', {
                         walletAddress: connectedWallet,
