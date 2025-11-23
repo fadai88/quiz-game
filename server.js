@@ -16,6 +16,7 @@ const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransac
 const Joi = require('joi');
 const BotDetector = require('./botDetector');
 const crypto = require('crypto');
+const { getCachedTreasurySecretKey } = require('./aws-secrets-integration');
 
 // NEW: Import PaymentQueue and PaymentProcessor for resilient payouts
 const PaymentQueue = require('./models/PaymentQueue'); // Adjust path as needed
@@ -210,19 +211,47 @@ const Quiz = mongoose.model('Quiz', new mongoose.Schema({
 
 const botDetector = new BotDetector();
 
-const config = {
-    USDC_MINT: new PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
-    TREASURY_WALLET: new PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
-    TREASURY_KEYPAIR: Keypair.fromSecretKey(
-        Buffer.from(JSON.parse(process.env.TREASURY_SECRET_KEY))
-    ),
-    connection: new Connection(process.env.SOLANA_RPC_URL, 'confirmed'),
-    // NEW: For PaymentProcessor - array of RPC endpoints for failover
-    rpcEndpoints: [process.env.SOLANA_RPC_URL], // Add more for production failover
-    io: io // Pass io for emitting events from processor
-};
+let config = null;
+let paymentProcessor = null;
 
-const connection = config.connection;
+async function initializeConfig() {
+    try {
+        console.log('🔐 Initializing config with AWS Secrets Manager...');
+        const secretString = await getCachedTreasurySecretKey();
+        const secretKey = JSON.parse(secretString);
+        
+        config = {
+            USDC_MINT: new PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
+            TREASURY_WALLET: new PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
+            TREASURY_KEYPAIR: Keypair.fromSecretKey(Buffer.from(secretKey)),
+            connection: new Connection(process.env.SOLANA_RPC_URL, 'confirmed'),
+            rpcEndpoints: [process.env.SOLANA_RPC_URL],
+            io: io
+        };
+        
+        console.log('✅ Config initialized successfully with AWS secret');
+        return config;
+    } catch (error) {
+        console.error('❌ FATAL: Failed to initialize config:', error);
+        process.exit(1);
+    }
+}
+
+// NEW: Initialize PaymentProcessor AFTER config is ready
+mongoose.connection.once('open', async () => {
+    try {
+        // ✅ FIXED: Initialize config first
+        await initializeConfig();
+        
+        // ✅ FIXED: Now config has connection, TREASURY_KEYPAIR, io, etc.
+        paymentProcessor = new PaymentProcessor(config);
+        paymentProcessor.startProcessing(60000); // Process every 60s
+        console.log('✅ PaymentProcessor initialized with valid config');
+    } catch (error) {
+        console.error('❌ FATAL: PaymentProcessor initialization failed:', error);
+        process.exit(1);
+    }
+});
 
 let programId;
 if (process.env.PROGRAM_ID) {
@@ -234,14 +263,6 @@ if (process.env.PROGRAM_ID) {
 }
 
 let redisClient;
-
-// NEW: Initialize PaymentProcessor after MongoDB connection
-let paymentProcessor;
-mongoose.connection.once('open', async () => {
-    paymentProcessor = new PaymentProcessor(config);
-    paymentProcessor.startProcessing(60000); // Process every 60s
-    console.log('PaymentProcessor initialized and started');
-});
 
 async function initializeRedis() {
     try {
@@ -606,11 +627,11 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
 async function verifyTransactionWithStatus(signature, maxRetries = 3, retryDelay = 500) {
     for (let i = 0; i < maxRetries; i++) {
         console.log(`Attempt ${i + 1} to verify transaction ${signature}`);
-        const statuses = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+        const statuses = await config.connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
         const status = statuses.value[0];
         if (status && status.confirmationStatus === 'confirmed') {
             console.log(`Transaction ${signature} confirmed`);
-            return await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+            return await config.connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
         }
         console.log(`Transaction ${signature} not confirmed yet, retrying in ${retryDelay}ms`);
         await new Promise(resolve => setTimeout(resolve, retryDelay));
@@ -1678,6 +1699,12 @@ io.on('connection', (socket) => {
                             return;
                         }
 
+                        if (!room.questions || room.questions.length === 0) {
+                            console.error(`Room ${roomId} has no questions`);
+                            socket.emit('answerError', 'Game not properly initialized');
+                            return;
+                        }
+
                         if (!room.questionStartTime || room.currentQuestionIndex >= room.questions.length) {
                             console.error(`No active question in room ${roomId} when ${authenticatedUsername} submitted answer`);
                             socket.emit('answerError', 'No active question');
@@ -1685,8 +1712,31 @@ io.on('connection', (socket) => {
                         }
 
                         const currentQuestion = room.questionIdMap.get(questionId);
-                        if (!currentQuestion || questionId !== room.questions[room.currentQuestionIndex].tempId) {
-                            console.error(`Invalid question ${questionId} for room ${roomId}`);
+                        if (!currentQuestion) {
+                            console.error(`No current question for room ${roomId}`);
+                            socket.emit('answerError', 'No active question');
+                            return;
+                        }
+
+                        // ✅ Check if question exists in the map (more reliable than array index)
+                        const questionData = room.questionIdMap.get(questionId);
+                        if (!questionData) {
+                            console.error(`Question ${questionId} not found in room ${roomId} questionIdMap`);
+                            socket.emit('answerError', 'Invalid question ID');
+                            return;
+                        }
+
+                        // ✅ Verify it's the current question (allowing for timing edge cases)
+                        if (questionId !== currentQuestion.tempId) {
+                            // Check if this is a late answer from previous question
+                            const questionIndex = room.questions.findIndex(q => q.tempId === questionId);
+                            if (questionIndex !== -1 && questionIndex < room.currentQuestionIndex) {
+                                console.log(`Player ${authenticatedUsername} submitted late answer for previous question ${questionId}`);
+                                socket.emit('answerError', 'Question expired');
+                                return;
+                            }
+                            
+                            console.error(`Invalid question ${questionId} for room ${roomId} (expected ${currentQuestion.tempId})`);
                             socket.emit('answerError', 'Invalid question');
                             return;
                         }
@@ -2840,7 +2890,23 @@ async function handleGameOver(room, roomId) {
 
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+async function startServer() {
+    try {
+        await initializeConfig();
+        await initializeRedis();
+        
+        server.listen(PORT, () => {
+            console.log(`🚀 Server is running on port ${PORT}`);
+            console.log(`🔐 Treasury wallet loaded from AWS Secrets Manager`);
+        });
+    } catch (error) {
+        console.error('❌ Failed to start server:', error);
+        process.exit(1);
+    }
+}
+
+startServer();
 
 // Function to generate a unique room ID
 function generateRoomId() {

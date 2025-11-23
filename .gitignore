@@ -1,3 +1,9 @@
+aws-secrets-integration.js
+aws/
+awscliv2.zip
+setup-aws-secrets.sh
+test-aws-integration.js
+
 # Solana/Anchor
 .anchor
 .DS_Store

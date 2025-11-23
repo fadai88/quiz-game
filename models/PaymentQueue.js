@@ -90,12 +90,14 @@ PaymentQueueSchema.statics.queuePayment = async function(recipientWallet, amount
   });
 };
 
-// Static method to get pending payments ready for processing
+// ✅ FIXED: Static method to get pending payments ready for processing
 PaymentQueueSchema.statics.getPendingPayments = async function(limit = 10) {
   // Get payments that are pending or failed but haven't exceeded max attempts
   // and weren't attempted in the last 5 minutes
   const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
   
+  // ✅ CRITICAL FIX: Removed .lean() to preserve Mongoose instance methods
+  // This ensures markProcessing(), markCompleted(), and markFailed() methods are available
   return this.find({
     $or: [
       { status: 'pending' },
@@ -107,8 +109,9 @@ PaymentQueueSchema.statics.getPendingPayments = async function(limit = 10) {
     ]
   })
   .sort({ createdAt: 1 })
-  .limit(limit)
-  .lean(); // NEW: Use lean() for performance
+  .limit(limit);
+  // ❌ REMOVED .lean() - we need instance methods!
+  // If you need performance, consider using .select() to limit fields instead
 };
 
 // NEW: Static method to cleanup old pending payments (call in cron)
