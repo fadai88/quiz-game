@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const socketIo = require('socket.io');
 const { createAdapter } = require('@socket.io/redis-adapter'); // New: Redis adapter for scaling
 const Redis = require('ioredis'); // Already present, but ensure >=4.0
@@ -16,7 +17,7 @@ const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransac
 const Joi = require('joi');
 const BotDetector = require('./botDetector');
 const crypto = require('crypto');
-const bs58 = require('bs58');
+const bs58 = require('bs58').default;
 const { getCachedTreasurySecretKey } = require('./aws-secrets-integration');
 
 // NEW: Import PaymentQueue and PaymentProcessor for resilient payouts
@@ -3020,7 +3021,6 @@ function generateRoomId() {
 }
 
 
-// FIXED: Enhanced verifyRecaptcha with strict enforcement and error throwing
 async function verifyRecaptcha(token) {
     if (process.env.ENABLE_RECAPTCHA !== 'true') {
         console.log('reCAPTCHA verification skipped (disabled in config)');
@@ -3037,11 +3037,20 @@ async function verifyRecaptcha(token) {
             return { success: true, score: 1.0 }; // Default to success in development
         }
         
+        /*
         const response = await axios.post('https://www.google.com/recaptcha/api/siteverify', null, {
             params: {
                 secret: secretKey,
                 response: token
             }
+        });
+        */
+        const response = await axios.post('https://www.google.com/recaptcha/api/siteverify', null, {
+            params: {
+                secret: secretKey,
+                response: token
+            },
+            httpsAgent: new https.Agent({ family: 4 }) // <--- FIX: Forces IPv4 to avoid ENETUNREACH
         });
         
         console.log('reCAPTCHA verification response:', response.data);
