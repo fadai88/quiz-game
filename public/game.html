@@ -348,18 +348,24 @@
                         this.usdcMint
                     );
 
+                    let accountInfo;
                     try {
                         // Check if account exists
-                        const accountInfo = await this.connection.getAccountInfo(tokenAccount);
-                        if (accountInfo) {
-                            return { tokenAccount, transaction: null };
-                        }
+                        accountInfo = await this.connection.getAccountInfo(tokenAccount);
                     } catch (error) {
-                        console.log('Error checking account:', error);
+                        console.error('Network error checking account info:', error);
+                        // CRITICAL FIX: If the RPC fails, THROW the error.
+                        // Do NOT proceed to create an account, or Phantom will pop up unnecessarily.
+                        throw error;
                     }
 
-                    // Create new account if it doesn't exist
-                    console.log('Creating new associated token account...');
+                    // If accountInfo exists, return it.
+                    if (accountInfo) {
+                        return { tokenAccount, transaction: null };
+                    }
+
+                    // Only proceed to creation if accountInfo is explicitly null (meaning no network error, but account doesn't exist)
+                    console.log('Account not found (valid), creating new associated token account...');
                     const transaction = new solanaWeb3.Transaction().add(
                         this.createAssociatedTokenAccountInstruction(
                             walletPublicKey,
@@ -374,6 +380,7 @@
 
                     return { tokenAccount, transaction };
                 } catch (error) {
+                    // This catches the thrown error above and stops the process
                     console.error('Error in getOrCreateAssociatedTokenAccount:', error);
                     throw error;
                 }
