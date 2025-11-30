@@ -175,11 +175,68 @@ async function initializeRateLimiter() {
 }
 
 // Auth middleware: Validate socket.user on events (post-login)
-const authMiddleware = (socket, next) => {
-    if (!socket.user || !socket.user.walletAddress) {
-        next(new Error('Unauthorized: No valid session'));
-    } else {
+const authMiddleware = async (socket, next) => {
+    try {
+        // Check 1: User must be attached to socket
+        if (!socket.user || !socket.user.walletAddress) {
+            console.warn(`[AUTH] Connection attempt without user: ${socket.id}`);
+            return next(new Error('Unauthorized: No valid session'));
+        }
+
+        // Check 2: Validate session in Redis
+        const walletAddress = socket.user.walletAddress;
+        const sessionKey = `session:${walletAddress}`;
+        
+        const session = await redisClient.get(sessionKey);
+        
+        if (!session) {
+            console.warn(`[AUTH] Connection attempt with expired session: ${walletAddress}`);
+            socket.emit('error', {
+                message: 'Session expired: Please login again',
+                code: 'SESSION_EXPIRED'
+            });
+            socket.disconnect(true);
+            return next(new Error('Session expired'));
+        }
+
+        // Check 3: Validate session age
+        try {
+            const sessionData = JSON.parse(session);
+            const sessionAge = Date.now() - sessionData.timestamp;
+            const MAX_SESSION_AGE = 24 * 60 * 60 * 1000; // 24 hours
+
+            if (sessionAge > MAX_SESSION_AGE) {
+                console.warn(`[AUTH] Connection attempt with old session: ${walletAddress}, age: ${sessionAge}ms`);
+                await redisClient.del(sessionKey);
+                socket.emit('error', {
+                    message: 'Session expired: Please login again',
+                    code: 'SESSION_EXPIRED'
+                });
+                socket.disconnect(true);
+                return next(new Error('Session expired'));
+            }
+        } catch (parseError) {
+            console.error(`[AUTH] Session parse error for ${walletAddress}:`, parseError);
+            await redisClient.del(sessionKey);
+            socket.emit('error', {
+                message: 'Session corrupted: Please login again',
+                code: 'SESSION_EXPIRED'
+            });
+            socket.disconnect(true);
+            return next(new Error('Session corrupted'));
+        }
+
+        // ✅ All checks passed - allow connection
+        console.log(`[AUTH] ✓ Connection authenticated for ${walletAddress}`);
         next();
+        
+    } catch (error) {
+        console.error('[AUTH] Connection middleware error:', error);
+        socket.emit('error', {
+            message: 'Authentication error occurred',
+            code: 'AUTH_ERROR'
+        });
+        next(new Error('Authentication error'));
     }
 };
 
@@ -1078,8 +1135,30 @@ io.on('connection', (socket) => {
 
                 socket.user = { walletAddress, fingerprint };
 
+                const sessionData = {
+                    walletAddress,
+                    fingerprint,
+                    timestamp: Date.now(),
+                    ip: connectionData.ip,
+                    userAgent: connectionData.userAgent
+                };
+
+                try {
+                    await redisClient.set(
+                        `session:${walletAddress}`,
+                        JSON.stringify(sessionData),
+                        'EX',
+                        86400 // 24 hours in seconds
+                    );
+                    console.log(`[SESSION] Created session for ${walletAddress} (expires in 24h)`);
+                } catch (redisError) {
+                    console.error(`[SESSION] Failed to store session for ${walletAddress}:`, redisError);
+                    // Continue anyway - session will be validated on next event
+                }
+                // ===== END SESSION STORAGE =====
+
                 console.log('Login successful for wallet:', walletAddress);
-                
+
                 socket.emit('loginSuccess', {
                     walletAddress: user.walletAddress,
                     virtualBalance: user.virtualBalance
@@ -1096,21 +1175,59 @@ io.on('connection', (socket) => {
 
     socket.on('walletReconnect', async (walletAddress) => {
         try {
-            console.log(`Reconnect attempt for wallet: ${walletAddress}`);
+            console.log(`[RECONNECT] Attempt for wallet: ${walletAddress}`);
+            
+            // ===== VALIDATE SESSION EXISTS IN REDIS =====
+            const sessionKey = `session:${walletAddress}`;
+            const session = await redisClient.get(sessionKey);
+            
+            if (!session) {
+                console.warn(`[RECONNECT] No valid session found for ${walletAddress}`);
+                return socket.emit('loginFailure', 'Session expired - please login again');
+            }
+
+            // Parse and validate session age
+            let sessionData;
+            try {
+                sessionData = JSON.parse(session);
+                
+                const sessionAge = Date.now() - sessionData.timestamp;
+                const MAX_SESSION_AGE = 24 * 60 * 60 * 1000; // 24 hours
+                
+                if (sessionAge > MAX_SESSION_AGE) {
+                    console.warn(`[RECONNECT] Session too old for ${walletAddress}: ${sessionAge}ms`);
+                    await redisClient.del(sessionKey); // Clean up
+                    return socket.emit('loginFailure', 'Session expired - please login again');
+                }
+            } catch (error) {
+                console.error(`[RECONNECT] Session parse error for ${walletAddress}:`, error);
+                await redisClient.del(sessionKey); // Clean up corrupted session
+                return socket.emit('loginFailure', 'Session corrupted - please login again');
+            }
+            
+            // ===== SESSION VALID - RESTORE USER =====
             const user = await User.findOne({ walletAddress });
             if (user) {
-                // Set socket.user for auth
-                socket.user = { walletAddress };
-                console.log(`Reconnect successful for ${walletAddress}`);
+                // Restore socket.user with fingerprint from session
+                socket.user = { 
+                    walletAddress,
+                    fingerprint: sessionData.fingerprint 
+                };
+                
+                // Join wallet-specific room for notifications
+                socket.join(`wallet:${walletAddress}`);
+                
+                console.log(`[RECONNECT] ✓ Successful for ${walletAddress} (session age: ${Math.round((Date.now() - sessionData.timestamp)/1000)}s)`);
                 socket.emit('loginSuccess', {
                     walletAddress: user.walletAddress,
                     virtualBalance: user.virtualBalance || 0
                 });
             } else {
-                socket.emit('loginFailure', 'Wallet not found—please login again');
+                console.warn(`[RECONNECT] User not found in database for ${walletAddress}`);
+                socket.emit('loginFailure', 'Wallet not found - please login again');
             }
         } catch (error) {
-            console.error('Reconnect error:', error);
+            console.error('[RECONNECT] Error:', error);
             socket.emit('loginFailure', error.message);
         }
     });
@@ -1123,13 +1240,70 @@ io.on('connection', (socket) => {
         }
     });
 
+    // ADD this AFTER authMiddleware definition (around line 250):
+    async function validateSocketSession(socket, eventName) {
+        if (!socket.user || !socket.user.walletAddress) {
+            console.warn(`[AUTH] Unauthorized ${eventName} from socket ${socket.id}`);
+            socket.emit('error', { 
+                message: 'Unauthorized: Please login first',
+                code: 'AUTH_REQUIRED'
+            });
+            return false;
+        }
+
+        const walletAddress = socket.user.walletAddress;
+        const sessionKey = `session:${walletAddress}`;
+        
+        try {
+            const session = await redisClient.get(sessionKey);
+            
+            if (!session) {
+                console.warn(`[AUTH] Session expired for ${walletAddress} on ${eventName}`);
+                socket.emit('error', { 
+                    message: 'Session expired: Please login again',
+                    code: 'SESSION_EXPIRED'
+                });
+                socket.disconnect(true);
+                return false;
+            }
+
+            const sessionData = JSON.parse(session);
+            const sessionAge = Date.now() - sessionData.timestamp;
+            const MAX_SESSION_AGE = 24 * 60 * 60 * 1000;
+
+            if (sessionAge > MAX_SESSION_AGE) {
+                console.warn(`[AUTH] Session too old for ${walletAddress}: ${sessionAge}ms on ${eventName}`);
+                await redisClient.del(sessionKey);
+                socket.emit('error', { 
+                    message: 'Session expired: Please login again',
+                    code: 'SESSION_EXPIRED'
+                });
+                socket.disconnect(true);
+                return false;
+            }
+
+            console.log(`[AUTH] ✓ Event ${eventName} authorized for ${walletAddress}`);
+            return true;
+            
+        } catch (error) {
+            console.error(`[AUTH] Session validation error for ${eventName}:`, error);
+            socket.emit('error', { 
+                message: 'Authentication error occurred',
+                code: 'AUTH_ERROR'
+            });
+            return false;
+        }
+    }
     // Apply rate-limit + auth to game events
     const gameEvents = ['joinGame', 'playerReady', 'joinHumanMatchmaking', 'joinBotGame', 'switchToBot', 'matchFound', 'leaveRoom', 'requestBotRoom', 'requestBotGame', 'submitAnswer'];
     gameEvents.forEach(event => {
         socket.on(event, async (...args) => {
             try {
                 // await rateLimitSocket(socket);
-                if (!socket.user) throw new Error('Unauthorized');
+                const isValidSession = await validateSocketSession(socket, event);
+                if (!isValidSession) {
+                    return; // Stop execution - validation function already sent error to client
+                }
                     
                 // Call original handler based on event type
                 if (event === 'joinGame') {

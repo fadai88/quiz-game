@@ -269,6 +269,28 @@
             } 
         });
 
+        socket.on('error', (error) => {
+            console.error('Server error:', error);
+            
+            if (error.code === 'AUTH_REQUIRED') {
+                alert('Please login to continue');
+                localStorage.removeItem('sessionData');
+                window.location.href = '/login.html';
+            }
+            
+            if (error.code === 'SESSION_EXPIRED') {
+                alert('Your session has expired. Please login again.');
+                localStorage.removeItem('sessionData');
+                window.location.href = '/login.html';
+            }
+            
+            if (error.code === 'AUTH_ERROR') {
+                alert('Authentication error. Please try logging in again.');
+                localStorage.removeItem('sessionData');
+                window.location.href = '/login.html';
+            }
+        });
+
         socket.on('connect_error', (err) => {
             console.log('Connect error details:', {
                 message: err.message,      // e.g., "xhr poll error"

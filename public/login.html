@@ -143,6 +143,15 @@
                 event: 'walletLogin'  // Exempts from middleware for initial auth
             } 
         });
+
+        socket.on('error', (error) => {
+            console.error('Server error:', error);
+            
+            if (error.code === 'SESSION_EXPIRED' || error.code === 'AUTH_ERROR') {
+                localStorage.removeItem('sessionData');
+                showError('Session expired. Please login again.');
+            }
+        });
         
         /*
         socket.on('connect_error', (err) => {
