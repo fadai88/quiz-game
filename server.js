@@ -42,13 +42,27 @@ if (ENVIRONMENT === 'production') {
         process.exit(1);
     }
     
+    // Enforce Redis security in production
+    if (!process.env.REDIS_PASSWORD) {
+        console.error('❌ FATAL: REDIS_PASSWORD required in production!');
+        console.error('   Set REDIS_PASSWORD in your .env file to secure Redis');
+        process.exit(1);
+    }
+    
     console.log('✅ reCAPTCHA properly configured for production');
+    console.log('✅ Redis security properly configured for production');
 } else {
     console.log('🔧 Starting in DEVELOPMENT mode');
     if (process.env.ENABLE_RECAPTCHA === 'true') {
         console.log('   reCAPTCHA: ENABLED (for testing)');
     } else {
         console.log('   reCAPTCHA: DISABLED (faster development)');
+    }
+    
+    if (process.env.REDIS_PASSWORD) {
+        console.log('   Redis: PASSWORD PROTECTED');
+    } else {
+        console.log('   ⚠️  Redis: NO PASSWORD (insecure - dev only)');
     }
 }
 
@@ -325,26 +339,59 @@ let redisClient;
 
 async function initializeRedis() {
     try {
-        redisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
-            // NEW: Robust retry configuration
+        // Build Redis configuration with security settings
+        const redisConfig = {
+            // Connection settings
+            host: process.env.REDIS_HOST || 'localhost',
+            port: process.env.REDIS_PORT || 6379,
+            
+            // Security: Password authentication
+            password: process.env.REDIS_PASSWORD,
+            
+            // Security: TLS encryption (only if explicitly enabled)
+            // Set REDIS_TLS=true in .env to enable TLS
+            tls: process.env.REDIS_TLS === 'true' ? {
+                rejectUnauthorized: process.env.REDIS_TLS_REJECT_UNAUTHORIZED !== 'false'
+            } : undefined,
+            
+            // Robust retry configuration
+            retryStrategy: (times) => {
+                const delay = Math.min(times * 50, 2000);
+                return delay;
+            },
+            maxRetriesPerRequest: 3,
             retryDelayOnFailover: 100,
             enableReadyCheck: true,
-            maxRetriesPerRequest: 3,
             lazyConnect: true,
             connectTimeout: 10000,
             commandTimeout: 5000
-        });
+        };
         
-        // NEW: Health monitoring events
-        redisClient.on('ready', () => { console.log('✅ Redis ready'); });
+        // Create Redis client with secure configuration
+        redisClient = new Redis(redisConfig);
+        
+        // Health monitoring events
+        redisClient.on('ready', () => { 
+            console.log('✅ Redis ready'); 
+            if (process.env.REDIS_PASSWORD) {
+                console.log('   🔒 Using password authentication');
+            }
+            if (process.env.REDIS_TLS === 'true') {
+                console.log('   🔐 Using TLS encryption');
+            }
+        });
         
         redisClient.on('connect', () => {
             console.log('Redis connected');
         });
         
-        redisClient.on('error', (err) => { console.error('⚠️  Redis error (will auto-retry):', err.message); });
+        redisClient.on('error', (err) => { 
+            console.error('⚠️  Redis error (will auto-retry):', err.message); 
+        });
         
-        redisClient.on('close', () => { console.warn('⚠️  Redis connection closed (will auto-reconnect)'); });
+        redisClient.on('close', () => { 
+            console.warn('⚠️  Redis connection closed (will auto-reconnect)'); 
+        });
         
         // Test Redis connection with ping
         await redisClient.ping();  // Simple health check
