@@ -15,6 +15,62 @@ const fs = require('fs');
 const path = require('path');
 const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, Keypair } = require('@solana/web3.js');
 const Joi = require('joi');
+
+// ============================================================================
+// INPUT VALIDATION SECURITY MODULE
+// ============================================================================
+// ✅ CRITICAL SECURITY FIX: Comprehensive input validation to prevent:
+//    - SQL/NoSQL injection via malformed IDs
+//    - Path traversal attacks (../, ..\)
+//    - Redis key injection
+//    - DoS via extremely long inputs
+//    - Data corruption from special characters
+//
+// All user inputs MUST be validated before use in:
+//    - Redis operations (room IDs, wallet addresses)
+//    - Database queries
+//    - File system operations
+//    - External API calls
+// ============================================================================
+
+/**
+ * Comprehensive validation middleware for socket events
+ * @param {Object} schema - Joi validation schema
+ * @param {string} eventName - Name of the socket event (for logging)
+ * @returns {Function} Validation middleware function
+ */
+function validateInput(schema, eventName) {
+    return (data) => {
+        const { error, value } = schema.validate(data, {
+            abortEarly: false,        // Report all errors, not just first
+            stripUnknown: true,       // Remove unknown properties (security)
+            convert: true             // Type coercion where safe
+        });
+        
+        if (error) {
+            const errorDetails = error.details.map(d => d.message).join('; ');
+            console.error(`❌ [SECURITY] Validation failed for ${eventName}:`, errorDetails);
+            throw new Error(`Validation failed: ${errorDetails}`);
+        }
+        
+        console.log(`✅ [SECURITY] Validation passed for ${eventName}`);
+        return value;
+    };
+}
+
+/**
+ * Sanitize user input for logging (prevent log injection)
+ * @param {string} input - Raw user input
+ * @returns {string} Sanitized string safe for logging
+ */
+function sanitizeForLog(input) {
+    if (typeof input !== 'string') return String(input);
+    // Remove control characters and limit length
+    return input
+        .replace(/[\x00-\x1F\x7F]/g, '') // Remove control chars
+        .substring(0, 100);               // Limit length
+}
+
 const BotDetector = require('./botDetector');
 const crypto = require('crypto');
 const bs58 = require('bs58').default;
@@ -106,21 +162,47 @@ const transactionSchema = Joi.object({
     recaptchaToken: Joi.string().required()
 });
 
+// ✅ SECURITY: Strict room ID validation (alphanumeric, hyphens, underscores only, 1-100 chars)
+const roomIdSchema = Joi.string()
+    .pattern(/^[a-zA-Z0-9_-]+$/)
+    .min(1)
+    .max(100)
+    .required()
+    .messages({
+        'string.pattern.base': 'Room ID must contain only alphanumeric characters, hyphens, and underscores',
+        'string.min': 'Room ID must be at least 1 character',
+        'string.max': 'Room ID cannot exceed 100 characters'
+    });
+
+// ✅ SECURITY: Strict question ID validation (roomId-uuid format: "q2bu9-562cf6b6-306a-4ba0-a86d-7855c9426831")
+const questionIdSchema = Joi.string()
+    .pattern(/^[a-zA-Z0-9_-]+-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i)
+    .min(1)
+    .max(150)
+    .required()
+    .messages({
+        'string.pattern.base': 'Question ID must be in format: roomId-uuid (e.g., room123-a1b2c3d4-...)',
+        'string.max': 'Question ID cannot exceed 150 characters'
+    });
+
 const submitAnswerSchema = Joi.object({
-    roomId: Joi.string().required(),
-    questionId: Joi.string().required(),
-    answer: Joi.number().integer().min(-1).required(),
+    roomId: roomIdSchema,
+    questionId: questionIdSchema,
+    answer: Joi.number().integer().min(-1).max(3).required().messages({
+        'number.min': 'Answer must be -1 (timeout) or 0-3 (option index)',
+        'number.max': 'Answer index cannot exceed 3'
+    }),
     recaptchaToken: Joi.string().allow(null, '').optional()  // username removed - will use socket.user.walletAddress
 });
 
 const playerReadySchema = Joi.object({
-    roomId: Joi.string().required(),
+    roomId: roomIdSchema,
     preferredMode: Joi.string().valid('human', 'bot').optional(),
     recaptchaToken: Joi.string().optional()
 });
 
 const switchToBotSchema = Joi.object({
-    roomId: Joi.string().required()
+    roomId: roomIdSchema
 });
 
 const requestBotRoomSchema = Joi.object({
@@ -130,15 +212,15 @@ const requestBotRoomSchema = Joi.object({
 });
 
 const requestBotGameSchema = Joi.object({
-    roomId: Joi.string().required()
+    roomId: roomIdSchema
 });
 
 const leaveRoomSchema = Joi.object({
-    roomId: Joi.string().required()
+    roomId: roomIdSchema
 });
 
 const matchFoundSchema = Joi.object({
-    newRoomId: Joi.string().required()
+    newRoomId: roomIdSchema
 });
 
 const { 
@@ -1589,40 +1671,53 @@ io.on('connection', (socket) => {
                             const otherRoomId = await getWaitingRoom(room.betAmount);
                             
                             if (otherRoomId && otherRoomId !== roomId) {
-                                const otherRoom = await getGameRoom(otherRoomId);
-                                if (
-                                    otherRoom &&
-                                    otherRoom.roomMode === 'human' &&
-                                    !otherRoom.gameStarted &&
-                                    otherRoom.betAmount === room.betAmount &&
-                                    otherRoom.players.length === 1
-                                ) {
-                                    console.log(`Found matching room ${otherRoomId} for player in room ${roomId} (O(1) lookup)`);
-                                    const player = room.players[0];
-                                    otherRoom.players.push(player);
-                                    await updateGameRoom(otherRoomId, otherRoom);
+                                // ✅ FIX: ATOMIC LOCK to prevent double-join/double-start race condition
+                                const lockKey = `lock:join:${otherRoomId}`;
+                                const acquiredLock = await redisClient.set(lockKey, 'locked', 'NX', 'EX', 5);
 
-                                    socket.leave(roomId);
-                                    if (roomId === socket.roomId) socket.roomId = null;
-                                    socket.join(otherRoomId);
-                                    socket.roomId = otherRoomId;
+                                if (acquiredLock) {
+                                    const otherRoom = await getGameRoom(otherRoomId);
+                                    if (
+                                        otherRoom &&
+                                        otherRoom.roomMode === 'human' &&
+                                        !otherRoom.gameStarted &&
+                                        otherRoom.betAmount === room.betAmount &&
+                                        otherRoom.players.length === 1
+                                    ) {
+                                        console.log(`Found matching room ${otherRoomId} for player in room ${roomId} (O(1) lookup)`);
+                                        const player = room.players[0];
+                                        otherRoom.players.push(player);
+                                        
+                                        // ✅ FIX: Removed "otherRoom.gameStarted = true" from here.
+                                        // It is now handled inside startGame() to ensure consistency.
+                                        await updateGameRoom(otherRoomId, otherRoom);
 
-                                    socket.emit('matchFound', { newRoomId: otherRoomId });
-                                    io.to(otherRoomId).emit('playerJoined', player.username);
+                                        socket.leave(roomId);
+                                        if (roomId === socket.roomId) socket.roomId = null;
+                                        socket.join(otherRoomId);
+                                        socket.roomId = otherRoomId;
 
-                                    otherRoom.gameStarted = true;
-                                    await updateGameRoom(otherRoomId, otherRoom);
-                                    await startGame(otherRoomId);
+                                        socket.emit('matchFound', { newRoomId: otherRoomId });
+                                        io.to(otherRoomId).emit('playerJoined', player.username);
 
-                                    // ✅ Clean up both rooms from waiting index
-                                    await removeWaitingRoom(room.betAmount, roomId);
-                                    await removeWaitingRoom(room.betAmount, otherRoomId);
-                                    await deleteGameRoom(roomId);
-                                    matchFound = true;
+                                        // Start game (flag is set inside the function now)
+                                        await startGame(otherRoomId);
+
+                                        // ✅ Clean up both rooms from waiting index
+                                        await removeWaitingRoom(room.betAmount, roomId);
+                                        await removeWaitingRoom(room.betAmount, otherRoomId);
+                                        await deleteGameRoom(roomId);
+                                        matchFound = true;
+                                    } else {
+                                        // Lock acquired but room invalid/gone
+                                        await redisClient.del(lockKey);
+                                        console.log(`Waiting room ${otherRoomId} no longer valid, replacing with ${roomId}`);
+                                        await removeWaitingRoom(room.betAmount, otherRoomId);
+                                        await addWaitingRoom(room.betAmount, roomId);
+                                    }
                                 } else {
-                                    // Other room invalid/gone, remove from index and add current room
-                                    console.log(`Waiting room ${otherRoomId} no longer valid, replacing with ${roomId}`);
-                                    await removeWaitingRoom(room.betAmount, otherRoomId);
+                                    console.log(`Race condition avoided: Room ${otherRoomId} is currently being joined`);
+                                    // Fallback: Add current room to waiting index since we couldn't join the other one
                                     await addWaitingRoom(room.betAmount, roomId);
                                 }
                             } else {
@@ -2651,6 +2746,9 @@ async function startGame(roomId) {
         console.log(`Game already started in room ${roomId}, skipping`);
         return;
     }
+
+    // ✅ FIX: Set gameStarted to true HERE to prevent race conditions
+    room.gameStarted = true;
 
     room.players.forEach(player => (player.score = 0));
     await updateGameRoom(roomId, room);
