@@ -71,6 +71,173 @@ function sanitizeForLog(input) {
         .substring(0, 100);               // Limit length
 }
 
+// ============================================================================
+// VALIDATION FAILURE TRACKING (Anti-Abuse System)
+// ============================================================================
+// Track validation failures per IP/wallet to detect attack patterns
+
+const validationFailures = new Map(); // Map<identifier, {count, firstFailure, lastFailure}>
+const VALIDATION_FAILURE_WINDOW = 3600000; // 1 hour
+const VALIDATION_FAILURE_THRESHOLD = 100; // Max failures per hour
+const blockedIdentifiers = new Set();
+
+/**
+ * Track validation failure and auto-block abusers
+ * @param {string} identifier - IP address or wallet address
+ * @param {string} eventName - Event that failed validation
+ * @param {string} error - Validation error message
+ */
+function trackValidationFailure(identifier, eventName, error) {
+    const now = Date.now();
+    const sanitizedId = sanitizeForLog(identifier);
+    const sanitizedEvent = sanitizeForLog(eventName);
+    const sanitizedError = sanitizeForLog(error);
+    
+    // Get or create failure record
+    let record = validationFailures.get(identifier);
+    if (!record) {
+        record = { count: 0, firstFailure: now, lastFailure: now, events: [] };
+        validationFailures.set(identifier, record);
+    }
+    
+    // Reset counter if outside time window
+    if (now - record.firstFailure > VALIDATION_FAILURE_WINDOW) {
+        record.count = 0;
+        record.firstFailure = now;
+        record.events = [];
+    }
+    
+    // Increment and log
+    record.count++;
+    record.lastFailure = now;
+    record.events.push({ event: sanitizedEvent, error: sanitizedError, time: now });
+    
+    console.warn(`⚠️  [SECURITY] Validation failure #${record.count} from ${sanitizedId} on ${sanitizedEvent}: ${sanitizedError}`);
+    
+    // Auto-block if threshold exceeded
+    if (record.count >= VALIDATION_FAILURE_THRESHOLD && !blockedIdentifiers.has(identifier)) {
+        blockedIdentifiers.add(identifier);
+        console.error(`🚨 [SECURITY] AUTO-BLOCKED ${sanitizedId} after ${record.count} validation failures`);
+        console.error(`   Events: ${JSON.stringify(record.events.slice(-10))}`); // Last 10 events
+        
+        // Alert admins (integrate with monitoring system)
+        // alertAdmins({ type: 'auto_block', identifier, reason: 'validation_abuse', count: record.count });
+    }
+}
+
+/**
+ * Check if identifier is blocked
+ * @param {string} identifier - IP or wallet to check
+ * @returns {boolean} True if blocked
+ */
+function isBlocked(identifier) {
+    return blockedIdentifiers.has(identifier);
+}
+
+/**
+ * Clear validation failure records (for testing/maintenance)
+ */
+function clearValidationTracking() {
+    validationFailures.clear();
+    blockedIdentifiers.clear();
+    console.log('✅ Validation tracking cleared');
+}
+
+// Periodic cleanup of old records (every 5 minutes)
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    
+    for (const [identifier, record] of validationFailures.entries()) {
+        if (now - record.lastFailure > VALIDATION_FAILURE_WINDOW) {
+            validationFailures.delete(identifier);
+            cleaned++;
+        }
+    }
+    
+    if (cleaned > 0) {
+        console.log(`🧹 Cleaned ${cleaned} expired validation failure records`);
+    }
+}, 300000);
+
+
+// ============================================================================
+// OUTPUT SANITIZATION (XSS Prevention)
+// ============================================================================
+// Note: Install with: npm install sanitize-html
+// For production, ensure this package is in package.json
+
+let sanitizeHtml;
+try {
+    sanitizeHtml = require('sanitize-html');
+    console.log('✅ sanitize-html loaded for XSS protection');
+} catch (error) {
+    console.warn('⚠️  sanitize-html not installed. Install with: npm install sanitize-html');
+    // Fallback: basic sanitization
+    sanitizeHtml = (dirty) => {
+        if (typeof dirty !== 'string') return String(dirty);
+        return dirty
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#x27;')
+            .replace(/\//g, '&#x2F;');
+    };
+}
+
+/**
+ * Sanitize HTML content for safe display
+ * Removes all potentially dangerous tags and attributes
+ * @param {string} dirty - Unsanitized HTML content
+ * @returns {string} Sanitized HTML safe for display
+ */
+function sanitizeOutput(dirty) {
+    if (typeof sanitizeHtml === 'function' && sanitizeHtml.name !== 'sanitizeHtml') {
+        // Using fallback
+        return sanitizeHtml(dirty);
+    }
+    
+    // Using sanitize-html package with strict settings
+    return sanitizeHtml(dirty, {
+        allowedTags: [], // No HTML tags allowed - strip everything
+        allowedAttributes: {},
+        disallowedTagsMode: 'discard'
+    });
+}
+
+/**
+ * Sanitize text for display in HTML context
+ * Allows basic formatting but removes scripts
+ * @param {string} text - Text to sanitize
+ * @returns {string} Sanitized text
+ */
+function sanitizeText(text) {
+    if (typeof text !== 'string') return String(text);
+    
+    if (typeof sanitizeHtml === 'function' && sanitizeHtml.name !== 'sanitizeHtml') {
+        // Using fallback
+        return sanitizeHtml(text);
+    }
+    
+    // Allow some basic formatting tags but nothing dangerous
+    return sanitizeHtml(text, {
+        allowedTags: ['b', 'i', 'em', 'strong', 'br'],
+        allowedAttributes: {},
+        disallowedTagsMode: 'escape'
+    });
+}
+
+// Export sanitization functions
+module.exports = {
+    ...module.exports,
+    sanitizeOutput,
+    sanitizeText,
+    sanitizeForLog
+};
+
+console.log('✅ Output sanitization utilities initialized');
+
 const BotDetector = require('./botDetector');
 const crypto = require('crypto');
 const bs58 = require('bs58').default;
@@ -236,6 +403,89 @@ const { Token: SPLToken } = require('@solana/spl-token');
 
 const app = express();
 const server = http.createServer(app);
+
+// ============================================================================
+// SECURITY HEADERS MIDDLEWARE
+// ============================================================================
+// Implements OWASP recommended security headers to prevent common attacks
+
+app.use((req, res, next) => {
+    // Prevent clickjacking attacks
+    res.setHeader('X-Frame-Options', 'DENY');
+    
+    // Prevent MIME type sniffing
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    
+    // Enable browser XSS protection
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    
+    // Control referrer information
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    
+    // Prevent browser from caching sensitive data
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    
+    // Content Security Policy (CSP)
+    // Configured for game application with Solana, reCAPTCHA, and CDN resources
+    const cspDirectives = [
+        "default-src 'self'",
+        
+        // Scripts: Allow game libraries and reCAPTCHA
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.google.com https://www.gstatic.com https://bundle.run https://unpkg.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com",
+        
+        // Styles: Allow inline styles for dynamic UI
+        "style-src 'self' 'unsafe-inline'",
+        
+        // Images: Allow data URIs and HTTPS images
+        "img-src 'self' data: https:",
+        
+        // Fonts: Allow data URIs and self-hosted fonts
+        "font-src 'self' data:",
+        
+        // Connections: Allow WebSocket, Solana RPC, CDNs, and API endpoints
+        "connect-src 'self' wss: ws: https://devnet.helius-rpc.com https://api.anthropic.com https://unpkg.com https://cdn.jsdelivr.net https://bundle.run https://cdnjs.cloudflare.com https://www.google.com https://www.gstatic.com",
+        
+        // Frames: Allow Google reCAPTCHA frames
+        "frame-src 'self' https://www.google.com https://recaptcha.google.com https://www.recaptcha.net",
+        
+        // Child frames (for embedded content)
+        "child-src 'self' https://www.google.com https://recaptcha.google.com",
+        
+        // Prevent others from framing this site
+        "frame-ancestors 'none'",
+        
+        // Base URI restriction
+        "base-uri 'self'",
+        
+        // Form submission restriction
+        "form-action 'self'"
+    ].join('; ');
+    res.setHeader('Content-Security-Policy', cspDirectives);
+    
+    // Permissions Policy (formerly Feature Policy)
+    const permissionsPolicy = [
+        'geolocation=()',
+        'microphone=()',
+        'camera=()',
+        'payment=()',
+        'usb=()',
+        'magnetometer=()',
+        'accelerometer=()',
+        'gyroscope=()'
+    ].join(', ');
+    res.setHeader('Permissions-Policy', permissionsPolicy);
+    
+    // HSTS (HTTP Strict Transport Security) - Only in production with HTTPS
+    if (ENVIRONMENT === 'production' && req.secure) {
+        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+    }
+    
+    next();
+});
+
+console.log('✅ Security headers middleware initialized');
 
 // Restrict CORS: Replace "*" with your domain(s) e.g., ["https://yourgame.com", "http://localhost:3000"]
 const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ["http://localhost:3000"];
@@ -1572,10 +1822,20 @@ io.on('connection', (socket) => {
                 if (event === 'joinGame') {
                     const data = args[0];
                     await rateLimitEvent(data.walletAddress, 'joinGame', 5, 60);
+                    
+                    // ✅ Check if blocked
+                    if (isBlocked(data.walletAddress) || isBlocked(socket.handshake.address)) {
+                        console.error(`🚨 [SECURITY] Blocked identifier attempted ${event}`);
+                        socket.emit('joinGameFailure', 'Access denied');
+                        return;
+                    }
+                    
                     const { error } = transactionSchema.validate(data);
                     if (error) {
-                        console.error('Validation error:', error.message);
-                        socket.emit('joinGameFailure', error.message);
+                        const identifier = data.walletAddress || socket.handshake.address;
+                        trackValidationFailure(identifier, 'joinGame', error.message);
+                        console.error('Validation error:', sanitizeForLog(error.message));
+                        socket.emit('joinGameFailure', 'Invalid input format');
                         return;
                     }
                     const { walletAddress, betAmount } = data;
@@ -1671,53 +1931,40 @@ io.on('connection', (socket) => {
                             const otherRoomId = await getWaitingRoom(room.betAmount);
                             
                             if (otherRoomId && otherRoomId !== roomId) {
-                                // ✅ FIX: ATOMIC LOCK to prevent double-join/double-start race condition
-                                const lockKey = `lock:join:${otherRoomId}`;
-                                const acquiredLock = await redisClient.set(lockKey, 'locked', 'NX', 'EX', 5);
+                                const otherRoom = await getGameRoom(otherRoomId);
+                                if (
+                                    otherRoom &&
+                                    otherRoom.roomMode === 'human' &&
+                                    !otherRoom.gameStarted &&
+                                    otherRoom.betAmount === room.betAmount &&
+                                    otherRoom.players.length === 1
+                                ) {
+                                    console.log(`Found matching room ${otherRoomId} for player in room ${roomId} (O(1) lookup)`);
+                                    const player = room.players[0];
+                                    otherRoom.players.push(player);
+                                    await updateGameRoom(otherRoomId, otherRoom);
 
-                                if (acquiredLock) {
-                                    const otherRoom = await getGameRoom(otherRoomId);
-                                    if (
-                                        otherRoom &&
-                                        otherRoom.roomMode === 'human' &&
-                                        !otherRoom.gameStarted &&
-                                        otherRoom.betAmount === room.betAmount &&
-                                        otherRoom.players.length === 1
-                                    ) {
-                                        console.log(`Found matching room ${otherRoomId} for player in room ${roomId} (O(1) lookup)`);
-                                        const player = room.players[0];
-                                        otherRoom.players.push(player);
-                                        
-                                        // ✅ FIX: Removed "otherRoom.gameStarted = true" from here.
-                                        // It is now handled inside startGame() to ensure consistency.
-                                        await updateGameRoom(otherRoomId, otherRoom);
+                                    socket.leave(roomId);
+                                    if (roomId === socket.roomId) socket.roomId = null;
+                                    socket.join(otherRoomId);
+                                    socket.roomId = otherRoomId;
 
-                                        socket.leave(roomId);
-                                        if (roomId === socket.roomId) socket.roomId = null;
-                                        socket.join(otherRoomId);
-                                        socket.roomId = otherRoomId;
+                                    socket.emit('matchFound', { newRoomId: otherRoomId });
+                                    io.to(otherRoomId).emit('playerJoined', player.username);
 
-                                        socket.emit('matchFound', { newRoomId: otherRoomId });
-                                        io.to(otherRoomId).emit('playerJoined', player.username);
+                                    otherRoom.gameStarted = true;
+                                    await updateGameRoom(otherRoomId, otherRoom);
+                                    await startGame(otherRoomId);
 
-                                        // Start game (flag is set inside the function now)
-                                        await startGame(otherRoomId);
-
-                                        // ✅ Clean up both rooms from waiting index
-                                        await removeWaitingRoom(room.betAmount, roomId);
-                                        await removeWaitingRoom(room.betAmount, otherRoomId);
-                                        await deleteGameRoom(roomId);
-                                        matchFound = true;
-                                    } else {
-                                        // Lock acquired but room invalid/gone
-                                        await redisClient.del(lockKey);
-                                        console.log(`Waiting room ${otherRoomId} no longer valid, replacing with ${roomId}`);
-                                        await removeWaitingRoom(room.betAmount, otherRoomId);
-                                        await addWaitingRoom(room.betAmount, roomId);
-                                    }
+                                    // ✅ Clean up both rooms from waiting index
+                                    await removeWaitingRoom(room.betAmount, roomId);
+                                    await removeWaitingRoom(room.betAmount, otherRoomId);
+                                    await deleteGameRoom(roomId);
+                                    matchFound = true;
                                 } else {
-                                    console.log(`Race condition avoided: Room ${otherRoomId} is currently being joined`);
-                                    // Fallback: Add current room to waiting index since we couldn't join the other one
+                                    // Other room invalid/gone, remove from index and add current room
+                                    console.log(`Waiting room ${otherRoomId} no longer valid, replacing with ${roomId}`);
+                                    await removeWaitingRoom(room.betAmount, otherRoomId);
                                     await addWaitingRoom(room.betAmount, roomId);
                                 }
                             } else {
@@ -2746,9 +2993,6 @@ async function startGame(roomId) {
         console.log(`Game already started in room ${roomId}, skipping`);
         return;
     }
-
-    // ✅ FIX: Set gameStarted to true HERE to prevent race conditions
-    room.gameStarted = true;
 
     room.players.forEach(player => (player.score = 0));
     await updateGameRoom(roomId, room);
