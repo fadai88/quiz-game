@@ -9,6 +9,26 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 require('dotenv').config();
 const { v4: uuidv4 } = require('uuid');
+const cookieParser = require('cookie-parser');
+
+// ============================================================================
+// SECURE SESSION CONFIGURATION
+// ============================================================================
+// Sessions are stored server-side in Redis and identified by secure cookies
+// Cookies are httpOnly (not accessible via JavaScript) to prevent XSS theft
+
+// Generate session secret keys (use environment variables in production)
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const SESSION_SECRET_2 = process.env.SESSION_SECRET_2 || crypto.randomBytes(32).toString('hex');
+
+if (!process.env.SESSION_SECRET && ENVIRONMENT === 'production') {
+    console.error('❌ FATAL: SESSION_SECRET not set in production!');
+    console.error('   Generate with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+    process.exit(1);
+}
+
+console.log('✅ Secure session secrets configured');
+
 const User = require('./models/User');
 const axios = require('axios');
 const fs = require('fs');
@@ -587,6 +607,162 @@ const authMiddleware = async (socket, next) => {
 };
 
 app.use(express.json());
+
+// ============================================================================
+// COOKIE MIDDLEWARE - Secure Session Management
+// ============================================================================
+// Use httpOnly cookies to prevent XSS access to session tokens
+app.use(cookieParser(SESSION_SECRET));
+
+// Session cookie configuration
+const COOKIE_OPTIONS = {
+    httpOnly: true,  // Prevents JavaScript access (XSS protection)
+    secure: ENVIRONMENT === 'production',  // HTTPS only in production
+    sameSite: 'strict',  // CSRF protection
+    maxAge: 24 * 60 * 60 * 1000,  // 24 hours
+    signed: true  // Sign cookies to prevent tampering
+};
+
+console.log('✅ Secure cookie middleware initialized', {
+    httpOnly: COOKIE_OPTIONS.httpOnly,
+    secure: COOKIE_OPTIONS.secure,
+    sameSite: COOKIE_OPTIONS.sameSite
+});
+
+// ============================================================================
+// SECURE HTTP AUTHENTICATION ENDPOINTS
+// ============================================================================
+// These endpoints handle login/logout with httpOnly cookies for XSS protection
+
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { walletAddress, verifyToken, recaptchaToken, clientData } = req.body;
+        
+        // Validate verification token (proves Socket.IO already verified signature)
+        const storedToken = await redisClient.get(`verify:${walletAddress}`);
+        
+        if (!storedToken || storedToken !== verifyToken) {
+            console.error(`[AUTH] Invalid or expired verification token for ${walletAddress}`);
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Invalid verification. Please try logging in again.' 
+            });
+        }
+        
+        // Delete verification token (one-time use)
+        await redisClient.del(`verify:${walletAddress}`);
+        console.log(`[AUTH] Verification token validated for ${walletAddress}`);
+        
+        // Verify reCAPTCHA if enabled
+        if (process.env.ENABLE_RECAPTCHA === 'true') {
+            if (!recaptchaToken) {
+                return res.status(400).json({ success: false, error: 'reCAPTCHA required' });
+            }
+            const recaptchaResult = await verifyRecaptcha(recaptchaToken);
+            if (!recaptchaResult.success) {
+                return res.status(400).json({ success: false, error: 'reCAPTCHA failed' });
+            }
+        }
+        
+        // Create/update user
+        let user = await User.findOne({ walletAddress });
+        const connectionData = {
+            ip: req.ip || req.connection.remoteAddress,
+            userAgent: req.headers['user-agent']
+        };
+        
+        if (!user) {
+            user = await User.create({ 
+                walletAddress,
+                registrationIP: connectionData.ip,
+                registrationDate: new Date(),
+                lastLoginIP: connectionData.ip,
+                lastLoginDate: new Date(),
+                userAgent: connectionData.userAgent,
+                recentQuestions: []
+            });
+        } else {
+            user.lastLoginIP = connectionData.ip;
+            user.lastLoginDate = new Date();
+            user.userAgent = connectionData.userAgent;
+            await user.save();
+        }
+        
+        // Generate fingerprint
+        const fingerprint = crypto.createHash('sha256')
+            .update(JSON.stringify(clientData || {}))
+            .digest('hex');
+        user.deviceFingerprint = fingerprint;
+        await user.save();
+        
+        // Generate secure session token
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        
+        // Store session in Redis
+        const sessionData = {
+            walletAddress,
+            fingerprint,
+            timestamp: Date.now(),
+            ip: connectionData.ip,
+            userAgent: connectionData.userAgent
+        };
+        
+        await redisClient.set(`session:${sessionToken}`, JSON.stringify(sessionData), 'EX', 86400);
+        await redisClient.set(`session:wallet:${walletAddress}`, sessionToken, 'EX', 86400);
+        
+        console.log(`[SESSION] HTTP login successful for ${walletAddress}`);
+        
+        // Set httpOnly cookie
+        res.cookie('sessionToken', sessionToken, COOKIE_OPTIONS);
+        
+        res.json({ success: true, virtualBalance: user.virtualBalance });
+        
+    } catch (error) {
+        console.error('[AUTH] HTTP login error:', error);
+        res.status(500).json({ success: false, error: 'Server error' });
+    }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+    const { sessionToken } = req.signedCookies;
+    if (sessionToken) {
+        redisClient.del(`session:${sessionToken}`).catch(console.error);
+    }
+    res.clearCookie('sessionToken');
+    res.json({ success: true });
+});
+
+app.get('/api/auth/session', async (req, res) => {
+    try {
+        const { sessionToken } = req.signedCookies;
+        
+        if (!sessionToken) {
+            return res.status(401).json({ authenticated: false });
+        }
+        
+        const sessionDataStr = await redisClient.get(`session:${sessionToken}`);
+        if (!sessionDataStr) {
+            res.clearCookie('sessionToken');
+            return res.status(401).json({ authenticated: false });
+        }
+        
+        const sessionData = JSON.parse(sessionDataStr);
+        const user = await User.findOne({ walletAddress: sessionData.walletAddress });
+        
+        res.json({
+            authenticated: true,
+            walletAddress: sessionData.walletAddress,
+            virtualBalance: user?.virtualBalance || 0
+        });
+        
+    } catch (error) {
+        console.error('[AUTH] Session validation error:', error);
+        res.status(500).json({ authenticated: false });
+    }
+});
+
+console.log('✅ HTTP authentication endpoints configured');
+
 app.get('/game.html', (req, res) => {
     let gameHtml = fs.readFileSync(path.join(__dirname, 'public', 'game.html'), 'utf8');
     const recaptchaEnabled = process.env.ENABLE_RECAPTCHA === 'true';
@@ -1485,6 +1661,72 @@ class TriviaBot {
     }
 }
 
+// ============================================================================
+// SOCKET.IO COOKIE AUTHENTICATION MIDDLEWARE
+// ============================================================================
+// Validates session from httpOnly cookie before allowing Socket.IO connection
+io.use(async (socket, next) => {
+    try {
+        // Extract cookies from handshake
+        const cookieHeader = socket.handshake.headers.cookie;
+        
+        // Allow unauthenticated connection for login flow
+        const incomingEvent = socket.handshake.auth?.event;
+        if (incomingEvent === 'walletLogin') {
+            return next(); // Let login happen first
+        }
+        
+        if (!cookieHeader) {
+            console.warn('[AUTH] No cookies in Socket.IO handshake');
+            return next(new Error('Authentication required'));
+        }
+        
+        // Parse cookies
+        const cookies = require('cookie').parse(cookieHeader);
+        const cookieSignature = require('cookie-signature');
+        
+        // Extract signed session token
+        let sessionToken = cookies.sessionToken;
+        if (!sessionToken) {
+            console.warn('[AUTH] No session cookie found');
+            return next(new Error('No session cookie'));
+        }
+        
+        // Unsign cookie
+        if (sessionToken.startsWith('s:')) {
+            sessionToken = cookieSignature.unsign(sessionToken.slice(2), SESSION_SECRET);
+            if (sessionToken === false) {
+                console.warn('[AUTH] Invalid cookie signature');
+                return next(new Error('Invalid session'));
+            }
+        }
+        
+        // Validate session in Redis
+        const sessionDataStr = await redisClient.get(`session:${sessionToken}`);
+        
+        if (!sessionDataStr) {
+            console.warn('[AUTH] Session not found in Redis');
+            return next(new Error('Session expired'));
+        }
+        
+        const sessionData = JSON.parse(sessionDataStr);
+        
+        // Attach authenticated user to socket
+        socket.user = {
+            walletAddress: sessionData.walletAddress,
+            fingerprint: sessionData.fingerprint,
+            sessionToken: sessionToken
+        };
+        
+        console.log(`[AUTH] Socket authenticated for ${sessionData.walletAddress}`);
+        next();
+        
+    } catch (error) {
+        console.error('[AUTH] Socket authentication error:', error);
+        next(new Error('Authentication failed'));
+    }
+});
+
 // Enable authentication middleware with exemptions for login events
 io.use((socket, next) => {
     // Exempt login/reconnect (no socket.user yet) - check handshake auth
@@ -1670,11 +1912,27 @@ io.on('connection', (socket) => {
                 }
                 // ===== END SESSION STORAGE =====
 
+                // Create temporary verification token for HTTP endpoint
+                // This proves Socket.IO already verified the signature
+                const verifyToken = crypto.randomBytes(32).toString('hex');
+                try {
+                    await redisClient.set(
+                        `verify:${walletAddress}`,
+                        verifyToken,
+                        'EX',
+                        30  // Expires in 30 seconds
+                    );
+                    console.log(`[VERIFY] Created verification token for ${walletAddress}`);
+                } catch (error) {
+                    console.error(`[VERIFY] Failed to store verification token:`, error);
+                }
+
                 console.log('Login successful for wallet:', walletAddress);
 
                 socket.emit('loginSuccess', {
                     walletAddress: user.walletAddress,
-                    virtualBalance: user.virtualBalance
+                    virtualBalance: user.virtualBalance,
+                    verifyToken: verifyToken  // Send to client for HTTP authentication
                 });
             } catch (error) {
                 console.error('Database error during login:', error);

@@ -264,9 +264,7 @@
         }
 
         const socket = io('http://localhost:5000', { 
-            auth: { 
-                event: 'walletLogin'  // Exempts from middleware for initial auth
-            } 
+            withCredentials: true,  // CRITICAL: Send cookies for authentication
         });
 
         socket.on('error', (error) => {
@@ -274,19 +272,16 @@
             
             if (error.code === 'AUTH_REQUIRED') {
                 alert('Please login to continue');
-                localStorage.removeItem('sessionData');
                 window.location.href = '/login.html';
             }
             
             if (error.code === 'SESSION_EXPIRED') {
                 alert('Your session has expired. Please login again.');
-                localStorage.removeItem('sessionData');
                 window.location.href = '/login.html';
             }
             
             if (error.code === 'AUTH_ERROR') {
                 alert('Authentication error. Please try logging in again.');
-                localStorage.removeItem('sessionData');
                 window.location.href = '/login.html';
             }
         });
@@ -560,57 +555,79 @@
         // Initialize USDC manager after connection is created
         const usdcManager = new USDCManager(connection);
 
-        // Initialize from URL or session data first
-        async function initializeFromSession() {
-            const sessionData = localStorage.getItem('sessionData');
-            const urlWallet = getUrlParameter('wallet');
-            
+        async function checkSession() {
             try {
-                connectedWallet = urlWallet || (sessionData ? JSON.parse(sessionData).walletAddress : null);
-
-                if (!connectedWallet) {
-                    console.log('No wallet found in session or URL');
-                    alert('No wallet connected. Redirecting to login page.');
-                    window.location.href = 'login.html';
-                    return;
-                }
-
-                console.log('Wallet connected:', connectedWallet);
+                const response = await fetch('/api/auth/session', {
+                    method: 'GET',
+                    credentials: 'include'  // CRITICAL: Send cookies
+                });
                 
-                // Update wallet status UI
-                document.getElementById('walletStatus').textContent = 
-                    `Connected: ${connectedWallet.slice(0,4)}...${connectedWallet.slice(-4)}`;
+                const data = await response.json();
+                
+                if (data.authenticated) {
+                    console.log('✅ Session valid for wallet:', data.walletAddress);
+                    connectedWallet = data.walletAddress;
                     
-                // CRITICAL: Re-authenticate socket with server to set socket.user
-                socket.emit('walletReconnect', connectedWallet);
-                
-                // Listen for reconnect response
-                socket.once('loginSuccess', async (data) => {  // <-- FIXED: Add 'async' here
-                    console.log('Reconnect successful:', data);
-                    // Proceed with balance/UI init
-                    await updateBalance();
-                    balanceUpdateInterval = setInterval(updateBalance, 30000);
-                    await initializeWallet(); // Existing
-                });
-                
-                socket.once('loginFailure', (message) => {
-                    console.error('Reconnect failed:', message);
-                    alert(`Session invalid: ${message}. Redirecting to login.`);
-                    localStorage.removeItem('sessionData');
-                    window.location.href = 'login.html';
-                });
-                
-                // Fallback timeout (5s) if no response
-                setTimeout(() => {
-                    if (!socket.connected) {  // Check connection state instead of socket.user (client-side approx)
-                        console.error('Reconnect timeout—redirecting');
-                        window.location.href = 'login.html';
+                    // Update UI
+                    if (document.getElementById('walletStatus')) {
+                        document.getElementById('walletStatus').textContent = 
+                            `Connected: ${connectedWallet.slice(0,4)}...${connectedWallet.slice(-4)}`;
                     }
-                }, 5000);
+                    
+                    return true;
+                } else {
+                    console.warn('⚠️ No valid session - redirecting to login');
+                    window.location.href = 'login.html';
+                    return false;
+                }
                 
             } catch (error) {
-                console.error('Session initialization error:', error);
+                console.error('❌ Session check error:', error);
                 window.location.href = 'login.html';
+                return false;
+            }
+        }
+
+        async function logout() {
+            try {
+                await fetch('/api/auth/logout', {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+            } catch (error) {
+                console.error('Logout error:', error);
+            }
+            window.location.href = 'login.html';
+        }
+
+        // Initialize from URL or session data first
+        async function initializeFromSession() {
+            console.log('Checking session via secure cookie...');
+            
+            // Check session via HTTP (secure cookie)
+            const isAuthenticated = await checkSession();
+            
+            if (!isAuthenticated) {
+                return; // checkSession already redirects to login
+            }
+            
+            // connectedWallet is now set by checkSession()
+            console.log('✅ Wallet connected:', connectedWallet);
+            
+            // Update wallet status UI
+            document.getElementById('walletStatus').textContent = 
+                `Connected: ${connectedWallet.slice(0,4)}...${connectedWallet.slice(-4)}`;
+            
+            // NO walletReconnect needed - cookie authenticates Socket.IO automatically
+            
+            // Proceed with balance/UI init
+            try {
+                await updateBalance();
+                balanceUpdateInterval = setInterval(updateBalance, 30000);
+                await initializeWallet();
+            } catch (error) {
+                console.error('Initialization error:', error);
+                alert('Failed to initialize. Please refresh the page.');
             }
         }
 
@@ -620,35 +637,28 @@
                     throw new Error('Phantom wallet not installed');
                 }
 
-                const sessionDataStr = localStorage.getItem('sessionData');
-                if (!sessionDataStr) {
-                    throw new Error('No session found');
+
+                // Session already validated by checkSession() - connectedWallet is set
+                // Optional: Auto-connect to Phantom if not already connected
+                if (!window.solana.isConnected) {
+                    try {
+                        await window.solana.connect({ onlyIfTrusted: true });
+                        console.log('Auto-connected to Phantom wallet');
+                    } catch (err) {
+                        console.log('Phantom not auto-connected:', err.message);
+                    }
                 }
 
-                const sessionData = JSON.parse(sessionDataStr);
-                
-                if (Date.now() - sessionData.timestamp > 24 * 60 * 60 * 1000) {
-                    throw new Error('Session expired');
-                }
-
-                let publicKey;
+                // Verify Phantom wallet matches session wallet (if connected)
                 if (window.solana.isConnected) {
-                    publicKey = window.solana.publicKey.toString();
-                } else {
-                    const resp = await window.solana.connect({ onlyIfTrusted: true });
-                    publicKey = resp.publicKey.toString();
-                }
-
-                if (publicKey !== sessionData.walletAddress) {
-                    throw new Error('Wallet mismatch');
-                }
-
-                // Only update if the wallet has changed
-                if (publicKey !== connectedWallet) {
-                    connectedWallet = publicKey;
-                    console.log('Wallet connection updated:', connectedWallet);
-                    document.getElementById('walletStatus').textContent = 
-                        `Connected: ${connectedWallet.slice(0,4)}...${connectedWallet.slice(-4)}`;
+                    const phantomPublicKey = window.solana.publicKey.toString();
+                    if (phantomPublicKey !== connectedWallet) {
+                        console.warn(`Wallet mismatch: Phantom=${phantomPublicKey}, Session=${connectedWallet}`);
+                        alert('Wallet mismatch detected. Please log in with the correct wallet.');
+                        await logout();
+                        return;
+                    }
+                    console.log('✅ Phantom wallet verified:', phantomPublicKey);
                 }
 
             } catch (error) {
@@ -740,7 +750,6 @@
                     }
                 });
 
-                localStorage.setItem('walletAddress', connectedWallet);
                 updateWalletStatus();
                 
                 // Update balance immediately after connecting
@@ -765,12 +774,23 @@
 
         window.addEventListener('load', initializeFromSession);
 
-        window.solana?.on('disconnect', () => {
+        window.solana?.on('disconnect', async () => {
             console.log('Wallet disconnected');
             if (balanceUpdateInterval) {
                 clearInterval(balanceUpdateInterval);
             }
-            localStorage.removeItem('sessionData');
+            
+            // Call logout endpoint to clear cookie
+            try {
+                await fetch('/api/auth/logout', {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+            } catch (error) {
+                console.error('Logout error:', error);
+            }
+            
+            // NO localStorage to clear - session is in httpOnly cookie
             window.location.href = 'login.html';
         });
 
