@@ -138,6 +138,33 @@
 
     <script src="/socket.io/socket.io.js"></script>
     <script>
+        function getErrorMessage(error) {
+            if (error && typeof error === 'object') {
+                if (error.error) return error.error;
+                if (error.message) return error.message;
+                return 'An error occurred. Please try again.';
+            }
+            if (typeof error === 'string') return error;
+            return 'An error occurred. Please try again.';
+        }
+        
+        function logError(context, error) {
+            const isProduction = window.location.hostname !== 'localhost';
+            if (isProduction) {
+                if (error && error.errorId) {
+                    console.log(`[${context}] Error ID: ${error.errorId}`);
+                } else {
+                    console.log(`[${context}] An error occurred`);
+                }
+            } else {
+                console.log(`[${context}]`, {
+                    message: getErrorMessage(error),
+                    code: error?.code,
+                    errorId: error?.errorId
+                });
+            }
+        }
+
         const socket = io('http://localhost:5000', { 
             auth: { 
                 event: 'walletLogin'  // Exempts from middleware for initial auth
@@ -145,29 +172,12 @@
         });
 
         socket.on('error', (error) => {
-            console.error('Server error:', error);
+            logError('socket-error', error);  // ✅ Safe logging
             
             if (error.code === 'SESSION_EXPIRED' || error.code === 'AUTH_ERROR') {
                 showError('Session expired. Please login again.');
             }
         });
-        
-        /*
-        socket.on('connect_error', (err) => {
-            console.log('Connect error details:', {
-                message: err.message,      // e.g., "xhr poll error"
-                description: err.description, // e.g., HTTP status
-                context: err.context       // e.g., XHR object
-            });
-        });
-
-        socket.on('connect', () => {
-            console.log('Connected via transport:', socket.io.engine.transport.name); // "polling" or "websocket"
-            socket.io.engine.once('upgrade', () => {
-                console.log('Upgraded to:', socket.io.engine.transport.name);
-            });
-        });
-        */
 
         socket.on('disconnect', (reason) => {
             console.log('Disconnected:', reason);
@@ -332,21 +342,22 @@
                     });
                     console.log('Sent login request to server');
                 } catch (error) {
-                    console.error('Wallet connection error:', error);
+                    logError('wallet-connection', error);  // ✅ Safe logging
                     connectButton.disabled = false;
                     connectButton.innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
-                    showError(error.message || 'Failed to connect wallet. Please try again.');
+                    showError(getErrorMessage(error) || 'Failed to connect wallet. Please try again.');  // ✅ Safe message
                 }
             } catch (err) {
-                console.error('Error in connectWallet:', err);
+                logError('connect-wallet', err);  // ✅ Safe logging
                 const connectButton = document.getElementById('connectWalletBtn');
                 connectButton.disabled = false;
                 connectButton.innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
                 
-                if (err.message.includes('reCAPTCHA')) {
-                    showError(err.message + ' Please refresh and try again.');
+                const errorMsg = getErrorMessage(err);
+                if (errorMsg.toLowerCase().includes('recaptcha')) {
+                    showError(errorMsg + ' Please refresh and try again.');
                 } else {
-                    showError('Failed to connect wallet: ' + err.message);
+                    showError(errorMsg);
                 }
             }
         }
@@ -410,25 +421,25 @@
                         window.location.href = 'game.html';
                     }, 1000);
                 } else {
-                    console.error('❌ HTTP authentication failed:', result.error);
-                    showError(`Authentication failed: ${result.error}`);
+                    logError('http-auth-failed', { error: result.error });  // ✅ Safe logging
+                    showError(getErrorMessage(result.error) || 'Authentication failed. Please try again.');
                     document.getElementById('connectWalletBtn').disabled = false;
                     document.getElementById('connectWalletBtn').innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
                 }
                 
             } catch (error) {
-                console.error('❌ HTTP authentication error:', error);
+                logError('http-auth-error', error);  // ✅ Safe logging
                 showError('Authentication failed. Please try again.');
                 document.getElementById('connectWalletBtn').disabled = false;
                 document.getElementById('connectWalletBtn').innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
             }
         });
 
-        socket.on('loginFailure', (message) => {
-            console.error('Login failed:', message);
+        socket.on('loginFailure', (error) => {
+            logError('login-failure', error);  // ✅ Safe logging
             document.getElementById('connectWalletBtn').disabled = false;
             document.getElementById('connectWalletBtn').innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
-            showError(`Login failed: ${message}`);
+            showError(getErrorMessage(error));  // ✅ User-friendly message
         });
 
         document.getElementById('connectWalletBtn').addEventListener('click', connectWallet);
@@ -445,7 +456,7 @@
                     credentials: 'include'
                 });
             } catch (error) {
-                console.error('Logout error:', error);
+                logError('logout', error);
             }
             
             if (window.solana && window.solana.isConnected) {
@@ -472,7 +483,6 @@
             loginMessage.className = 'success-message';
         }
 
-        // Check if wallet is already connected
         // Check for existing session on page load (via secure cookie)
         window.addEventListener('load', async () => {
             try {

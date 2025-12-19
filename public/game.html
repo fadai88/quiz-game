@@ -231,6 +231,49 @@
     <script src="/socket.io/socket.io.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js"></script>
     <script>
+        function getErrorMessage(error) {
+            // Handle sanitized error objects from server
+            if (error && typeof error === 'object') {
+                // New sanitized format: { error: "message", code: "ERROR_CODE", errorId: "abc123" }
+                if (error.error) {
+                    return error.error;
+                }
+                // Validation errors may have this structure
+                if (error.message) {
+                    return error.message;
+                }
+                // Fallback for generic objects
+                return 'An error occurred. Please try again.';
+            }
+            // Handle string errors (legacy or simple messages)
+            if (typeof error === 'string') {
+                return error;
+            }
+            // Unknown format
+            return 'An error occurred. Please try again.';
+        }
+        
+        // Safe console logging - only log error IDs in production, not full details
+        function logError(context, error) {
+            const isProduction = window.location.hostname !== 'localhost' && 
+                                 !window.location.hostname.includes('127.0.0.1');
+            
+            if (isProduction) {
+                // Production: Only log error ID for support
+                if (error && error.errorId) {
+                    console.log(`[${context}] Error ID: ${error.errorId}`);
+                } else {
+                    console.log(`[${context}] An error occurred`);
+                }
+            } else {
+                // Development: Log sanitized details (not full stack traces)
+                console.log(`[${context}]`, {
+                    message: getErrorMessage(error),
+                    code: error?.code,
+                    errorId: error?.errorId
+                });
+            }
+        }
         const AccountLayout = {
             decode(buffer) {
                 const accountInfo = {
@@ -268,7 +311,7 @@
         });
 
         socket.on('error', (error) => {
-            console.error('Server error:', error);
+            logError('socket-error', error);  // ✅ Safe logging
             
             if (error.code === 'AUTH_REQUIRED') {
                 alert('Please login to continue');
@@ -287,11 +330,8 @@
         });
 
         socket.on('connect_error', (err) => {
-            console.log('Connect error details:', {
-                message: err.message,      // e.g., "xhr poll error"
-                description: err.description, // e.g., HTTP status
-                context: err.context       // e.g., XHR object
-            });
+            logError('connection', { message: err.message });  // ✅ Safe logging
+            // Don't show connection errors to user - they're often temporary
         });
 
         socket.on('connect', () => {
@@ -370,7 +410,7 @@
                         // Check if account exists
                         accountInfo = await this.connection.getAccountInfo(tokenAccount);
                     } catch (error) {
-                        console.error('Network error checking account info:', error);
+                        logError('account-checking', error);
                         // CRITICAL FIX: If the RPC fails, THROW the error.
                         // Do NOT proceed to create an account, or Phantom will pop up unnecessarily.
                         throw error;
@@ -398,7 +438,7 @@
                     return { tokenAccount, transaction };
                 } catch (error) {
                     // This catches the thrown error above and stops the process
-                    console.error('Error in getOrCreateAssociatedTokenAccount:', error);
+                    logError('getOrCreateAssociatedTokenAccount', error);
                     throw error;
                 }
             }
@@ -463,7 +503,7 @@
                         needsTokenAccount: false
                     };
                 } catch (error) {
-                    console.error('Error getting USDC balance:', error);
+                    logError('usdc-balance', error);
                     throw error;
                 }
             }
@@ -546,7 +586,7 @@
 
                     return transaction;
                 } catch (error) {
-                    console.error('Error creating transfer transaction:', error);
+                    logError('create-transaction', error);
                     throw error;
                 }
             }
@@ -582,7 +622,7 @@
                 }
                 
             } catch (error) {
-                console.error('❌ Session check error:', error);
+                logError('session-check', error);
                 window.location.href = 'login.html';
                 return false;
             }
@@ -595,7 +635,7 @@
                     credentials: 'include'
                 });
             } catch (error) {
-                console.error('Logout error:', error);
+                logError('logout', error);
             }
             window.location.href = 'login.html';
         }
@@ -626,7 +666,7 @@
                 balanceUpdateInterval = setInterval(updateBalance, 30000);
                 await initializeWallet();
             } catch (error) {
-                console.error('Initialization error:', error);
+                logError('session-init', error);
                 alert('Failed to initialize. Please refresh the page.');
             }
         }
@@ -662,7 +702,7 @@
                 }
 
             } catch (error) {
-                console.error('Wallet initialization error:', error);
+                logError('wallet-init', error);
                 // Don't redirect here since initializeFromSession already handles that
             }
         }
@@ -690,14 +730,14 @@
                         console.log('Created USDC token account');
                         await updateBalance();
                     } catch (error) {
-                        console.error('Error creating token account:', error);
+                        logError('token-account-creation:', error);
                     }
                 } else {
                     const formattedBalance = balanceResult.balance.toFixed(2);
                     document.getElementById('balanceDisplay').textContent = `Balance: ${formattedBalance} USDC`;
                 }
             } catch (error) {
-                console.error('Error updating balance:', error);
+                logError('balance-update', error);
                 document.getElementById('balanceDisplay').textContent = 'Error fetching balance';
             }
         }
@@ -719,7 +759,7 @@
                         await grecaptcha.ready();
                         recaptchaToken = await grecaptcha.execute(window.recaptchaSiteKey, {action: 'wallet_connect'});
                     } catch (error) {
-                        console.error('reCAPTCHA error:', error);
+                        logError('reCAPTCHA', error);
                         // Continue without reCAPTCHA if there's an error.    LOOK AT THIS!!!!!
                     }
                 }
@@ -757,7 +797,7 @@
                 balanceUpdateInterval = setInterval(updateBalance, 30000);
                 return connectedWallet;
             } catch (err) {
-                console.error('Error connecting to wallet:', err);
+                logError('wallet-connection', err);
                 alert('Failed to connect wallet: ' + err.message);
                 return null;
             }
@@ -787,7 +827,7 @@
                     credentials: 'include'
                 });
             } catch (error) {
-                console.error('Logout error:', error);
+                logError('logout', error);
             }
             
             // NO localStorage to clear - session is in httpOnly cookie
@@ -870,7 +910,7 @@
                 waitingMessage.textContent = 'Waiting for game mode selection...';
                 showGameChoiceModal(); // Show modal directly
             } catch (error) {
-                console.error('Join game error:', error);
+                logError('join-game', error);
                 resetUIAfterError();
                 alert('Failed to join game: ' + error.message);
                 joinGameBtn.disabled = false;
@@ -889,16 +929,16 @@
         });
 
         socket.on('joinGameFailure', (error) => {
-            console.error('Failed to join game:', error);
+            logError('join-game', error);  // ✅ Safe logging
             resetJoinUI();
-            alert('Failed to join game: ' + error);
+            alert(getErrorMessage(error));  // ✅ User-friendly message
             joinGameBtn.disabled = false;
         });
 
-        socket.on('matchmakingError', ({ message }) => {
-            console.error('Matchmaking/bot game error:', message);
+        socket.on('matchmakingError', (error) => {
+            logError('matchmaking', error);  // ✅ Safe logging
             resetUIAfterError();
-            alert(`Game setup failed: ${message}`);
+            alert(getErrorMessage(error));  // ✅ User-friendly message
             joinGameBtn.disabled = false;
         });
 
@@ -917,7 +957,7 @@
                 try {
                     recaptchaToken = await getRecaptchaToken('submit_answer');
                 } catch (error) {
-                    console.error('reCAPTCHA error on answer submission:', error);
+                    logError('reCAPTCHA-answer-submission', error);
                     alert('Verification required for answer submission. Please try again.');
                     return;  // Block submission
                 }
@@ -1138,10 +1178,9 @@
             }, 7000);
         });
 
-        socket.on('gameError', (errorMessage) => {
-            console.error('Game error:', errorMessage);
-            alert(`Game error: ${errorMessage}`);
-            
+        socket.on('gameError', (error) => {
+            logError('game', error);  // ✅ Safe logging
+            alert(getErrorMessage(error));  // ✅ User-friendly message
             resetGame();
         });
 
@@ -1377,7 +1416,7 @@
                 
                 return token;
             } catch (error) {
-                console.error('reCAPTCHA token generation failed:', error);
+                logError('reCAPTCHA-token-generation', error);
                 throw new Error('Verification failed. Please try again.');
             }
         }
@@ -1427,7 +1466,7 @@
                         try {
                             recaptchaToken = await getRecaptchaToken('place_bet');
                         } catch (error) {
-                            console.error('reCAPTCHA failed for human matchmaking:', error);
+                            logError('reCAPTCHA-human-matchmaking:', error);
                             alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
                             waitingMessage.textContent = 'Verification failed. Please try again.';
                             throw error;
@@ -1445,7 +1484,7 @@
                     waitingMessage.textContent = 'Looking for another player...';
                     await updateBalance();
                 } catch (error) {
-                    console.error('Human matchmaking error:', error);
+                    logError('human-matchmaking', error);
                     if (error.message.includes('reCAPTCHA') || error.message.includes('Verification')) {
                         alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
                     } else {
@@ -1508,7 +1547,7 @@
                         try {
                             recaptchaToken = await getRecaptchaToken('place_bet');
                         } catch (error) {
-                            console.error('reCAPTCHA failed for bot game:', error);
+                            logError('reCAPTCHA-bot-game:', error);
                             alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
                             waitingMessage.textContent = 'Verification failed. Please try again.';
                             throw error;
@@ -1527,7 +1566,7 @@
                     waitingMessage.textContent = 'Creating a game with a bot opponent...';
                     await updateBalance();
                 } catch (error) {
-                    console.error('Bot game error:', error);
+                    logError('bot-game', error);
                     if (error.message.includes('reCAPTCHA') || error.message.includes('Verification')) {
                         alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
                     } else {
@@ -1644,7 +1683,7 @@
                     }
                 }
             } catch (error) {
-                console.error('Error updating answer UI:', error);
+                logError('update-answer-UI', error);
             }
         });
 
@@ -1794,7 +1833,7 @@
                     countdownTimer.style.display = 'none';
                 }
             } catch (error) {
-                console.error('Error in roundComplete:', error);
+                logError('roundComplete', error);
                 waitingMessage.innerHTML = `<p class="error-message">Error displaying round results</p>`;
             }
         });

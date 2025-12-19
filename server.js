@@ -248,6 +248,93 @@ function sanitizeText(text) {
     });
 }
 
+// ============================================================================
+// ERROR SANITIZATION (Information Disclosure Prevention)
+// ============================================================================
+// ✅ CRITICAL SECURITY FIX: Prevent error message information disclosure
+//    - Stack traces NOT sent to client (only in server logs)
+//    - Database errors NOT exposed (schema protection)
+//    - Wallet addresses NOT leaked in errors
+//    - Internal system information NOT revealed
+//
+// All errors MUST be sanitized before sending to clients
+// ============================================================================
+
+/**
+ * Centralized error sanitization for client responses
+ * Prevents information disclosure while maintaining trackability
+ * @param {Error} error - The original error object
+ * @param {string} context - Where the error occurred (for logging)
+ * @param {string} [userMessage] - Optional user-friendly message
+ * @returns {Object} Sanitized error response safe for clients
+ */
+function sanitizeError(error, context, userMessage = null) {
+    // Generate unique error ID for support tracking
+    const errorId = uuidv4().substring(0, 8);
+    
+    // Full error details in server logs (NOT sent to client)
+    console.error(`[ERROR:${errorId}] ${context}:`);
+    console.error(`  Message: ${error.message}`);
+    console.error(`  Stack: ${error.stack}`);
+    if (error.code) console.error(`  Code: ${error.code}`);
+    
+    // Determine environment
+    const isProduction = process.env.NODE_ENV === 'production';
+    
+    if (isProduction) {
+        // PRODUCTION: Generic messages only, no technical details
+        return {
+            error: userMessage || 'An error occurred. Please try again.',
+            code: 'SERVER_ERROR',
+            errorId // For support tickets
+        };
+    } else {
+        // DEVELOPMENT: More details for debugging (but still sanitized)
+        return {
+            error: userMessage || 'An error occurred',
+            message: sanitizeForLog(error.message), // Sanitized message
+            code: error.code || 'UNKNOWN',
+            errorId,
+            context // Help developers debug
+        };
+    }
+}
+
+/**
+ * Sanitize validation errors specifically (they're less sensitive)
+ * @param {Object} validationError - Joi validation error object
+ * @param {string} context - Where validation failed
+ * @returns {Object} Sanitized validation error
+ */
+function sanitizeValidationError(validationError, context) {
+    const errorId = uuidv4().substring(0, 8);
+    
+    // Log full details server-side
+    console.error(`[VALIDATION:${errorId}] ${context}:`, validationError.message);
+    
+    const isProduction = process.env.NODE_ENV === 'production';
+    
+    if (isProduction) {
+        // PRODUCTION: Generic message
+        return {
+            error: 'Invalid input format',
+            code: 'VALIDATION_ERROR',
+            errorId
+        };
+    } else {
+        // DEVELOPMENT: Show which fields failed (but not values)
+        const fields = validationError.details?.map(d => d.path.join('.')) || [];
+        return {
+            error: 'Validation failed',
+            fields: fields,
+            code: 'VALIDATION_ERROR',
+            errorId
+        };
+    }
+}
+
+console.log('✅ Error sanitization configured');
+
 // Export sanitization functions
 module.exports = {
     ...module.exports,
@@ -1822,10 +1909,10 @@ io.on('connection', (socket) => {
                     await rateLimitFailedRecaptcha(clientIP); // Increment on failure
                 } catch (rateError) {
                     console.warn(`reCAPTCHA rate limit hit for IP ${clientIP}:`, rateError.message);
-                    return socket.emit('loginFailure', rateError.message);
+                    return socket.emit('loginFailure', 'Too many failed verification attempts. Please try again later.');
                 }
                 console.warn(`reCAPTCHA verification failed for wallet ${walletAddress}: ${error.message}`);
-                return socket.emit('loginFailure', error.message);
+                return socket.emit('loginFailure', 'Verification failed. Please try again.');
             }
             console.log('reCAPTCHA verification result:', recaptchaResult);
             
@@ -1998,8 +2085,8 @@ io.on('connection', (socket) => {
                 socket.emit('loginFailure', 'Wallet not found - please login again');
             }
         } catch (error) {
-            console.error('[RECONNECT] Error:', error);
-            socket.emit('loginFailure', error.message);
+            const sanitized = sanitizeError(error, 'walletReconnect', 'Reconnection failed. Please login again.');
+            socket.emit('loginFailure', sanitized.error);
         }
     });
 
@@ -2129,8 +2216,8 @@ io.on('connection', (socket) => {
                     
                     const { error } = playerReadySchema.validate({ roomId, preferredMode, recaptchaToken });
                     if (error) {
-                        console.error('Validation error in playerReady:', error.message);
-                        socket.emit('gameError', `Invalid input: ${error.message}`);
+                        const sanitized = sanitizeValidationError(error, 'playerReady');
+                        socket.emit('gameError', sanitized);
                         return;
                     }
 
@@ -2249,8 +2336,8 @@ io.on('connection', (socket) => {
                     await rateLimitEvent(data.walletAddress, 'joinHumanMatchmaking');
                     const { error } = transactionSchema.validate(data);
                     if (error) {
-                        console.error('Validation error:', error.message);
-                        socket.emit('joinGameFailure', error.message);
+                        const sanitized = sanitizeValidationError(error, 'joinHumanMatchmaking');
+                        socket.emit('joinGameFailure', sanitized.error);
                         return;
                     }
 
@@ -2267,7 +2354,7 @@ io.on('connection', (socket) => {
                         // Redis operation wrapped in safeRedisOp
                         const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                         await rateLimitFailedRecaptcha(clientIP);
-                        socket.emit('joinGameFailure', error.message);  // Use error message directly
+                        socket.emit('joinGameFailure', 'Verification failed. Please try again.');
                         return;
                     }
 
@@ -2387,8 +2474,8 @@ io.on('connection', (socket) => {
                     await rateLimitEvent(data.walletAddress, 'joinBotGame', 3, 60);
                     const { error } = transactionSchema.validate(data);
                     if (error) {
-                        console.error('Validation error:', error.message);
-                        socket.emit('joinGameFailure', error.message);
+                        const sanitized = sanitizeValidationError(error, 'joinBotGame');
+                        socket.emit('joinGameFailure', sanitized.error);
                         return;
                     }
 
@@ -2405,7 +2492,7 @@ io.on('connection', (socket) => {
                         // Redis operation wrapped in safeRedisOp
                         const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                         await rateLimitFailedRecaptcha(clientIP);
-                        socket.emit('joinGameFailure', error.message);  // Use error message directly
+                        socket.emit('joinGameFailure', 'Verification failed. Please try again.');
                         return;
                     }
 
@@ -2470,8 +2557,8 @@ io.on('connection', (socket) => {
                     const { roomId } = args[0];
                     const { error } = switchToBotSchema.validate({ roomId });
                     if (error) {
-                        console.error('Validation error in switchToBot:', error.message);
-                        socket.emit('matchmakingError', { message: `Invalid input: ${error.message}` });
+                        const sanitized = sanitizeValidationError(error, 'switchToBot');
+                        socket.emit('matchmakingError', sanitized);
                         return;
                     }
 
@@ -2579,8 +2666,8 @@ io.on('connection', (socket) => {
                         // Validate input
                         const { error } = matchFoundSchema.validate({ newRoomId });
                         if (error) {
-                            console.error('Validation error in matchFound:', error.message);
-                            socket.emit('gameError', `Invalid input: ${error.message}`);
+                            const sanitized = sanitizeValidationError(error, 'matchFound');
+                            socket.emit('gameError', sanitized);
                             return;
                         }
 
@@ -2588,16 +2675,16 @@ io.on('connection', (socket) => {
                         socket.roomId = newRoomId;  // FIXED: Set roomId on socket
                         // Additional handling if needed
                     } catch (error) {
-                        console.error('Error in matchFound:', error);
-                        socket.emit('gameError', `Error: ${error.message}`);
+                        const sanitized = sanitizeError(error, 'matchFound', 'Error processing match.');
+                        socket.emit('gameError', sanitized);
                     }
                 } else if (event === 'leaveRoom') {
                     const { roomId } = args[0];
                     try {
                         const { error } = leaveRoomSchema.validate({ roomId });
                         if (error) {
-                            console.error('Validation error in leaveRoom:', error.message);
-                            socket.emit('gameError', `Invalid input: ${error.message}`);
+                            const sanitized = sanitizeValidationError(error, 'leaveRoom');
+                            socket.emit('gameError', sanitized);
                             return;
                         }
 
@@ -2639,16 +2726,16 @@ io.on('connection', (socket) => {
 
                         socket.emit('leftRoom', { roomId });
                     } catch (error) {
-                        console.error('Error in leaveRoom:', error);
-                        socket.emit('gameError', `Error: ${error.message}`);
+                        const sanitized = sanitizeError(error, 'leaveRoom', 'Error leaving room.');
+                        socket.emit('gameError', sanitized);
                     }
                 } else if (event === 'requestBotRoom') {
                     const { walletAddress, betAmount } = args[0];
                     try {
                         const { error } = requestBotRoomSchema.validate({ walletAddress, betAmount });
                         if (error) {
-                            console.error('Validation error in requestBotRoom:', error.message);
-                            socket.emit('gameError', `Invalid input: ${error.message}`);
+                            const sanitized = sanitizeValidationError(error, 'requestBotRoom');
+                            socket.emit('gameError', sanitized);
                             return;
                         }
 
@@ -2661,7 +2748,7 @@ io.on('connection', (socket) => {
                         let room = await getGameRoom(roomId);
                         if (!room) {
                             console.error(`Failed to create or retrieve room ${roomId}`);
-                            socket.emit('gameError', { message: 'Failed to create bot room' });
+                            socket.emit('gameError', { error: 'Failed to create bot room', code: 'ROOM_CREATE_FAILED' });
                             return;
                         }
 
@@ -2679,16 +2766,16 @@ io.on('connection', (socket) => {
                         socket.emit('botRoomCreated', roomId);
                         await logGameRoomsState();
                     } catch (error) {
-                        console.error('Error in requestBotRoom:', error);
-                        socket.emit('gameError', `Error: ${error.message}`);
+                        const sanitized = sanitizeError(error, 'requestBotRoom', 'Error creating bot room.');
+                        socket.emit('gameError', sanitized);
                     }
                 } else if (event === 'requestBotGame') {
                     const { roomId } = args[0];
                     try {
                         const { error } = requestBotGameSchema.validate({ roomId });
                         if (error) {
-                            console.error('Validation error in requestBotGame:', error.message);
-                            socket.emit('gameError', `Invalid input: ${error.message}`);
+                            const sanitized = sanitizeValidationError(error, 'requestBotGame');
+                            socket.emit('gameError', sanitized);
                             return;
                         }
 
@@ -2697,7 +2784,7 @@ io.on('connection', (socket) => {
                         let room = await getGameRoom(roomId);
                         if (!room) {
                             console.error(`Room ${roomId} not found when requesting bot game`);
-                            socket.emit('gameError', 'Room not found');
+                            socket.emit('gameError', { error: 'Room not found', code: 'ROOM_NOT_FOUND' });
                             return;
                         }
 
@@ -2710,14 +2797,14 @@ io.on('connection', (socket) => {
                         const humanPlayers = room.players.filter(p => !p.isBot);
                         if (humanPlayers.length > 1) {
                             console.error(`Room ${roomId} already has ${humanPlayers.length} human players, can't add bot`);
-                            socket.emit('gameError', 'Cannot add bot to a room with multiple players');
+                            socket.emit('gameError', { error: 'Cannot add bot to a room with multiple players', code: 'TOO_MANY_PLAYERS' });
                             return;
                         }
 
                         const playerInRoom = room.players.find(p => p.id === socket.id);
                         if (!playerInRoom) {
                             console.error(`Player ${socket.id} not found in room ${roomId}`);
-                            socket.emit('gameError', 'You are not in this room');
+                            socket.emit('gameError', { error: 'You are not in this room', code: 'PLAYER_NOT_IN_ROOM' });
                             return;
                         }
 
@@ -2728,8 +2815,8 @@ io.on('connection', (socket) => {
                         await startSinglePlayerGame(roomId);
                         await logGameRoomsState();
                     } catch (error) {
-                        console.error('Error in requestBotGame:', error);
-                        socket.emit('gameError', `Error: ${error.message}`);
+                        const sanitized = sanitizeError(error, 'requestBotGame', 'Error starting bot game.');
+                        socket.emit('gameError', sanitized);
                     }
                 } else if (event === 'submitAnswer') {
                     const { roomId, questionId, answer, recaptchaToken } = args[0];
@@ -2737,8 +2824,8 @@ io.on('connection', (socket) => {
                         // ===== 1. INPUT VALIDATION =====
                         const { error } = submitAnswerSchema.validate({ roomId, questionId, answer, recaptchaToken });
                         if (error) {
-                            console.error('Validation error in submitAnswer:', error.message);
-                            socket.emit('answerError', `Invalid input: ${error.message}`);
+                            const sanitized = sanitizeValidationError(error, 'submitAnswer');
+                            socket.emit('answerError', sanitized);
                             return;
                         }
 
@@ -2866,10 +2953,10 @@ io.on('connection', (socket) => {
                                     await rateLimitFailedRecaptcha(clientIP);
                                 } catch (rateError) {
                                     console.warn(`reCAPTCHA rate limit hit for IP ${clientIP}:`, rateError.message);
-                                    socket.emit('answerError', rateError.message);
+                                    socket.emit('answerError', 'Too many failed verification attempts. Please try again later.');
                                     return;
                                 }
-                                socket.emit('answerError', error.message);
+                                socket.emit('answerError', 'Verification failed. Please try again.');
                                 return;
                             }
                         } else if (process.env.ENABLE_RECAPTCHA === 'true') {
@@ -2995,13 +3082,13 @@ io.on('connection', (socket) => {
 
                         // Do not call completeQuestion here; wait for the timeout
                     } catch (error) {
-                        console.error('Error in submitAnswer:', error.message);
-                        socket.emit('answerError', `Error submitting answer: ${error.message}`);
+                        const sanitized = sanitizeError(error, 'submitAnswer', 'Error submitting answer. Please try again.');
+                        socket.emit('answerError', sanitized);
                     }
                 } 
             } catch (error) {
-                console.error(`Error in ${event}:`, error);
-                socket.emit(`${event}Error` || 'gameError', error.message);
+                const sanitized = sanitizeError(error, `game-event-${event}`, 'An error occurred. Please try again.');
+                socket.emit(`${event}Error` || 'gameError', sanitized);
             }
         });
     });
