@@ -613,17 +613,74 @@ const io = socketIo(server, {
 
 // Enhanced rate-limiting: Per-socket, Redis-backed (install rate-limiter-flexible)
 let socketRateLimiter;
+// ============================================================================
+// ENHANCED PER-EVENT RATE LIMITERS
+// ============================================================================
+// Each event type has its own rate limiter with appropriate thresholds
+const eventLimiters = new Map();
+
 async function initializeRateLimiter() {
     try {
+        // General socket-level rate limiter
         socketRateLimiter = new RateLimiterRedis({
             storeClient: redisClient,
-            points: 200, // Max 100 events/min per socket
+            points: 200, // Max 200 events/min per socket
             duration: 60,
             keyPrefix: 'socket'
         });
-        console.log('Socket rate-limiter initialized');
+        
+        // Per-event rate limiters with appropriate thresholds
+        eventLimiters.set('submitAnswer', new RateLimiterRedis({
+            storeClient: redisClient,
+            points: 10,          // 10 answers per minute
+            duration: 60,
+            blockDuration: 300,  // Block for 5 minutes on exceed
+            keyPrefix: 'event:submitAnswer'
+        }));
+        
+        eventLimiters.set('joinGame', new RateLimiterRedis({
+            storeClient: redisClient,
+            points: 5,           // 5 game joins per minute
+            duration: 60,
+            blockDuration: 180,  // Block for 3 minutes on exceed
+            keyPrefix: 'event:joinGame'
+        }));
+        
+        eventLimiters.set('joinHumanMatchmaking', new RateLimiterRedis({
+            storeClient: redisClient,
+            points: 5,           // 5 matchmaking requests per minute
+            duration: 60,
+            blockDuration: 180,
+            keyPrefix: 'event:joinHumanMatchmaking'
+        }));
+        
+        eventLimiters.set('joinBotGame', new RateLimiterRedis({
+            storeClient: redisClient,
+            points: 8,           // 8 bot games per minute
+            duration: 60,
+            blockDuration: 120,
+            keyPrefix: 'event:joinBotGame'
+        }));
+        
+        eventLimiters.set('playerReady', new RateLimiterRedis({
+            storeClient: redisClient,
+            points: 20,          // 20 ready signals per minute
+            duration: 60,
+            blockDuration: 60,
+            keyPrefix: 'event:playerReady'
+        }));
+        
+        eventLimiters.set('leaveRoom', new RateLimiterRedis({
+            storeClient: redisClient,
+            points: 15,          // 15 leave requests per minute
+            duration: 60,
+            blockDuration: 60,
+            keyPrefix: 'event:leaveRoom'
+        }));
+        
+        console.log('✅ Socket and per-event rate-limiters initialized');
     } catch (error) {
-        console.error('Failed to init rate-limiter:', error);
+        console.error('❌ Failed to init rate-limiter:', error);
     }
 }
 
@@ -1580,27 +1637,83 @@ async function verifyTransactionWithStatus(signature, maxRetries = 3, retryDelay
     return null;
 }
 
-async function rateLimitEvent(walletAddress, eventName, maxRequests = 5, windowSeconds = 60) {
-    const result = await safeRedisOp(
-        async () => {
-            const key = `rate:${walletAddress}:${eventName}`;
-            const count = await redisClient.get(key) || 0;
-            if (count >= maxRequests) {
-                throw new Error(`Too many ${eventName} requests`);
-            }
-            await redisClient.set(key, parseInt(count) + 1, 'EX', windowSeconds);
-            return true;
-        },
-        true,
-        `Rate limit for ${walletAddress}:${eventName}`
-    );
+// ============================================================================
+// ENHANCED RATE LIMITING WITH PROGRESSIVE PENALTIES
+// ============================================================================
+/**
+ * Rate limit an event using dedicated RateLimiterRedis instances
+ * Tracks both wallet address AND IP for defense-in-depth
+ * 
+ * @param {string} walletAddress - User's wallet address
+ * @param {string} eventName - Name of the event being rate limited
+ * @param {string} ip - IP address of the user
+ * @param {object} socket - Socket.io socket object (optional, for disconnecting abusers)
+ */
+async function rateLimitEvent(walletAddress, eventName, ip = null, socket = null) {
+    const limiter = eventLimiters.get(eventName);
     
-    if (result === true) {
-        return;
+    if (!limiter) {
+        console.warn(`⚠️  No rate limiter configured for event: ${eventName}`);
+        return; // Fail open - don't block if limiter not configured
     }
     
-    throw new Error(result);
+    try {
+        // Rate limit by wallet address (primary identifier)
+        const walletKey = `${walletAddress}`;
+        await limiter.consume(walletKey, 1);
+        
+        // Also rate limit by IP if provided (defense-in-depth)
+        if (ip) {
+            const ipKey = `ip:${ip}`;
+            try {
+                await limiter.consume(ipKey, 1);
+            } catch (ipError) {
+                console.error(`🚨 [RATE LIMIT] IP ${ip} exceeded limit for ${eventName}`);
+                // Block the IP temporarily
+                await redisClient.set(`blocklist:${ip}`, '1', 'EX', 600); // 10 min block
+                if (socket) {
+                    socket.disconnect(true);
+                }
+                throw new Error(`Rate limit exceeded for ${eventName}. Please wait before trying again.`);
+            }
+        }
+        
+        console.log(`✅ [RATE LIMIT] ${eventName} passed for ${walletAddress}`);
+        
+    } catch (error) {
+        // Check if it's a rate limit error
+        if (error.msBeforeNext !== undefined) {
+            const waitSeconds = Math.ceil(error.msBeforeNext / 1000);
+            console.error(`🚨 [RATE LIMIT] ${walletAddress} exceeded limit for ${eventName}, retry in ${waitSeconds}s`);
+            
+            // Track repeat offenders for progressive penalties
+            const offenderKey = `offender:${walletAddress}:${eventName}`;
+            const offenseCount = await redisClient.incr(offenderKey);
+            await redisClient.expire(offenderKey, 3600); // Reset after 1 hour
+            
+            if (offenseCount > 5) {
+                // Progressive penalty: longer block for repeat offenders
+                console.error(`🚨 [SECURITY] ${walletAddress} is a repeat offender (${offenseCount} violations) - extended block`);
+                await redisClient.set(`blocklist:wallet:${walletAddress}`, '1', 'EX', 3600); // 1 hour block
+                if (socket) {
+                    socket.emit('error', { 
+                        message: 'Account temporarily restricted due to suspicious activity',
+                        code: 'RATE_LIMIT_ABUSE'
+                    });
+                    socket.disconnect(true);
+                }
+            }
+            
+            throw new Error(`Rate limit exceeded for ${eventName}. Please wait ${waitSeconds} seconds before trying again.`);
+        }
+        
+        // Re-throw other errors
+        throw error;
+    }
 }
+
+// DEPRECATED: Old manual counter-based rate limiting (kept for backward compatibility)
+// New code should use the improved rateLimitEvent function above
 
 // FIXED: Add Redis rate limiter for failed reCAPTCHA (max 5 per IP per hour)
 async function rateLimitFailedRecaptcha(ip) {
@@ -2166,7 +2279,8 @@ io.on('connection', (socket) => {
                 // Call original handler based on event type
                 if (event === 'joinGame') {
                     const data = args[0];
-                    await rateLimitEvent(data.walletAddress, 'joinGame', 5, 60);
+                    const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                    await rateLimitEvent(data.walletAddress, 'joinGame', clientIP, socket);
                     
                     // ✅ Check if blocked
                     if (isBlocked(data.walletAddress) || isBlocked(socket.handshake.address)) {
@@ -2211,8 +2325,9 @@ io.on('connection', (socket) => {
                 } else if (event === 'playerReady') {
                     const { roomId, preferredMode, recaptchaToken } = args[0];
                     
-                    // ✅ NEW: Rate limit playerReady to prevent DoS (max 3 per minute)
-                    await rateLimitEvent(socket.user.walletAddress, 'playerReady', 3, 60);
+                    // ✅ NEW: Rate limit playerReady to prevent DoS
+                    const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                    await rateLimitEvent(socket.user.walletAddress, 'playerReady', clientIP, socket);
                     
                     const { error } = playerReadySchema.validate({ roomId, preferredMode, recaptchaToken });
                     if (error) {
@@ -2333,7 +2448,8 @@ io.on('connection', (socket) => {
                     await logGameRoomsState();
                 } else if (event === 'joinHumanMatchmaking') {
                     const data = args[0];
-                    await rateLimitEvent(data.walletAddress, 'joinHumanMatchmaking');
+                    const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                    await rateLimitEvent(data.walletAddress, 'joinHumanMatchmaking', clientIP, socket);
                     const { error } = transactionSchema.validate(data);
                     if (error) {
                         const sanitized = sanitizeValidationError(error, 'joinHumanMatchmaking');
@@ -2471,7 +2587,8 @@ io.on('connection', (socket) => {
                     await logMatchmakingState();
                 } else if (event === 'joinBotGame') {
                     const data = args[0];
-                    await rateLimitEvent(data.walletAddress, 'joinBotGame', 3, 60);
+                    const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                    await rateLimitEvent(data.walletAddress, 'joinBotGame', clientIP, socket);
                     const { error } = transactionSchema.validate(data);
                     if (error) {
                         const sanitized = sanitizeValidationError(error, 'joinBotGame');
@@ -2681,6 +2798,10 @@ io.on('connection', (socket) => {
                 } else if (event === 'leaveRoom') {
                     const { roomId } = args[0];
                     try {
+                        // Rate limit leaveRoom to prevent spam
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitEvent(socket.user.walletAddress, 'leaveRoom', clientIP, socket);
+                        
                         const { error } = leaveRoomSchema.validate({ roomId });
                         if (error) {
                             const sanitized = sanitizeValidationError(error, 'leaveRoom');
@@ -2836,7 +2957,8 @@ io.on('connection', (socket) => {
                         }
 
                         const authenticatedUsername = socket.user.walletAddress;
-                        await rateLimitEvent(authenticatedUsername, 'submitAnswer', 10, 60);
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitEvent(authenticatedUsername, 'submitAnswer', clientIP, socket);
 
                         console.log(`Received answer from ${authenticatedUsername} in room ${roomId} for question ${questionId}:`, { answer });
 
@@ -2902,6 +3024,14 @@ io.on('connection', (socket) => {
                             socket.emit('answerError', 'Already answered');
                             return;
                         }
+
+                        // ============================================================================
+                        // CRITICAL: Mark player as answered IMMEDIATELY to prevent race condition
+                        // This prevents the timeout handler from marking this player as timed out
+                        // while we're doing async verification (reCAPTCHA, etc.)
+                        // We'll update the actual answer and score later after verification
+                        // ============================================================================
+                        player.answered = true; // Mark NOW before any async operations
 
                         // ===== 4. TIMING VALIDATION =====
                         const serverResponseTime = Date.now() - room.questionStartTime;
@@ -3021,7 +3151,7 @@ io.on('connection', (socket) => {
                         console.log(`SERVER CALCULATED: ${authenticatedUsername} response time: ${serverResponseTime}ms`);
 
                         const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
-                        player.answered = true;
+                        // Note: player.answered was already set to true earlier to prevent race condition
                         player.lastAnswer = answer;
                         player.lastResponseTime = serverResponseTime;
                         player.totalResponseTime = (player.totalResponseTime || 0) + serverResponseTime;
