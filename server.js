@@ -37,6 +37,22 @@ const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransac
 const Joi = require('joi');
 
 // ============================================================================
+// WINSTON LOGGING SYSTEM
+// ============================================================================
+const logger = require('./logger');
+const { httpRequestLogger, socketLogger, errorHandler } = require('./middleware/requestLogger');
+const { SecurityLogger, AuditLogger, PerformanceLogger } = require('./utils/securityLogger');
+const { 
+    alertManager, 
+    trackFailedLogin, 
+    trackRateLimitViolation,
+    trackValidationFailure,
+    trackRecaptchaFailure,
+    trackBotSuspicion,
+    trackFailedTransaction 
+} = require('./config/alerts');
+
+// ============================================================================
 // INPUT VALIDATION SECURITY MODULE
 // ============================================================================
 // ✅ CRITICAL SECURITY FIX: Comprehensive input validation to prevent:
@@ -69,11 +85,16 @@ function validateInput(schema, eventName) {
         
         if (error) {
             const errorDetails = error.details.map(d => d.message).join('; ');
-            console.error(`❌ [SECURITY] Validation failed for ${eventName}:`, errorDetails);
+            logger.security('security_error', {
+                message: `Validation failed for ${eventName}:`,
+                errorDetails
+            });
             throw new Error(`Validation failed: ${errorDetails}`);
         }
         
-        console.log(`✅ [SECURITY] Validation passed for ${eventName}`);
+        logger.security('security_info', {
+            message: `Validation passed for ${eventName}`
+        });
         return value;
     };
 }
@@ -101,49 +122,6 @@ const VALIDATION_FAILURE_WINDOW = 3600000; // 1 hour
 const VALIDATION_FAILURE_THRESHOLD = 100; // Max failures per hour
 const blockedIdentifiers = new Set();
 
-/**
- * Track validation failure and auto-block abusers
- * @param {string} identifier - IP address or wallet address
- * @param {string} eventName - Event that failed validation
- * @param {string} error - Validation error message
- */
-function trackValidationFailure(identifier, eventName, error) {
-    const now = Date.now();
-    const sanitizedId = sanitizeForLog(identifier);
-    const sanitizedEvent = sanitizeForLog(eventName);
-    const sanitizedError = sanitizeForLog(error);
-    
-    // Get or create failure record
-    let record = validationFailures.get(identifier);
-    if (!record) {
-        record = { count: 0, firstFailure: now, lastFailure: now, events: [] };
-        validationFailures.set(identifier, record);
-    }
-    
-    // Reset counter if outside time window
-    if (now - record.firstFailure > VALIDATION_FAILURE_WINDOW) {
-        record.count = 0;
-        record.firstFailure = now;
-        record.events = [];
-    }
-    
-    // Increment and log
-    record.count++;
-    record.lastFailure = now;
-    record.events.push({ event: sanitizedEvent, error: sanitizedError, time: now });
-    
-    console.warn(`⚠️  [SECURITY] Validation failure #${record.count} from ${sanitizedId} on ${sanitizedEvent}: ${sanitizedError}`);
-    
-    // Auto-block if threshold exceeded
-    if (record.count >= VALIDATION_FAILURE_THRESHOLD && !blockedIdentifiers.has(identifier)) {
-        blockedIdentifiers.add(identifier);
-        console.error(`🚨 [SECURITY] AUTO-BLOCKED ${sanitizedId} after ${record.count} validation failures`);
-        console.error(`   Events: ${JSON.stringify(record.events.slice(-10))}`); // Last 10 events
-        
-        // Alert admins (integrate with monitoring system)
-        // alertAdmins({ type: 'auto_block', identifier, reason: 'validation_abuse', count: record.count });
-    }
-}
 
 /**
  * Check if identifier is blocked
@@ -176,7 +154,7 @@ setInterval(() => {
     }
     
     if (cleaned > 0) {
-        console.log(`🧹 Cleaned ${cleaned} expired validation failure records`);
+        logger.info(`🧹 Cleaned ${cleaned} expired validation failure records`);
     }
 }, 300000);
 
@@ -273,10 +251,10 @@ function sanitizeError(error, context, userMessage = null) {
     const errorId = uuidv4().substring(0, 8);
     
     // Full error details in server logs (NOT sent to client)
-    console.error(`[ERROR:${errorId}] ${context}:`);
-    console.error(`  Message: ${error.message}`);
-    console.error(`  Stack: ${error.stack}`);
-    if (error.code) console.error(`  Code: ${error.code}`);
+    logger.error(`[ERROR:${errorId}] ${context}:`);
+    logger.error(`  Message: ${error.message}`);
+    logger.error(`  Stack: ${error.stack}`);
+    if (error.code) logger.error(`  Code: ${error.code}`);
     
     // Determine environment
     const isProduction = process.env.NODE_ENV === 'production';
@@ -610,6 +588,7 @@ const io = socketIo(server, {
     // Enable maxHttpBufferSize to mitigate CVE-2023-32695 (packet DoS)
     maxHttpBufferSize: 1e6 // 1MB limit
 });
+io.use(socketLogger);
 
 // Enhanced rate-limiting: Per-socket, Redis-backed (install rate-limiter-flexible)
 let socketRateLimiter;
@@ -680,7 +659,7 @@ async function initializeRateLimiter() {
         
         console.log('✅ Socket and per-event rate-limiters initialized');
     } catch (error) {
-        console.error('❌ Failed to init rate-limiter:', error);
+        logger.error('❌ Failed to init rate-limiter:', { error: error });
     }
 }
 
@@ -689,7 +668,7 @@ const authMiddleware = async (socket, next) => {
     try {
         // Check 1: User must be attached to socket
         if (!socket.user || !socket.user.walletAddress) {
-            console.warn(`[AUTH] Connection attempt without user: ${socket.id}`);
+            logger.auth(`Connection attempt without user: ${socket.id}`);
             return next(new Error('Unauthorized: No valid session'));
         }
 
@@ -700,7 +679,7 @@ const authMiddleware = async (socket, next) => {
         const session = await redisClient.get(sessionKey);
         
         if (!session) {
-            console.warn(`[AUTH] Connection attempt with expired session: ${walletAddress}`);
+            SecurityLogger.sessionExpired(walletAddress, sessionAge);
             socket.emit('error', {
                 message: 'Session expired: Please login again',
                 code: 'SESSION_EXPIRED'
@@ -716,7 +695,7 @@ const authMiddleware = async (socket, next) => {
             const MAX_SESSION_AGE = 24 * 60 * 60 * 1000; // 24 hours
 
             if (sessionAge > MAX_SESSION_AGE) {
-                console.warn(`[AUTH] Connection attempt with old session: ${walletAddress}, age: ${sessionAge}ms`);
+                SecurityLogger.sessionTooOld(walletAddress, sessionAge, MAX_SESSION_AGE);
                 await redisClient.del(sessionKey);
                 socket.emit('error', {
                     message: 'Session expired: Please login again',
@@ -726,7 +705,10 @@ const authMiddleware = async (socket, next) => {
                 return next(new Error('Session expired'));
             }
         } catch (parseError) {
-            console.error(`[AUTH] Session parse error for ${walletAddress}:`, parseError);
+            logger.security('auth_error', {
+                message: `Session parse error for ${walletAddress}`,
+                parseError
+            });
             await redisClient.del(sessionKey);
             socket.emit('error', {
                 message: 'Session corrupted: Please login again',
@@ -737,11 +719,11 @@ const authMiddleware = async (socket, next) => {
         }
 
         // ✅ All checks passed - allow connection
-        console.log(`[AUTH] ✓ Connection authenticated for ${walletAddress}`);
+        logger.auth('connection_authenticated', { walletAddress, sessionId: sessionToken?.substring(0, 8) });
         next();
         
     } catch (error) {
-        console.error('[AUTH] Connection middleware error:', error);
+        logger.error('[AUTH] Connection middleware error:', { error: error });
         socket.emit('error', {
             message: 'Authentication error occurred',
             code: 'AUTH_ERROR'
@@ -757,6 +739,7 @@ app.use(express.json());
 // ============================================================================
 // Use httpOnly cookies to prevent XSS access to session tokens
 app.use(cookieParser(SESSION_SECRET));
+app.use(httpRequestLogger);
 
 // Session cookie configuration
 const COOKIE_OPTIONS = {
@@ -767,7 +750,7 @@ const COOKIE_OPTIONS = {
     signed: true  // Sign cookies to prevent tampering
 };
 
-console.log('✅ Secure cookie middleware initialized', {
+logger.info('✅ Secure cookie middleware initialized', {
     httpOnly: COOKIE_OPTIONS.httpOnly,
     secure: COOKIE_OPTIONS.secure,
     sameSite: COOKIE_OPTIONS.sameSite
@@ -786,7 +769,7 @@ app.post('/api/auth/login', async (req, res) => {
         const storedToken = await redisClient.get(`verify:${walletAddress}`);
         
         if (!storedToken || storedToken !== verifyToken) {
-            console.error(`[AUTH] Invalid or expired verification token for ${walletAddress}`);
+            SecurityLogger.invalidToken(walletAddress, 'expired_or_invalid');
             return res.status(401).json({ 
                 success: false, 
                 error: 'Invalid verification. Please try logging in again.' 
@@ -795,7 +778,7 @@ app.post('/api/auth/login', async (req, res) => {
         
         // Delete verification token (one-time use)
         await redisClient.del(`verify:${walletAddress}`);
-        console.log(`[AUTH] Verification token validated for ${walletAddress}`);
+        logger.auth(`Verification token validated for ${walletAddress}`);
         
         // Verify reCAPTCHA if enabled
         if (process.env.ENABLE_RECAPTCHA === 'true') {
@@ -854,7 +837,7 @@ app.post('/api/auth/login', async (req, res) => {
         await redisClient.set(`session:${sessionToken}`, JSON.stringify(sessionData), 'EX', 86400);
         await redisClient.set(`session:wallet:${walletAddress}`, sessionToken, 'EX', 86400);
         
-        console.log(`[SESSION] HTTP login successful for ${walletAddress}`);
+        logger.info(`[SESSION] HTTP login successful for ${walletAddress}`);
         
         // Set httpOnly cookie
         res.cookie('sessionToken', sessionToken, COOKIE_OPTIONS);
@@ -862,7 +845,7 @@ app.post('/api/auth/login', async (req, res) => {
         res.json({ success: true, virtualBalance: user.virtualBalance });
         
     } catch (error) {
-        console.error('[AUTH] HTTP login error:', error);
+        logger.error('[AUTH] HTTP login error:', { error: error });
         res.status(500).json({ success: false, error: 'Server error' });
     }
 });
@@ -900,7 +883,7 @@ app.get('/api/auth/session', async (req, res) => {
         });
         
     } catch (error) {
-        console.error('[AUTH] Session validation error:', error);
+        logger.error('[AUTH] Session validation error:', { error: error });
         res.status(500).json({ authenticated: false });
     }
 });
@@ -957,7 +940,7 @@ async function initializeConfig() {
         console.log('✅ Config initialized successfully with AWS secret');
         return config;
     } catch (error) {
-        console.error('❌ FATAL: Failed to initialize config:', error);
+        logger.error('❌ FATAL: Failed to initialize config:', { error: error });
         process.exit(1);
     }
 }
@@ -973,7 +956,7 @@ mongoose.connection.once('open', async () => {
         paymentProcessor.startProcessing(60000); // Process every 60s
         console.log('✅ PaymentProcessor initialized with valid config');
     } catch (error) {
-        console.error('❌ FATAL: PaymentProcessor initialization failed:', error);
+        logger.error('❌ FATAL: PaymentProcessor initialization failed:', { error: error });
         process.exit(1);
     }
 });
@@ -1038,7 +1021,7 @@ async function initializeRedis() {
         });
         
         redisClient.on('error', (err) => { 
-            console.error('⚠️  Redis error (will auto-retry):', err.message); 
+            logger.error('⚠️  Redis error (will auto-retry):', { error: err.message }); 
         });
         
         redisClient.on('close', () => { 
@@ -1049,11 +1032,11 @@ async function initializeRedis() {
         await redisClient.ping();  // Simple health check
         await redisClient.set('test', '1', 'EX', 60);
         const testValue = await redisClient.get('test');
-        console.log(`Redis test: ${testValue}`);
+        logger.info(`Redis test: ${testValue}`);
     // Redis health auto-managed by ioredis
         await initializeRateLimiter(); // Init after Redis
     } catch (error) {
-        console.error('Failed to initialize Redis:', error);
+        logger.error('Failed to initialize Redis:', { error: error });
     // Redis health auto-managed by ioredis
         // CRITICAL: Do not fallback; log and set unhealthy
         console.error('Redis unavailable - transaction processing disabled');
@@ -1061,7 +1044,7 @@ async function initializeRedis() {
 }
 
 initializeRedis().catch((err) => {
-    console.error('Redis init failed:', err);
+    logger.error('Redis init failed:', { error: err });
     // Redis health auto-managed by ioredis
 });
 
@@ -1106,7 +1089,7 @@ async function initializeSocketAdapter() {
         io.adapter(createAdapter(pubClient, subClient));
         console.log('Socket.io Redis adapter initialized for scaling');
     } catch (error) {
-        console.error('Failed to initialize Socket.io adapter:', error);
+        logger.error('Failed to initialize Socket.io adapter:', { error: error });
     }
 }
 
@@ -1150,12 +1133,12 @@ async function getCleanActiveRooms() {
         // 4. Execute cleanup if needed
         if (cleanupPipeline.length > 0) {
             await cleanupPipeline.exec();
-            console.log(`🧹 Cleaned up ${roomIds.length - validRooms.length} zombie room IDs`);
+            logger.info(`🧹 Cleaned up ${roomIds.length - validRooms.length} zombie room IDs`);
         }
 
         return validRooms;
     } catch (error) {
-        console.error('Error getting/cleaning active rooms:', error);
+        logger.error('Error getting/cleaning active rooms:', { error: error });
         return [];
     }
 }
@@ -1164,9 +1147,9 @@ async function getCleanActiveRooms() {
 async function trackMatchmakingPlayer(betAmount, walletAddress) {
     try {
         await redisClient.sadd(`active:matchmaking:${betAmount}`, walletAddress);
-        console.log(`✅ Tracking matchmaking player: ${walletAddress} in ${betAmount} pool`);
+        logger.info(`✅ Tracking matchmaking player: ${walletAddress} in ${betAmount} pool`);
     } catch (error) {
-        console.error('Error tracking matchmaking player:', error);
+        logger.error('Error tracking matchmaking player:', { error: error });
     }
 }
 
@@ -1174,9 +1157,9 @@ async function trackMatchmakingPlayer(betAmount, walletAddress) {
 async function untrackMatchmakingPlayer(betAmount, walletAddress) {
     try {
         await redisClient.srem(`active:matchmaking:${betAmount}`, walletAddress);
-        console.log(`✅ Untracked matchmaking player: ${walletAddress} from ${betAmount} pool`);
+        logger.info(`✅ Untracked matchmaking player: ${walletAddress} from ${betAmount} pool`);
     } catch (error) {
-        console.error('Error untracking matchmaking player:', error);
+        logger.error('Error untracking matchmaking player:', { error: error });
     }
 }
 
@@ -1185,7 +1168,7 @@ async function getMatchmakingPoolWallets(betAmount) {
     try {
         return await redisClient.smembers(`active:matchmaking:${betAmount}`);
     } catch (error) {
-        console.error('Error getting matchmaking pool wallets:', error);
+        logger.error('Error getting matchmaking pool wallets:', { error: error });
         return [];
     }
 }
@@ -1211,7 +1194,7 @@ async function addWaitingRoom(betAmount, roomId) {
     try {
         await redisClient.zadd(`waiting_rooms:${betAmount}`, Date.now(), roomId);
         await redisClient.expire(`waiting_rooms:${betAmount}`, 3600);
-        console.log(`Added room ${roomId} to waiting index for bet ${betAmount}`);
+        logger.info(`Added room ${roomId} to waiting index for bet ${betAmount}`);
         return true;
     } catch (error) {
         console.error(`Error adding waiting room ${roomId}:`, error);
@@ -1232,16 +1215,16 @@ async function getWaitingRoom(betAmount) {
 async function removeWaitingRoom(betAmount, roomId) {
     try {
         await redisClient.zrem(`waiting_rooms:${betAmount}`, roomId);
-        console.log(`Removed room ${roomId} from waiting index for bet ${betAmount}`);
+        logger.info(`Removed room ${roomId} from waiting index for bet ${betAmount}`);
     } catch (error) {
         console.error(`Error removing waiting room ${roomId}:`, error);
     }
 }
 
 async function verifyAndValidateTransaction(signature, expectedAmount, senderAddress, recipientAddress, nonce, maxRetries = 3, retryDelay = 500) {
-    console.log(`🔐 SECURE VERIFICATION: ${signature}`);
-    console.log(`   Expected: ${expectedAmount} USDC from ${senderAddress} to ${recipientAddress}`);
-    console.log(`   Nonce: ${nonce}`);
+    logger.info(`🔐 SECURE VERIFICATION: ${signature}`);
+    logger.info(`   Expected: ${expectedAmount} USDC from ${senderAddress} to ${recipientAddress}`);
+    logger.info(`   Nonce: ${nonce}`);
 
     const key = `tx:${signature}`;
     const nonceKey = `nonce:${nonce}`;
@@ -1265,16 +1248,16 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         );
 
         if (result !== null) {
-            console.error(`❌ REPLAY ATTACK DETECTED: ${signature} already processed`);
+            logger.error(`❌ REPLAY ATTACK DETECTED: ${signature} already processed`);
             throw new Error('Transaction already processed - replay attack prevented');
         }
-        console.log(`✅ MongoDB: New transaction recorded`);
+        logger.info(`✅ MongoDB: New transaction recorded`);
     } catch (dbErr) {
         if (dbErr.code === 11000) {
-            console.error(`❌ RACE CONDITION: ${signature} duplicate key error`);
+            logger.error(`❌ RACE CONDITION: ${signature} duplicate key error`);
             throw new Error('Transaction already processed');
         }
-        console.error('❌ MongoDB audit failed:', dbErr.message);
+        logger.error('❌ MongoDB audit failed:', { error: dbErr.message });
         throw new Error('Audit service unavailable');
     }
 
@@ -1287,7 +1270,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         async () => {
             const exists = await redisClient.get(key);
             if (exists) {
-                console.log(`⚠️  Redis: Replay detected for ${key} (MongoDB already prevented)`);
+                logger.info(`⚠️  Redis: Replay detected for ${key} (MongoDB already prevented)`);
             }
         },
         null,
@@ -1298,7 +1281,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     try {
         const storedNonce = await redisClient.get(nonceKey);
         if (storedNonce) {
-            console.error(`❌ NONCE REUSE DETECTED: ${nonce}`);
+            logger.error(`❌ NONCE REUSE DETECTED: ${nonce}`);
             await TransactionLog.findOneAndUpdate(
                 { signature },
                 { status: 'failed', errorMessage: 'Nonce already used' }
@@ -1307,14 +1290,14 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         }
         
         await redisClient.set(nonceKey, 'used', 'EX', 86400); // 24 hour expiry
-        console.log(`✅ Nonce registered: ${nonce}`);
+        logger.info(`✅ Nonce registered: ${nonce}`);
     } catch (error) {
         if (error.message.includes('Nonce already used')) {
             throw error;
         }
         
         // Redis infrastructure failure - REJECT for safety
-        console.error(`❌ CRITICAL: Redis nonce service unavailable`);
+        logger.error(`❌ CRITICAL: Redis nonce service unavailable`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: 'Nonce verification service unavailable' }
@@ -1330,14 +1313,14 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         transaction = await verifyTransactionWithStatus(signature, maxRetries, retryDelay);
     } catch (error) {
         if (error.message.includes('Invalid param: Invalid')) {
-            console.error(`❌ Invalid signature format: ${signature}`);
+            logger.error(`❌ Invalid signature format: ${signature}`);
             await TransactionLog.findOneAndUpdate(
                 { signature },
                 { status: 'failed', errorMessage: 'Invalid signature' }
             );
             throw new Error('Invalid transaction signature');
         }
-        console.error(`❌ Blockchain verification failed: ${error.message}`);
+        logger.error(`❌ Blockchain verification failed: ${error.message}`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: error.message }
@@ -1346,7 +1329,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     }
 
     if (!transaction) {
-        console.error(`❌ Transaction not found after ${maxRetries} retries`);
+        logger.error(`❌ Transaction not found after ${maxRetries} retries`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: 'Transaction not found' }
@@ -1356,7 +1339,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
 
     // Check if transaction failed on-chain
     if (transaction.meta.err) {
-        console.error(`❌ Transaction failed on-chain: ${JSON.stringify(transaction.meta.err)}`);
+        logger.error(`❌ Transaction failed on-chain: ${JSON.stringify(transaction.meta.err)}`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: JSON.stringify(transaction.meta.err) }
@@ -1364,7 +1347,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('Transaction failed on the blockchain');
     }
 
-    console.log(`✅ Transaction fetched from blockchain`);
+    logger.info(`✅ Transaction fetched from blockchain`);
 
     // ========================================================================
     // STEP 4: VERIFY TRANSACTION SENDER (CRITICAL SECURITY CHECK)
@@ -1375,7 +1358,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     );
 
     if (senderIndex === -1) {
-        console.error(`❌ SENDER NOT FOUND: ${senderAddress} not in transaction accounts`);
+        logger.error(`❌ SENDER NOT FOUND: ${senderAddress} not in transaction accounts`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: 'Sender wallet not found in transaction' }
@@ -1392,7 +1375,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     };
 
     if (!isAccountSigner(senderIndex)) {
-        console.error(`❌ UNAUTHORIZED: ${senderAddress} did not sign transaction`);
+        logger.error(`❌ UNAUTHORIZED: ${senderAddress} did not sign transaction`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: 'Sender did not sign transaction' }
@@ -1400,7 +1383,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('Transaction not signed by expected sender');
     }
 
-    console.log(`✅ Sender verified: ${senderAddress} signed transaction`);
+    logger.info(`✅ Sender verified: ${senderAddress} signed transaction`);
 
     // ========================================================================
     // STEP 5: VERIFY TREASURY RECEIVES TOKENS (via Balance Check)
@@ -1418,7 +1401,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     const preTokenBalances = transaction.meta.preTokenBalances;
 
     if (!postTokenBalances || !preTokenBalances) {
-        console.error(`❌ Missing token balance data`);
+        logger.error(`❌ Missing token balance data`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: 'Missing token balances' }
@@ -1435,8 +1418,8 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     );
 
     if (!treasuryPostBalance) {
-        console.error(`❌ WRONG TOKEN: No USDC balance change for treasury`);
-        console.error(`   Expected mint: ${config.USDC_MINT.toBase58()}`);
+        logger.error(`❌ WRONG TOKEN: No USDC balance change for treasury`);
+        logger.error(`   Expected mint: ${config.USDC_MINT.toBase58()}`);
         console.error(`   Available mints:`, postTokenBalances.map(b => b.mint));
         await TransactionLog.findOneAndUpdate(
             { signature },
@@ -1446,7 +1429,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     }
 
     if (!treasuryPreBalance) {
-        console.error(`❌ Missing pre-balance for treasury USDC account`);
+        logger.error(`❌ Missing pre-balance for treasury USDC account`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: 'Missing treasury pre-balance' }
@@ -1454,8 +1437,8 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('Cannot verify treasury balance change');
     }
 
-    console.log(`✅ USDC mint verified: ${config.USDC_MINT.toBase58()}`);
-    console.log(`✅ Treasury verified: ${recipientAddress} received USDC tokens`);
+    logger.info(`✅ USDC mint verified: ${config.USDC_MINT.toBase58()}`);
+    logger.info(`✅ Treasury verified: ${recipientAddress} received USDC tokens`);
     const postAmount = BigInt(treasuryPostBalance.uiTokenAmount.amount || '0');
     const preAmount = BigInt(treasuryPreBalance.uiTokenAmount.amount || '0');
     const actualTransferAmount = postAmount - preAmount;
@@ -1464,9 +1447,9 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     const expectedBigInt = BigInt(Math.round(expectedAmount * 1_000_000));
 
     if (actualTransferAmount !== expectedBigInt) {
-        console.error(`❌ AMOUNT MISMATCH:`);
-        console.error(`   Expected: ${expectedAmount} USDC (${expectedBigInt} raw)`);
-        console.error(`   Received: ${Number(actualTransferAmount) / 1_000_000} USDC (${actualTransferAmount} raw)`);
+        logger.error(`❌ AMOUNT MISMATCH:`);
+        logger.error(`   Expected: ${expectedAmount} USDC (${expectedBigInt} raw)`);
+        logger.error(`   Received: ${Number(actualTransferAmount) / 1_000_000} USDC (${actualTransferAmount} raw)`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { 
@@ -1477,7 +1460,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error(`Amount mismatch: expected ${expectedAmount} USDC, received ${Number(actualTransferAmount) / 1_000_000} USDC`);
     }
 
-    console.log(`✅ Amount verified: ${expectedAmount} USDC`);
+    logger.info(`✅ Amount verified: ${expectedAmount} USDC`);
 
     // ========================================================================
     // STEP 8: VERIFY TOKEN ACCOUNT OWNERSHIP (ADVANCED SECURITY)
@@ -1488,7 +1471,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     );
 
     if (senderTokenBalance && senderTokenBalance.owner !== senderAddress) {
-        console.error(`❌ TOKEN ACCOUNT OWNERSHIP MISMATCH`);
+        logger.error(`❌ TOKEN ACCOUNT OWNERSHIP MISMATCH`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: 'Sender token account ownership invalid' }
@@ -1496,7 +1479,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('Token account ownership verification failed');
     }
 
-    console.log(`✅ Token account ownership verified`);
+    logger.info(`✅ Token account ownership verified`);
 
     // ========================================================================
     // STEP 9: VERIFY MEMO INSTRUCTION WITH NONCE (REPLAY PROTECTION)
@@ -1510,7 +1493,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         });
         
         if (!memoInstruction) {
-            console.error(`❌ MISSING MEMO: Transaction missing memo instruction`);
+            logger.error(`❌ MISSING MEMO: Transaction missing memo instruction`);
             await TransactionLog.findOneAndUpdate(
                 { signature },
                 { status: 'failed', errorMessage: 'Missing memo instruction' }
@@ -1532,11 +1515,11 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
             }
         }
         
-        console.log(`📝 Memo text: ${memoText}`);
+        logger.info(`📝 Memo text: ${memoText}`);
         
         // Verify nonce is in memo
         if (!memoText.includes(nonce)) {
-            console.error(`❌ NONCE MISMATCH: Expected "${nonce}" in memo "${memoText}"`);
+            logger.error(`❌ NONCE MISMATCH: Expected "${nonce}" in memo "${memoText}"`);
             await TransactionLog.findOneAndUpdate(
                 { signature },
                 { status: 'failed', errorMessage: 'Nonce mismatch in transaction memo' }
@@ -1544,7 +1527,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
             throw new Error('Nonce mismatch - transaction does not match request');
         }
         
-        console.log(`✅ Memo nonce verified: ${nonce}`);
+        logger.info(`✅ Memo nonce verified: ${nonce}`);
     } catch (error) {
         if (error.message.includes('Nonce') || error.message.includes('memo') || error.message.includes('MISSING')) {
             throw error;
@@ -1561,7 +1544,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     // STEP 10: VERIFY TRANSACTION AGE (PREVENT OLD TRANSACTION REPLAY)
     // ========================================================================
     if (!transaction.blockTime) {
-        console.error(`❌ Missing blockTime in transaction`);
+        logger.error(`❌ Missing blockTime in transaction`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: 'Transaction missing timestamp' }
@@ -1573,7 +1556,7 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     const txAge = Date.now() - (transaction.blockTime * 1000);
     
     if (txAge > TX_MAX_AGE) {
-        console.error(`❌ TRANSACTION TOO OLD: ${txAge}ms (max ${TX_MAX_AGE}ms)`);
+        logger.error(`❌ TRANSACTION TOO OLD: ${txAge}ms (max ${TX_MAX_AGE}ms)`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { status: 'failed', errorMessage: 'Transaction expired (must be used within 5 minutes)' }
@@ -1581,37 +1564,37 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('Transaction expired - please create a new transaction');
     }
     
-    console.log(`✅ Transaction age: ${Math.round(txAge / 1000)}s (within ${TX_MAX_AGE / 1000}s limit)`);
+    logger.info(`✅ Transaction age: ${Math.round(txAge / 1000)}s (within ${TX_MAX_AGE / 1000}s limit)`);
 
     // ========================================================================
     // STEP 11: CACHE IN REDIS (BEST-EFFORT)
     // ========================================================================
     try {
         await redisClient.set(key, '1', 'EX', 604800); // 7 days
-        console.log(`✅ Transaction cached in Redis`);
+        logger.info(`✅ Transaction cached in Redis`);
     } catch (redisErr) {
-        console.error('⚠️  Redis cache failed (non-blocking):', redisErr.message);
+        logger.error('⚠️  Redis cache failed (non-blocking):', { error: redisErr.message });
     }
 
     // ========================================================================
     // VERIFICATION COMPLETE
     // ========================================================================
-    console.log(`🎉 TRANSACTION VERIFIED SUCCESSFULLY: ${signature}`);
-    console.log(`   ✅ Replay protection (MongoDB + Redis + Nonce)`);
-    console.log(`   ✅ Sender authorization (${senderAddress})`);
-    console.log(`   ✅ Treasury recipient (${recipientAddress})`);
-    console.log(`   ✅ USDC mint (${config.USDC_MINT.toBase58()})`);
-    console.log(`   ✅ Amount (${expectedAmount} USDC)`);
-    console.log(`   ✅ Token account ownership`);
-    console.log(`   ✅ Memo nonce (${nonce})`);
-    console.log(`   ✅ Transaction age (${Math.round(txAge / 1000)}s)`);
+    logger.info(`🎉 TRANSACTION VERIFIED SUCCESSFULLY: ${signature}`);
+    logger.info(`   ✅ Replay protection (MongoDB + Redis + Nonce)`);
+    logger.info(`   ✅ Sender authorization (${senderAddress})`);
+    logger.info(`   ✅ Treasury recipient (${recipientAddress})`);
+    logger.info(`   ✅ USDC mint (${config.USDC_MINT.toBase58()})`);
+    logger.info(`   ✅ Amount (${expectedAmount} USDC)`);
+    logger.info(`   ✅ Token account ownership`);
+    logger.info(`   ✅ Memo nonce (${nonce})`);
+    logger.info(`   ✅ Transaction age (${Math.round(txAge / 1000)}s)`);
 
     return transaction;
 }
 
 async function verifyTransactionWithStatus(signature, maxRetries = 3, retryDelay = 500) {
     for (let i = 0; i < maxRetries; i++) {
-        console.log(`🔍 Verification attempt ${i + 1}/${maxRetries} for ${signature}`);
+        logger.info(`🔍 Verification attempt ${i + 1}/${maxRetries} for ${signature}`);
         
         const statuses = await config.connection.getSignatureStatuses(
             [signature], 
@@ -1621,19 +1604,19 @@ async function verifyTransactionWithStatus(signature, maxRetries = 3, retryDelay
         const status = statuses.value[0];
         
         if (status && status.confirmationStatus === 'confirmed') {
-            console.log(`✅ Transaction confirmed on blockchain`);
+            logger.info(`✅ Transaction confirmed on blockchain`);
             return await config.connection.getTransaction(signature, { 
                 maxSupportedTransactionVersion: 0 
             });
         }
         
         if (i < maxRetries - 1) {
-            console.log(`⏳ Transaction not confirmed yet, retrying in ${retryDelay}ms...`);
+            logger.info(`⏳ Transaction not confirmed yet, retrying in ${retryDelay}ms...`);
             await new Promise(resolve => setTimeout(resolve, retryDelay));
         }
     }
     
-    console.log(`❌ Transaction verification failed after ${maxRetries} retries`);
+    logger.info(`❌ Transaction verification failed after ${maxRetries} retries`);
     return null;
 }
 
@@ -1653,7 +1636,7 @@ async function rateLimitEvent(walletAddress, eventName, ip = null, socket = null
     const limiter = eventLimiters.get(eventName);
     
     if (!limiter) {
-        console.warn(`⚠️  No rate limiter configured for event: ${eventName}`);
+        logger.warn(`⚠️  No rate limiter configured for event: ${eventName}`);
         return; // Fail open - don't block if limiter not configured
     }
     
@@ -1668,7 +1651,7 @@ async function rateLimitEvent(walletAddress, eventName, ip = null, socket = null
             try {
                 await limiter.consume(ipKey, 1);
             } catch (ipError) {
-                console.error(`🚨 [RATE LIMIT] IP ${ip} exceeded limit for ${eventName}`);
+                logger.error(`🚨 [RATE LIMIT] IP ${ip} exceeded limit for ${eventName}`);
                 // Block the IP temporarily
                 await redisClient.set(`blocklist:${ip}`, '1', 'EX', 600); // 10 min block
                 if (socket) {
@@ -1678,13 +1661,13 @@ async function rateLimitEvent(walletAddress, eventName, ip = null, socket = null
             }
         }
         
-        console.log(`✅ [RATE LIMIT] ${eventName} passed for ${walletAddress}`);
+        logger.info(`✅ [RATE LIMIT] ${eventName} passed for ${walletAddress}`);
         
     } catch (error) {
         // Check if it's a rate limit error
         if (error.msBeforeNext !== undefined) {
             const waitSeconds = Math.ceil(error.msBeforeNext / 1000);
-            console.error(`🚨 [RATE LIMIT] ${walletAddress} exceeded limit for ${eventName}, retry in ${waitSeconds}s`);
+            logger.error(`🚨 [RATE LIMIT] ${walletAddress} exceeded limit for ${eventName}, retry in ${waitSeconds}s`);
             
             // Track repeat offenders for progressive penalties
             const offenderKey = `offender:${walletAddress}:${eventName}`;
@@ -1693,7 +1676,7 @@ async function rateLimitEvent(walletAddress, eventName, ip = null, socket = null
             
             if (offenseCount > 5) {
                 // Progressive penalty: longer block for repeat offenders
-                console.error(`🚨 [SECURITY] ${walletAddress} is a repeat offender (${offenseCount} violations) - extended block`);
+                logger.error(`🚨 [SECURITY] ${walletAddress} is a repeat offender (${offenseCount} violations) - extended block`);
                 await redisClient.set(`blocklist:wallet:${walletAddress}`, '1', 'EX', 3600); // 1 hour block
                 if (socket) {
                     socket.emit('error', { 
@@ -1735,7 +1718,7 @@ async function rateLimitFailedRecaptcha(ip) {
 // Enhanced: Socket-specific rate-limit
 async function rateLimitSocket(socket, points = 100, duration = 60) {
     if (!socketRateLimiter) {
-        console.warn(`⚠️  Socket rate limiting unavailable for ${socket.id}`);
+        logger.warn(`⚠️  Socket rate limiting unavailable for ${socket.id}`);
         return;
     }
     
@@ -1791,7 +1774,7 @@ class TriviaBot {
                     }
                 }
             } else {
-                console.warn(`TriviaBot: Invalid options or correctAnswer. Options: ${JSON.stringify(options)}, CorrectAnswer: ${correctAnswer}. Question: ${question}`);
+                logger.warn(`TriviaBot: Invalid options or correctAnswer. Options: ${JSON.stringify(options)}, CorrectAnswer: ${correctAnswer}. Question: ${question}`);
                 if (Array.isArray(options) && options.length > 0) {
                     botAnswer = Math.floor(Math.random() * options.length);
                 } else {
@@ -1810,7 +1793,7 @@ class TriviaBot {
                             botAnswer = Math.floor(Math.random() * options.length);
                         }
                     } else {
-                        console.error(`TriviaBot: Options array is problematic for question "${question}". Defaulting bot answer to 0.`);
+                        logger.error(`TriviaBot: Options array is problematic for question "${question}". Defaulting bot answer to 0.`);
                         botAnswer = 0; 
                     }
                 }
@@ -1918,11 +1901,11 @@ io.use(async (socket, next) => {
             sessionToken: sessionToken
         };
         
-        console.log(`[AUTH] Socket authenticated for ${sessionData.walletAddress}`);
+        SecurityLogger.socketAuthSuccess(sessionData.walletAddress, socket);
         next();
         
     } catch (error) {
-        console.error('[AUTH] Socket authentication error:', error);
+        logger.error('[AUTH] Socket authentication error:', { error: error });
         next(new Error('Authentication failed'));
     }
 });
@@ -1940,7 +1923,7 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
-    console.log('New client connected:', socket.id);
+    logger.info('New client connected:', socket.id);
     
     const connectionData = {
         ip: socket.handshake.headers['x-forwarded-for'] || socket.handshake.address,
@@ -1956,11 +1939,11 @@ io.on('connection', (socket) => {
         try {
             const isBlocked = await redisClient.get(`blocklist:${connectionData.ip}`);
             if (isBlocked) {
-                console.warn(`Blocked IP attempting to connect: ${connectionData.ip}`);
+                logger.warn(`Blocked IP attempting to connect: ${connectionData.ip}`);
                 socket.disconnect();
             }
         } catch (error) {
-            console.error('Error checking IP blocklist:', error);
+            logger.error('Error checking IP blocklist:', { error: error });
         }
     })();
 
@@ -1981,7 +1964,7 @@ io.on('connection', (socket) => {
             await packetLimiter.consume(socket.id);
             next();
         } catch (error) {
-            console.warn(`Packet rate limit hit for ${socket.id}: ${error.message}`);
+            logger.warn(`Packet rate limit hit for ${socket.id}: ${error.message}`);
             next(new Error('Rate limited'));
         }
     });
@@ -1991,11 +1974,11 @@ io.on('connection', (socket) => {
             // Redis operation wrapped in safeRedisOp
             const isWalletBlocked = await redisClient.get(`blocklist:wallet:${walletAddress}`);
             if (isWalletBlocked) {
-                console.warn(`Blocked wallet attempting to login: ${walletAddress}`);
+                logger.warn(`Blocked wallet attempting to login: ${walletAddress}`);
                 socket.emit('loginFailure', 'This wallet is temporarily blocked.');
                 return;
             }
-            console.log('Wallet login attempt:', { walletAddress, recaptchaToken: !!recaptchaToken });
+            logger.info('Wallet login attempt:', { walletAddress, recaptchaToken: !!recaptchaToken });
             
             // FIXED: Rate limit login attempts (existing) + failed reCAPTCHA specifically
             // Redis operation wrapped in safeRedisOp
@@ -2004,7 +1987,8 @@ io.on('connection', (socket) => {
             const loginAttempts = await redisClient.get(loginLimitKey) || 0;
                 
             if (loginAttempts > 100) {
-                console.warn(`Rate limit exceeded for IP ${clientIP}`);
+                SecurityLogger.rateLimitExceeded(clientIP, 'login', 5, '1 minute');
+            trackRateLimitViolation(clientIP, { eventName: 'login' });
                 return socket.emit('loginFailure', 'Too many login attempts. Please try again later.');
             }
             await redisClient.set(loginLimitKey, parseInt(loginAttempts) + 1, 'EX', 3600);
@@ -2024,10 +2008,10 @@ io.on('connection', (socket) => {
                     console.warn(`reCAPTCHA rate limit hit for IP ${clientIP}:`, rateError.message);
                     return socket.emit('loginFailure', 'Too many failed verification attempts. Please try again later.');
                 }
-                console.warn(`reCAPTCHA verification failed for wallet ${walletAddress}: ${error.message}`);
+                logger.warn(`reCAPTCHA verification failed for wallet ${walletAddress}: ${error.message}`);
                 return socket.emit('loginFailure', 'Verification failed. Please try again.');
             }
-            console.log('reCAPTCHA verification result:', recaptchaResult);
+            logger.info('reCAPTCHA verification result:', recaptchaResult);
             
             // FIXED: Fallback anomaly check if reCAPTCHA disabled (basic clientData validation)
             if (process.env.ENABLE_RECAPTCHA !== 'true') {
@@ -2039,7 +2023,7 @@ io.on('connection', (socket) => {
                     if (clientData.screenResolution && !/^\d+x\d+$/.test(clientData.screenResolution)) anomalies.push('invalid resolution');
                 }
                 if (anomalies.length > 0) {
-                    console.warn(`Client data anomalies for ${walletAddress}: ${anomalies.join(', ')}`);
+                    logger.warn(`Client data anomalies for ${walletAddress}: ${anomalies.join(', ')}`);
                     return socket.emit('loginFailure', 'Invalid client information. Please try again.');
                 }
             }
@@ -2056,18 +2040,18 @@ io.on('connection', (socket) => {
                 );
 
                 if (!verified) {
-                    console.warn(`Invalid signature for wallet ${walletAddress}`);
+                    logger.warn(`Invalid signature for wallet ${walletAddress}`);
                     return socket.emit('loginFailure', 'Invalid signature');
                 }
             } catch (error) {
-                console.error('Signature verification error:', error);
+                logger.error('Signature verification error:', { error: error });
                 return socket.emit('loginFailure', 'Invalid wallet credentials');
             }
 
             try {
                 let user = await User.findOne({ walletAddress });
                 if (!user) {
-                    console.log('Creating new user for wallet:', walletAddress);
+                    logger.info('Creating new user for wallet:', walletAddress);
                     user = await User.create({ 
                         walletAddress,
                         registrationIP: connectionData.ip,
@@ -2105,7 +2089,7 @@ io.on('connection', (socket) => {
                         'EX',
                         86400 // 24 hours in seconds
                     );
-                    console.log(`[SESSION] Created session for ${walletAddress} (expires in 24h)`);
+                    logger.info(`[SESSION] Created session for ${walletAddress} (expires in 24h)`);
                 } catch (redisError) {
                     console.error(`[SESSION] Failed to store session for ${walletAddress}:`, redisError);
                     // Continue anyway - session will be validated on next event
@@ -2122,12 +2106,12 @@ io.on('connection', (socket) => {
                         'EX',
                         30  // Expires in 30 seconds
                     );
-                    console.log(`[VERIFY] Created verification token for ${walletAddress}`);
+                    logger.info(`[VERIFY] Created verification token for ${walletAddress}`);
                 } catch (error) {
                     console.error(`[VERIFY] Failed to store verification token:`, error);
                 }
 
-                console.log('Login successful for wallet:', walletAddress);
+                logger.info('Login successful for wallet:', walletAddress);
 
                 socket.emit('loginSuccess', {
                     walletAddress: user.walletAddress,
@@ -2135,25 +2119,25 @@ io.on('connection', (socket) => {
                     verifyToken: verifyToken  // Send to client for HTTP authentication
                 });
             } catch (error) {
-                console.error('Database error during login:', error);
+                logger.error('Database error during login:', { error: error });
                 socket.emit('loginFailure', 'Server error during login. Please try again.');
             }
         } catch (error) {
-            console.error('Unexpected login error:', error);
+            logger.error('Unexpected login error:', { error: error });
             socket.emit('loginFailure', 'An unexpected error occurred. Please try again.');
         }
     });
 
     socket.on('walletReconnect', async (walletAddress) => {
         try {
-            console.log(`[RECONNECT] Attempt for wallet: ${walletAddress}`);
+            logger.info(`[RECONNECT] Attempt for wallet: ${walletAddress}`);
             
             // ===== VALIDATE SESSION EXISTS IN REDIS =====
             const sessionKey = `session:${walletAddress}`;
             const session = await redisClient.get(sessionKey);
             
             if (!session) {
-                console.warn(`[RECONNECT] No valid session found for ${walletAddress}`);
+                logger.warn(`[RECONNECT] No valid session found for ${walletAddress}`);
                 return socket.emit('loginFailure', 'Session expired - please login again');
             }
 
@@ -2166,7 +2150,7 @@ io.on('connection', (socket) => {
                 const MAX_SESSION_AGE = 24 * 60 * 60 * 1000; // 24 hours
                 
                 if (sessionAge > MAX_SESSION_AGE) {
-                    console.warn(`[RECONNECT] Session too old for ${walletAddress}: ${sessionAge}ms`);
+                    logger.warn(`[RECONNECT] Session too old for ${walletAddress}: ${sessionAge}ms`);
                     await redisClient.del(sessionKey); // Clean up
                     return socket.emit('loginFailure', 'Session expired - please login again');
                 }
@@ -2188,13 +2172,13 @@ io.on('connection', (socket) => {
                 // Join wallet-specific room for notifications
                 socket.join(`wallet:${walletAddress}`);
                 
-                console.log(`[RECONNECT] ✓ Successful for ${walletAddress} (session age: ${Math.round((Date.now() - sessionData.timestamp)/1000)}s)`);
+                logger.info(`[RECONNECT] ✓ Successful for ${walletAddress} (session age: ${Math.round((Date.now() - sessionData.timestamp)/1000)}s)`);
                 socket.emit('loginSuccess', {
                     walletAddress: user.walletAddress,
                     virtualBalance: user.virtualBalance || 0
                 });
             } else {
-                console.warn(`[RECONNECT] User not found in database for ${walletAddress}`);
+                logger.warn(`[RECONNECT] User not found in database for ${walletAddress}`);
                 socket.emit('loginFailure', 'Wallet not found - please login again');
             }
         } catch (error) {
@@ -2214,7 +2198,7 @@ io.on('connection', (socket) => {
     // ADD this AFTER authMiddleware definition (around line 250):
     async function validateSocketSession(socket, eventName) {
         if (!socket.user || !socket.user.walletAddress) {
-            console.warn(`[AUTH] Unauthorized ${eventName} from socket ${socket.id}`);
+            logger.auth(`Unauthorized ${eventName} from socket ${socket.id}`);
             socket.emit('error', { 
                 message: 'Unauthorized: Please login first',
                 code: 'AUTH_REQUIRED'
@@ -2229,7 +2213,7 @@ io.on('connection', (socket) => {
             const session = await redisClient.get(sessionKey);
             
             if (!session) {
-                console.warn(`[AUTH] Session expired for ${walletAddress} on ${eventName}`);
+                logger.auth(`Session expired for ${walletAddress} on ${eventName}`);
                 socket.emit('error', { 
                     message: 'Session expired: Please login again',
                     code: 'SESSION_EXPIRED'
@@ -2243,7 +2227,7 @@ io.on('connection', (socket) => {
             const MAX_SESSION_AGE = 24 * 60 * 60 * 1000;
 
             if (sessionAge > MAX_SESSION_AGE) {
-                console.warn(`[AUTH] Session too old for ${walletAddress}: ${sessionAge}ms on ${eventName}`);
+                logger.auth(`Session too old for ${walletAddress}: ${sessionAge}ms on ${eventName}`);
                 await redisClient.del(sessionKey);
                 socket.emit('error', { 
                     message: 'Session expired: Please login again',
@@ -2253,11 +2237,11 @@ io.on('connection', (socket) => {
                 return false;
             }
 
-            console.log(`[AUTH] ✓ Event ${eventName} authorized for ${walletAddress}`);
+            logger.auth(`✓ Event ${eventName} authorized for ${walletAddress}`);
             return true;
             
         } catch (error) {
-            console.error(`[AUTH] Session validation error for ${eventName}:`, error);
+            logger.security('auth_error', { message: `Session validation error for ${eventName}`, error});
             socket.emit('error', { 
                 message: 'Authentication error occurred',
                 code: 'AUTH_ERROR'
@@ -2284,7 +2268,7 @@ io.on('connection', (socket) => {
                     
                     // ✅ Check if blocked
                     if (isBlocked(data.walletAddress) || isBlocked(socket.handshake.address)) {
-                        console.error(`🚨 [SECURITY] Blocked identifier attempted ${event}`);
+                        logger.error(`🚨 [SECURITY] Blocked identifier attempted ${event}`);
                         socket.emit('joinGameFailure', 'Access denied');
                         return;
                     }
@@ -2299,7 +2283,7 @@ io.on('connection', (socket) => {
                     }
                     const { walletAddress, betAmount } = data;
 
-                    console.log('Join game request:', { walletAddress, betAmount });
+                    logger.info('Join game request:', { walletAddress, betAmount });
 
                     if (!walletAddress || typeof betAmount !== 'number' || betAmount <= 0) {
                         throw new Error('Invalid join game request');
@@ -2318,7 +2302,7 @@ io.on('connection', (socket) => {
 
                     socket.join(roomId);
                     socket.roomId = roomId;  // FIXED: Store roomId on socket for O(1) disconnect cleanup
-                    console.log(`Player ${walletAddress} joined temporary room ${roomId}`);
+                    logger.info(`Player ${walletAddress} joined temporary room ${roomId}`);
                     socket.emit('gameJoined', roomId);
 
                     await logGameRoomsState();
@@ -2336,11 +2320,11 @@ io.on('connection', (socket) => {
                         return;
                     }
 
-                    console.log(`Player ${socket.id} ready in room ${roomId}, preferred mode: ${preferredMode || 'not specified'}`);
+                    logger.info(`Player ${socket.id} ready in room ${roomId}, preferred mode: ${preferredMode || 'not specified'}`);
                     let room = await getGameRoom(roomId);
 
                     if (!room) {
-                        console.error(`Room ${roomId} not found when player ${socket.id} marked ready`);
+                        logger.error(`Room ${roomId} not found when player ${socket.id} marked ready`);
                         socket.emit('gameError', 'Room not found');
                         return;
                     }
@@ -2355,7 +2339,7 @@ io.on('connection', (socket) => {
                     // Device fingerprint check
                     const user = await User.findOne({ walletAddress: username });
                     if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint) {
-                        console.warn(`Device fingerprint mismatch for ${username} in playerReady`);
+                        SecurityLogger.deviceMismatch(username, user.deviceFingerprint, socket.user.fingerprint, { event: 'playerReady' });
                         botDetector.trackEvent(username, 'fingerprint_mismatch', { event: 'playerReady' });
                         if (!recaptchaToken || !(await verifyRecaptcha(recaptchaToken)).success) {
                             socket.emit('gameError', 'Device verification failed. Please relogin.');
@@ -2375,14 +2359,14 @@ io.on('connection', (socket) => {
                     botDetector.trackEvent(username, 'player_ready', { preferredMode, roomId });
 
                     if (room.roomMode === 'bot') {
-                        console.log(`Room ${roomId} is set for bot play, not starting regular game`);
+                        logger.info(`Room ${roomId} is set for bot play, not starting regular game`);
                         return;
                     }
 
                     if (preferredMode === 'human') {
                         room.roomMode = 'human';
                         await updateGameRoom(roomId, room);
-                        console.log(`Room ${roomId} marked for human vs human play`);
+                        logger.info(`Room ${roomId} marked for human vs human play`);
 
                         if (room.players.length === 1) {
                             let matchFound = false;
@@ -2399,7 +2383,7 @@ io.on('connection', (socket) => {
                                     otherRoom.betAmount === room.betAmount &&
                                     otherRoom.players.length === 1
                                 ) {
-                                    console.log(`Found matching room ${otherRoomId} for player in room ${roomId} (O(1) lookup)`);
+                                    logger.info(`Found matching room ${otherRoomId} for player in room ${roomId} (O(1) lookup)`);
                                     const player = room.players[0];
                                     otherRoom.players.push(player);
                                     await updateGameRoom(otherRoomId, otherRoom);
@@ -2423,26 +2407,26 @@ io.on('connection', (socket) => {
                                     matchFound = true;
                                 } else {
                                     // Other room invalid/gone, remove from index and add current room
-                                    console.log(`Waiting room ${otherRoomId} no longer valid, replacing with ${roomId}`);
+                                    logger.info(`Waiting room ${otherRoomId} no longer valid, replacing with ${roomId}`);
                                     await removeWaitingRoom(room.betAmount, otherRoomId);
                                     await addWaitingRoom(room.betAmount, roomId);
                                 }
                             } else {
                                 // No waiting room found, add this one to index
                                 await addWaitingRoom(room.betAmount, roomId);
-                                console.log(`No match found for player in room ${roomId}, added to waiting index`);
+                                logger.info(`No match found for player in room ${roomId}, added to waiting index`);
                             }
                         }
                     }
 
                     if (room.players.length === 2 && !room.gameStarted) {
-                        console.log(`Starting multiplayer game in room ${roomId} with 2 players`);
+                        logger.info(`Starting multiplayer game in room ${roomId} with 2 players`);
                         room.gameStarted = true;
                         room.roomMode = 'multiplayer';
                         await updateGameRoom(roomId, room);
                         await startGame(roomId);
                     } else {
-                        console.log(`Room ${roomId} has ${room.players.length} players, waiting for more to join`);
+                        logger.info(`Room ${roomId} has ${room.players.length} players, waiting for more to join`);
                     }
 
                     await logGameRoomsState();
@@ -2458,14 +2442,15 @@ io.on('connection', (socket) => {
                     }
 
                     const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;  // NEW: Extract nonce
-                    console.log('Human matchmaking request:', { walletAddress, betAmount, gameMode, nonce });
+                    logger.info('Human matchmaking request:', { walletAddress, betAmount, gameMode, nonce });
 
                     // FIXED: Strict reCAPTCHA enforcement
                     let recaptchaResult;
                     try {
                         recaptchaResult = await verifyRecaptcha(recaptchaToken);
                     } catch (error) {
-                        console.error('reCAPTCHA failed for human matchmaking:', error.message);
+                        SecurityLogger.recaptchaFailed(walletAddress, error.message, null, clientIP);
+                        trackRecaptchaFailure(walletAddress, { error: error.message, event: 'joinHumanMatchmaking' });
                         // FIXED: Increment failed attempts ONLY on reCAPTCHA failure
                         // Redis operation wrapped in safeRedisOp
                         const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
@@ -2487,7 +2472,7 @@ io.on('connection', (socket) => {
                         retryDelay
                     );
 
-                    console.log('Transaction verified successfully');
+                    AuditLogger.transactionVerified(walletAddress, betAmount, transactionSignature, config.TREASURY_WALLET.toString(), nonce, clientIP);
 
                     // FIXED: Clean up existing room using socket.roomId (no scan needed)
                     if (socket.roomId) {
@@ -2499,10 +2484,10 @@ io.on('connection', (socket) => {
                                 await updateGameRoom(socket.roomId, existingRoom);
                                 socket.leave(socket.roomId);
                                 socket.roomId = null;  // FIXED: Clear roomId
-                                console.log(`Player ${walletAddress} left room ${socket.roomId} for matchmaking`);
+                                logger.info(`Player ${walletAddress} left room ${socket.roomId} for matchmaking`);
                                 if (existingRoom.players.length === 0) {
                                     await deleteGameRoom(socket.roomId);
-                                    console.log(`Deleted empty room ${socket.roomId}`);
+                                    logger.info(`Deleted empty room ${socket.roomId}`);
                                 }
                             }
                         }
@@ -2525,7 +2510,7 @@ io.on('connection', (socket) => {
                         // No other server could have gotten this same player
                         const opponent = JSON.parse(opponentJson);
                         const roomId = generateRoomId();
-                        console.log(`✅ ATOMIC MATCH: Creating game room ${roomId} for ${walletAddress} vs ${opponent.walletAddress}`);
+                        logger.info(`✅ ATOMIC MATCH: Creating game room ${roomId} for ${walletAddress} vs ${opponent.walletAddress}`);
                         
                         await createGameRoom(roomId, betAmount, 'multiplayer');
                         let room = await getGameRoom(roomId);
@@ -2563,7 +2548,7 @@ io.on('connection', (socket) => {
                     } else {
                         // FAILURE: Queue was empty
                         // Add current player to matchmaking pool
-                        console.log(`No opponents available. Adding ${walletAddress} to matchmaking pool for ${betAmount}`);
+                        logger.info(`No opponents available. Adding ${walletAddress} to matchmaking pool for ${betAmount}`);
                         // ✅ FIXED: Verify pool add succeeds before setting socket property
                         const poolAdded = await addToMatchmakingPool(betAmount, {
                             socketId: socket.id,
@@ -2597,14 +2582,15 @@ io.on('connection', (socket) => {
                     }
 
                     const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;  // NEW: Extract nonce
-                    console.log('Bot game request:', { walletAddress, betAmount, gameMode, nonce });
+                    logger.info('Bot game request:', { walletAddress, betAmount, gameMode, nonce });
 
                     // FIXED: Strict reCAPTCHA enforcement
                     let recaptchaResult;
                     try {
                         recaptchaResult = await verifyRecaptcha(recaptchaToken);
                     } catch (error) {
-                        console.error('reCAPTCHA failed for bot game:', error.message);
+                        SecurityLogger.recaptchaFailed(walletAddress, error.message, null, clientIP);
+                        trackRecaptchaFailure(walletAddress, { error: error.message, event: 'joinBotGame' });
                         // FIXED: Increment failed attempts ONLY on reCAPTCHA failure
                         // Redis operation wrapped in safeRedisOp
                         const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
@@ -2626,7 +2612,7 @@ io.on('connection', (socket) => {
                         retryDelay
                     );
 
-                    console.log('Transaction verified successfully');
+                    AuditLogger.transactionVerified(walletAddress, betAmount, transactionSignature, config.TREASURY_WALLET.toString(), nonce, clientIP);
 
                     // FIXED: Clean up existing room using socket.roomId (no scan needed)
                     if (socket.roomId) {
@@ -2634,20 +2620,20 @@ io.on('connection', (socket) => {
                         if (existingRoom) {
                             const playerIndex = existingRoom.players.findIndex(p => p.username === walletAddress);
                             if (playerIndex !== -1) {
-                                console.log(`Player ${walletAddress} already in room ${socket.roomId}, cleaning up`);
+                                logger.info(`Player ${walletAddress} already in room ${socket.roomId}, cleaning up`);
                                 existingRoom.players.splice(playerIndex, 1);
                                 existingRoom.isDeleted = true;
                                 await updateGameRoom(socket.roomId, existingRoom);
                                 socket.leave(socket.roomId);
                                 socket.roomId = null;  // FIXED: Clear roomId
                                 await redisClient.del(`room:${socket.roomId}`);
-                                console.log(`Deleted room ${socket.roomId} due to new bot game request`);
+                                logger.info(`Deleted room ${socket.roomId} due to new bot game request`);
                             }
                         }
                     }
 
                     const roomId = generateRoomId();
-                    console.log(`Creating bot game room ${roomId} for player ${walletAddress}`);
+                    logger.info(`Creating bot game room ${roomId} for player ${walletAddress}`);
 
                     await createGameRoom(roomId, betAmount, 'bot');
                     let room = await getGameRoom(roomId);
@@ -2679,7 +2665,7 @@ io.on('connection', (socket) => {
                         return;
                     }
 
-                    console.log(`Player ${socket.id} wants to switch from matchmaking to bot game`);
+                    logger.info(`Player ${socket.id} wants to switch from matchmaking to bot game`);
 
                     let playerFound = false;
                     let playerData = null;
@@ -2694,13 +2680,13 @@ io.on('connection', (socket) => {
                                 playerData = existingRoom.players[playerIndex];
                                 playerBetAmount = existingRoom.betAmount;
                                 playerFound = true;
-                                console.log(`Found player ${playerData.username} in room ${socket.roomId} with bet ${playerBetAmount}`);
+                                logger.info(`Found player ${playerData.username} in room ${socket.roomId} with bet ${playerBetAmount}`);
                                 existingRoom.players.splice(playerIndex, 1);
                                 socket.leave(socket.roomId);
                                 socket.roomId = null;  // FIXED: Clear roomId
                                 if (existingRoom.players.length === 0) {
                                     await deleteGameRoom(socket.roomId);
-                                    console.log(`Deleted empty room ${socket.roomId}`);
+                                    logger.info(`Deleted empty room ${socket.roomId}`);
                                 } else {
                                     await updateGameRoom(socket.roomId, existingRoom);
                                     io.to(socket.roomId).emit('playerLeft', playerData.username);
@@ -2710,20 +2696,20 @@ io.on('connection', (socket) => {
                     }
 
                     if (!playerFound && socket.matchmakingPool) {
-                        console.log(`Player ${socket.id} found in matchmaking pool via socket reference`);
+                        logger.info(`Player ${socket.id} found in matchmaking pool via socket reference`);
                         const playerDataFromPool = await removeFromMatchmakingPool(socket.matchmakingPool, socket.id);
                         if (playerDataFromPool) {
                             playerData = playerDataFromPool;
                             playerBetAmount = socket.matchmakingPool;
                             playerFound = true;
                             socket.matchmakingPool = null;  // ✅ Clear reference after removal
-                            console.log(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
+                            logger.info(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
                         }
                     }
 
                     // ✅ FIXED: Removed fallback scanKeys - force root cause fix
                     if (!playerFound) {
-                        console.error(`CRITICAL METRIC: socket.matchmakingPool missing for ${socket.id} - potential bug or race condition`);
+                        logger.error(`CRITICAL METRIC: socket.matchmakingPool missing for ${socket.id} - potential bug or race condition`);
                         // TODO: Send to monitoring service (Sentry, Datadog, CloudWatch, etc.)
                         // Example: await metrics.increment('matchmaking.missing_pool_ref', { socketId: socket.id });
                         
@@ -2734,20 +2720,20 @@ io.on('connection', (socket) => {
                     }
 
                     if (!playerFound || !playerData) {
-                        console.error(`Player ${socket.id} not found in any matchmaking pool or room`);
+                        logger.error(`Player ${socket.id} not found in any matchmaking pool or room`);
                         socket.emit('matchmakingError', { message: 'Not found in matchmaking or game rooms' });
                         return;
                     }
 
                     const playerIdentifier = playerData.username || playerData.walletAddress || socket.id;
                     const newRoomId = generateRoomId();
-                    console.log(`Creating bot game room ${newRoomId} for player ${playerIdentifier}`);
+                    logger.info(`Creating bot game room ${newRoomId} for player ${playerIdentifier}`);
 
                     // Create a new game room in Redis
                     await createGameRoom(newRoomId, playerBetAmount, 'bot');
                     let room = await getGameRoom(newRoomId);
                     if (!room) {
-                        console.error(`Failed to create or retrieve room ${newRoomId}`);
+                        logger.error(`Failed to create or retrieve room ${newRoomId}`);
                         socket.emit('matchmakingError', { message: 'Failed to create bot game room' });
                         return;
                     }
@@ -2788,7 +2774,7 @@ io.on('connection', (socket) => {
                             return;
                         }
 
-                        console.log(`Match found, player ${socket.id} moved to room ${newRoomId}`);
+                        logger.info(`Match found, player ${socket.id} moved to room ${newRoomId}`);
                         socket.roomId = newRoomId;  // FIXED: Set roomId on socket
                         // Additional handling if needed
                     } catch (error) {
@@ -2809,35 +2795,35 @@ io.on('connection', (socket) => {
                             return;
                         }
 
-                        console.log(`Player ${socket.id} requested to leave room ${roomId}`);
+                        logger.info(`Player ${socket.id} requested to leave room ${roomId}`);
 
                         let room = await getGameRoom(roomId);
                         if (!room) {
-                            console.log(`Room ${roomId} not found when player tried to leave`);
+                            logger.info(`Room ${roomId} not found when player tried to leave`);
                             socket.emit('leftRoom', { roomId });
                             return;
                         }
 
                         if (room.gameStarted) {
-                            console.log(`Game already started in room ${roomId}, handling as disconnect`);
+                            logger.info(`Game already started in room ${roomId}, handling as disconnect`);
                             return;
                         }
 
                         const playerIndex = room.players.findIndex(p => p.id === socket.id);
                         if (playerIndex !== -1) {
                             const player = room.players[playerIndex];
-                            console.log(`Removing player ${player.username} from room ${roomId}`);
+                            logger.info(`Removing player ${player.username} from room ${roomId}`);
                             room.players.splice(playerIndex, 1);
 
                             socket.leave(roomId);
                             if (roomId === socket.roomId) socket.roomId = null;  // FIXED: Clear roomId if matching
 
                             if (room.players.length === 0) {
-                                console.log(`Room ${roomId} is now empty, deleting it`);
+                                logger.info(`Room ${roomId} is now empty, deleting it`);
                                 await deleteGameRoom(roomId);
                             } else {
                                 await updateGameRoom(roomId, room);
-                                console.log(`Notifying remaining players in room ${roomId}`);
+                                logger.info(`Notifying remaining players in room ${roomId}`);
                                 io.to(roomId).emit('playerLeft', player.username);
                             }
                         }
@@ -2860,15 +2846,15 @@ io.on('connection', (socket) => {
                             return;
                         }
 
-                        console.log(`Player ${walletAddress} requesting dedicated bot room with bet ${betAmount}`);
+                        logger.info(`Player ${walletAddress} requesting dedicated bot room with bet ${betAmount}`);
 
                         const roomId = generateRoomId();
-                        console.log(`Creating new bot room ${roomId} for ${walletAddress}`);
+                        logger.info(`Creating new bot room ${roomId} for ${walletAddress}`);
 
                         await createGameRoom(roomId, betAmount, 'bot');
                         let room = await getGameRoom(roomId);
                         if (!room) {
-                            console.error(`Failed to create or retrieve room ${roomId}`);
+                            logger.error(`Failed to create or retrieve room ${roomId}`);
                             socket.emit('gameError', { error: 'Failed to create bot room', code: 'ROOM_CREATE_FAILED' });
                             return;
                         }
@@ -2900,11 +2886,11 @@ io.on('connection', (socket) => {
                             return;
                         }
 
-                        console.log(`Bot game requested for room ${roomId}`);
+                        logger.info(`Bot game requested for room ${roomId}`);
 
                         let room = await getGameRoom(roomId);
                         if (!room) {
-                            console.error(`Room ${roomId} not found when requesting bot game`);
+                            logger.error(`Room ${roomId} not found when requesting bot game`);
                             socket.emit('gameError', { error: 'Room not found', code: 'ROOM_NOT_FOUND' });
                             return;
                         }
@@ -2917,19 +2903,19 @@ io.on('connection', (socket) => {
 
                         const humanPlayers = room.players.filter(p => !p.isBot);
                         if (humanPlayers.length > 1) {
-                            console.error(`Room ${roomId} already has ${humanPlayers.length} human players, can't add bot`);
+                            logger.error(`Room ${roomId} already has ${humanPlayers.length} human players, can't add bot`);
                             socket.emit('gameError', { error: 'Cannot add bot to a room with multiple players', code: 'TOO_MANY_PLAYERS' });
                             return;
                         }
 
                         const playerInRoom = room.players.find(p => p.id === socket.id);
                         if (!playerInRoom) {
-                            console.error(`Player ${socket.id} not found in room ${roomId}`);
+                            logger.error(`Player ${socket.id} not found in room ${roomId}`);
                             socket.emit('gameError', { error: 'You are not in this room', code: 'PLAYER_NOT_IN_ROOM' });
                             return;
                         }
 
-                        console.log(`Setting room ${roomId} to bot mode`);
+                        logger.info(`Setting room ${roomId} to bot mode`);
                         room.roomMode = 'bot';
                         await updateGameRoom(roomId, room);
 
@@ -2965,26 +2951,26 @@ io.on('connection', (socket) => {
                         // ===== 3. ROOM & QUESTION VALIDATION =====
                         let room = await getGameRoom(roomId);
                         if (!room) {
-                            console.error(`Room ${roomId} not found for answer submission`);
+                            logger.error(`Room ${roomId} not found for answer submission`);
                             socket.emit('answerError', 'Room not found');
                             return;
                         }
 
                         if (!room.questions || room.questions.length === 0) {
-                            console.error(`Room ${roomId} has no questions`);
+                            logger.error(`Room ${roomId} has no questions`);
                             socket.emit('answerError', 'Game not properly initialized');
                             return;
                         }
 
                         if (!room.questionStartTime || room.currentQuestionIndex >= room.questions.length) {
-                            console.error(`No active question in room ${roomId} when ${authenticatedUsername} submitted answer`);
+                            logger.error(`No active question in room ${roomId} when ${authenticatedUsername} submitted answer`);
                             socket.emit('answerError', 'No active question');
                             return;
                         }
 
                         const currentQuestion = room.questionIdMap.get(questionId);
                         if (!currentQuestion) {
-                            console.error(`No current question for room ${roomId}`);
+                            logger.error(`No current question for room ${roomId}`);
                             socket.emit('answerError', 'No active question');
                             return;
                         }
@@ -2992,7 +2978,7 @@ io.on('connection', (socket) => {
                         // ✅ Check if question exists in the map (more reliable than array index)
                         const questionData = room.questionIdMap.get(questionId);
                         if (!questionData) {
-                            console.error(`Question ${questionId} not found in room ${roomId} questionIdMap`);
+                            logger.error(`Question ${questionId} not found in room ${roomId} questionIdMap`);
                             socket.emit('answerError', 'Invalid question ID');
                             return;
                         }
@@ -3002,25 +2988,25 @@ io.on('connection', (socket) => {
                             // Check if this is a late answer from previous question
                             const questionIndex = room.questions.findIndex(q => q.tempId === questionId);
                             if (questionIndex !== -1 && questionIndex < room.currentQuestionIndex) {
-                                console.log(`Player ${authenticatedUsername} submitted late answer for previous question ${questionId}`);
+                                logger.info(`Player ${authenticatedUsername} submitted late answer for previous question ${questionId}`);
                                 socket.emit('answerError', 'Question expired');
                                 return;
                             }
                             
-                            console.error(`Invalid question ${questionId} for room ${roomId} (expected ${currentQuestion.tempId})`);
+                            logger.error(`Invalid question ${questionId} for room ${roomId} (expected ${currentQuestion.tempId})`);
                             socket.emit('answerError', 'Invalid question');
                             return;
                         }
 
                         const player = room.players.find(p => p.username === authenticatedUsername && !p.isBot);
                         if (!player) {
-                            console.error(`Player ${authenticatedUsername} not found in room ${roomId} or is a bot`);
+                            logger.error(`Player ${authenticatedUsername} not found in room ${roomId} or is a bot`);
                             socket.emit('answerError', 'Player not found');
                             return;
                         }
 
                         if (player.answered) {
-                            console.log(`Player ${authenticatedUsername} already answered this question`);
+                            logger.info(`Player ${authenticatedUsername} already answered this question`);
                             socket.emit('answerError', 'Already answered');
                             return;
                         }
@@ -3036,7 +3022,7 @@ io.on('connection', (socket) => {
                         // ===== 4. TIMING VALIDATION =====
                         const serverResponseTime = Date.now() - room.questionStartTime;
                         if (serverResponseTime < 200 || serverResponseTime > 15000) {
-                            console.warn(`Invalid response time ${serverResponseTime}ms from ${authenticatedUsername} in room ${roomId}`);
+                            logger.warn(`Invalid response time ${serverResponseTime}ms from ${authenticatedUsername} in room ${roomId}`);
                             // Redis operation wrapped in safeRedisOp
                             await redisClient.set(`suspect:${authenticatedUsername}`, 1, 'EX', 3600);
                             socket.emit('answerError', 'Invalid response timing');
@@ -3045,7 +3031,10 @@ io.on('connection', (socket) => {
 
                         // ===== 5. BOT DETECTION =====
                         const botSuspicion = botDetector.getSuspicionScore(authenticatedUsername);
-                        console.log(`Bot suspicion for ${authenticatedUsername}: ${botSuspicion}`);
+                        SecurityLogger.botSuspicion(authenticatedUsername, botSuspicion, 'submitAnswer', 0.7);
+                        if (botSuspicion >= 0.8) {
+                            trackBotSuspicion(authenticatedUsername, { score: botSuspicion, event: 'submitAnswer' });
+                        }
 
                         // ===== 6. RECAPTCHA VERIFICATION (ENVIRONMENT-AWARE) =====
                         const isProduction = process.env.NODE_ENV === 'production';
@@ -3054,18 +3043,18 @@ io.on('connection', (socket) => {
                         if (isProduction) {
                             // PRODUCTION: ALWAYS require reCAPTCHA (no exceptions)
                             if (!recaptchaToken) {
-                                console.error(`Missing reCAPTCHA token from ${authenticatedUsername} in PRODUCTION`);
+                                logger.error(`Missing reCAPTCHA token from ${authenticatedUsername} in PRODUCTION`);
                                 socket.emit('answerError', 'Verification required');
                                 return;
                             }
 
                             try {
                                 recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                                console.log(`reCAPTCHA verified for ${authenticatedUsername} (score: ${recaptchaResult.score || 'N/A'})`);
+                                logger.info(`reCAPTCHA verified for ${authenticatedUsername} (score: ${recaptchaResult.score || 'N/A'})`);
 
                                 // Check score threshold (v3 only)
                                 if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
-                                    console.warn(`Low reCAPTCHA score ${recaptchaResult.score} for ${authenticatedUsername}`);
+                                    logger.warn(`Low reCAPTCHA score ${recaptchaResult.score} for ${authenticatedUsername}`);
                                     botDetector.trackEvent(authenticatedUsername, 'low_recaptcha_score', { 
                                         score: recaptchaResult.score,
                                         event: 'submitAnswer'
@@ -3074,7 +3063,8 @@ io.on('connection', (socket) => {
                                     return;
                                 }
                             } catch (error) {
-                                console.error(`reCAPTCHA verification failed for ${authenticatedUsername}: ${error.message}`);
+                                SecurityLogger.recaptchaFailed(authenticatedUsername, error.message, null, socket.handshake.headers['x-forwarded-for'] || socket.handshake.address);
+                        trackRecaptchaFailure(authenticatedUsername, { error: error.message });
                                 
                                 // Track failed attempt for rate limiting
                                 // Redis operation wrapped in safeRedisOp
@@ -3094,38 +3084,38 @@ io.on('connection', (socket) => {
                             if (recaptchaToken) {
                                 try {
                                     recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                                    console.log(`✅ Dev reCAPTCHA verified (score: ${recaptchaResult.score || 'N/A'})`);
+                                    logger.info(`✅ Dev reCAPTCHA verified (score: ${recaptchaResult.score || 'N/A'})`);
                                     
                                     // Still check score in dev for testing
                                     if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
-                                        console.warn(`⚠️ Low score in dev: ${recaptchaResult.score} (allowing anyway)`);
+                                        logger.warn(`⚠️ Low score in dev: ${recaptchaResult.score} (allowing anyway)`);
                                     }
                                 } catch (error) {
-                                    console.warn(`⚠️ Dev reCAPTCHA failed (allowing anyway): ${error.message}`);
+                                    logger.warn(`⚠️ Dev reCAPTCHA failed (allowing anyway): ${error.message}`);
                                 }
                             } else {
-                                console.log(`🔓 Dev mode - no reCAPTCHA token provided`);
+                                logger.info(`🔓 Dev mode - no reCAPTCHA token provided`);
                             }
                         } else {
                             // DEVELOPMENT: reCAPTCHA disabled
-                            console.log(`🔓 Dev mode - reCAPTCHA disabled for ${authenticatedUsername}`);
+                            logger.info(`🔓 Dev mode - reCAPTCHA disabled for ${authenticatedUsername}`);
                         }
 
                         // ===== 7. DEVICE FINGERPRINT CHECK (RISK-BASED) =====
                         const user = await User.findOne({ walletAddress: authenticatedUsername });
                         if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint) {
-                            console.warn(`Device fingerprint mismatch for ${authenticatedUsername} in submitAnswer`);
+                            SecurityLogger.deviceMismatch(authenticatedUsername, user.deviceFingerprint, socket.user.fingerprint, { event: 'submitAnswer' });
                             botDetector.trackEvent(authenticatedUsername, 'fingerprint_mismatch', { event: 'submitAnswer' });
                             
                             // In production, if reCAPTCHA score is also suspicious = likely bot attack
                             if (isProduction && recaptchaResult && recaptchaResult.score !== undefined && recaptchaResult.score < 0.7) {
-                                console.error(`Device mismatch + low reCAPTCHA score (${recaptchaResult.score}) for ${authenticatedUsername}`);
+                                logger.error(`Device mismatch + low reCAPTCHA score (${recaptchaResult.score}) for ${authenticatedUsername}`);
                                 socket.emit('answerError', 'Device verification failed. Please relogin.');
                                 return;
                             }
                             
                             // In development or if score is high, just log and continue
-                            console.log(`Allowing fingerprint mismatch (production: ${isProduction}, score: ${recaptchaResult?.score || 'N/A'})`);
+                            logger.info(`Allowing fingerprint mismatch (production: ${isProduction}, score: ${recaptchaResult?.score || 'N/A'})`);
                         }
 
                         // ===== 8. HIGH-WIN STREAK CHECK (USES STORED RESULT) =====
@@ -3134,21 +3124,21 @@ io.on('connection', (socket) => {
                             if (isProduction) {
                                 // In production, reCAPTCHA already verified above
                                 if (!recaptchaResult || !recaptchaResult.success) {
-                                    console.error(`High-win player ${authenticatedUsername} failed verification`);
+                                    logger.error(`High-win player ${authenticatedUsername} failed verification`);
                                     socket.emit('answerError', 'Additional verification required due to high win rate.');
                                     return;
                                 }
-                                console.log(`High-win verification passed for ${authenticatedUsername} (score: ${recaptchaResult.score})`);
+                                logger.info(`High-win verification passed for ${authenticatedUsername} (score: ${recaptchaResult.score})`);
                             } else if (process.env.ENABLE_RECAPTCHA === 'true' && !recaptchaToken) {
                                 // In dev with reCAPTCHA enabled, require token for high-win players
-                                console.warn(`High-win player ${authenticatedUsername} in dev without reCAPTCHA`);
+                                logger.warn(`High-win player ${authenticatedUsername} in dev without reCAPTCHA`);
                                 socket.emit('answerError', 'Verification required for high win rate players.');
                                 return;
                             }
                         }
 
                         // ===== 9. PROCESS ANSWER =====
-                        console.log(`SERVER CALCULATED: ${authenticatedUsername} response time: ${serverResponseTime}ms`);
+                        logger.info(`SERVER CALCULATED: ${authenticatedUsername} response time: ${serverResponseTime}ms`);
 
                         const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
                         // Note: player.answered was already set to true earlier to prevent race condition
@@ -3158,7 +3148,7 @@ io.on('connection', (socket) => {
 
                         if (isCorrect) {
                             player.score = (player.score || 0) + 1;
-                            console.log(`Correct answer from ${authenticatedUsername}. New score: ${player.score}`);
+                            logger.info(`Correct answer from ${authenticatedUsername}. New score: ${player.score}`);
                             try {
                                 await User.findOneAndUpdate(
                                     { walletAddress: authenticatedUsername },
@@ -3170,7 +3160,7 @@ io.on('connection', (socket) => {
                                     }
                                 );
                             } catch (error) {
-                                console.error('Error updating user stats:', error);
+                                logger.error('Error updating user stats:', { error: error });
                             }
                         }
 
@@ -3224,14 +3214,14 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', async () => {
-        console.log('Client disconnected:', socket.id);
+        logger.info('Client disconnected:', socket.id);
 
         // 1. Check and remove from matchmaking pools in Redis (retained scan—fewer keys)
         if (socket.matchmakingPool) {
             try {
                 const removedPlayer = await removeFromMatchmakingPool(socket.matchmakingPool, socket.id);
                 if (removedPlayer) {
-                    console.log(`Player ${removedPlayer.walletAddress} (socket ${socket.id}) removed from matchmaking pool for bet ${socket.matchmakingPool} (O(1))`);
+                    logger.info(`Player ${removedPlayer.walletAddress} (socket ${socket.id}) removed from matchmaking pool for bet ${socket.matchmakingPool} (O(1))`);
                 }
                 socket.matchmakingPool = null;  // ✅ Clear ref
                 await logMatchmakingState();
@@ -3239,7 +3229,7 @@ io.on('connection', (socket) => {
                 console.error(`Error in O(1) matchmaking cleanup for socket ${socket.id}:`, error);
                 // FALLBACK ALERT: Log if ref missing/unhealthy (no scan to avoid DoS)
                 // Redis operation wrapped in safeRedisOp
-                console.warn(`Fallback needed for disconnect ${socket.id} - ref missing/unhealthy. Investigate manually.`);
+                logger.warn(`Fallback needed for disconnect ${socket.id} - ref missing/unhealthy. Investigate manually.`);
                 // TODO: Metric/alert (e.g., via Sentry) - do NOT scan here
             }
         }
@@ -3257,7 +3247,7 @@ io.on('connection', (socket) => {
                 const playerIndex = room.players.findIndex(p => p.id === socket.id);
                 if (playerIndex !== -1) {
                     const disconnectedPlayer = room.players[playerIndex];
-                    console.log(`Player ${disconnectedPlayer.username} (socket ${socket.id}) disconnected from room ${roomId}`);
+                    logger.info(`Player ${disconnectedPlayer.username} (socket ${socket.id}) disconnected from room ${roomId}`);
 
                     // Clear question timeout
                     if (room.questionTimeout) {
@@ -3272,7 +3262,7 @@ io.on('connection', (socket) => {
 
                     // Scenario 1: Bot Game Forfeit (Human disconnected)
                     if (room.roomMode === 'bot') {
-                        console.log(`Human player ${disconnectedPlayer.username} left bot game. Bot wins by forfeit.`);
+                        logger.info(`Human player ${disconnectedPlayer.username} left bot game. Bot wins by forfeit.`);
                         const botPlayer = room.players.find(p => p.isBot);
 
                         if (botPlayer) {
@@ -3292,7 +3282,7 @@ io.on('connection', (socket) => {
                                 }
                             ];
 
-                            console.log(`Calling updatePlayerStats for bot forfeit. Winner: ${winnerName}, Bet: ${room.betAmount}`);
+                            logger.info(`Calling updatePlayerStats for bot forfeit. Winner: ${winnerName}, Bet: ${room.betAmount}`);
                             await updatePlayerStats(allPlayersForStats, {
                                 winner: winnerName,
                                 botOpponent: true,
@@ -3307,14 +3297,14 @@ io.on('connection', (socket) => {
                                 message: `${disconnectedPlayer.username} left the game. ${winnerName} wins by default.`
                             });
                         } else {
-                            console.error(`CRITICAL: Bot not found in bot game room ${roomId} after human ${disconnectedPlayer.username} disconnected.`);
+                            logger.error(`CRITICAL: Bot not found in bot game room ${roomId} after human ${disconnectedPlayer.username} disconnected.`);
                             io.to(roomId).emit('gameError', 'An error occurred due to player disconnection.');
                         }
 
                         // Ensure room is deleted
                         await deleteGameRoom(roomId);
                         await redisClient.del(`room:${roomId}`);
-                        console.log(`Confirmed deletion of room ${roomId}`);
+                        logger.info(`Confirmed deletion of room ${roomId}`);
                         await logGameRoomsState();
                         socket.roomId = null;  // FIXED: Clear roomId
                         return;
@@ -3323,7 +3313,7 @@ io.on('connection', (socket) => {
                     // Scenario 2: Human vs Human Game Forfeit
                     if (room.players.length === 1 && !room.players[0].isBot) {
                         const remainingPlayer = room.players[0];
-                        console.log(`Player ${disconnectedPlayer.username} left H2H game. ${remainingPlayer.username} wins by forfeit.`);
+                        logger.info(`Player ${disconnectedPlayer.username} left H2H game. ${remainingPlayer.username} wins by forfeit.`);
 
                         const allPlayersForStats = [
                             {
@@ -3349,7 +3339,7 @@ io.on('connection', (socket) => {
 
                     // Scenario 3: Room becomes empty
                     if (room.players.length === 0) {
-                        console.log(`Room ${roomId} is now empty after ${disconnectedPlayer.username} left. Deleting room.`);
+                        logger.info(`Room ${roomId} is now empty after ${disconnectedPlayer.username} left. Deleting room.`);
                         await deleteGameRoom(roomId);
                         await redisClient.del(`room:${roomId}`);
                         await logGameRoomsState();
@@ -3365,22 +3355,26 @@ io.on('connection', (socket) => {
                     socket.roomId = null;  // FIXED: Clear roomId
                 }
             } else {
-                console.log(`No room associated with disconnected socket ${socket.id}`);
+                logger.info(`No room associated with disconnected socket ${socket.id}`);
             }
         } catch (error) {
-            console.error(`Error cleaning up game rooms for socket ${socket.id}:`, error);
+            logger.error('Error cleaning up game rooms', {
+                socketId: socket.id,
+                error: error.message,
+                stack: error.stack
+            });
             socket.roomId = null;  // FIXED: Clear on error to avoid stale state
         }
     });
 });
 
+app.use(errorHandler);
+
 io.engine.on('connection_error', (err) => {
-    console.warn('Socket.io connection error (non-fatal):', {
-        req: err.req,     // Incoming request
-        code: err.code,   // e.g., 1 = transport error
-        message: err.message, // e.g., "Session ID unknown"
-        context: err.context,
-        transport: err.req ? err.req._query?.transport : 'unknown'
+    logger.warn('Socket.io connection error', {
+        code: err.code,
+        message: err.message,
+        transport: err.req?._query?.transport
     });
 });
 
@@ -3456,16 +3450,16 @@ app.get('/api/payment/:paymentId', async (req, res) => {
 
 
 async function startGame(roomId) {
-    console.log(`Attempting to start game in room ${roomId}`);
+    logger.info(`Attempting to start game in room ${roomId}`);
     let room = await getGameRoom(roomId);
     if (!room) {
-        console.log(`Room ${roomId} not found when trying to start game`);
+        logger.info(`Room ${roomId} not found when trying to start game`);
         return;
     }
 
     // Idempotent: Skip if already started
     if (room.gameStarted) {
-        console.log(`Game already started in room ${roomId}, skipping`);
+        logger.info(`Game already started in room ${roomId}, skipping`);
         return;
     }
 
@@ -3485,7 +3479,7 @@ async function startGame(roomId) {
         }
 
         const rawQuestions = await Quiz.aggregate([...matchStage, { $sample: { size: 7 } }]);
-        console.log(`Fetched ${rawQuestions.length} questions for room ${roomId}`);
+        logger.info(`Fetched ${rawQuestions.length} questions for room ${roomId}`);
 
         // FIXED: Pre-shuffle ALL questions here (no race in startNextQuestion)
         room.questions = rawQuestions.map((question, index) => {
@@ -3494,7 +3488,7 @@ async function startGame(roomId) {
             const shuffledOptions = shuffleArray([...options]); // Shuffle copy
             const shuffledCorrectAnswer = shuffledOptions.indexOf(options[question.correctAnswer]);
             if (shuffledCorrectAnswer === -1) {
-                console.error(`Failed to shuffle question ${tempId} correctly`);
+                logger.error(`Failed to shuffle question ${tempId} correctly`);
                 throw new Error('Question shuffle failed');
             }
             const questionData = {
@@ -3539,13 +3533,13 @@ async function startGame(roomId) {
         });
         await startNextQuestion(roomId);
     } catch (error) {
-        console.error('Error starting game:', error);
+        logger.error('Error starting game:', { error: error });
         io.to(roomId).emit('gameError', 'Failed to start the game. Please try again.');
     }
 }
 
 async function startSinglePlayerGame(roomId) {
-    console.log('Starting single player game with bot for room:', roomId);
+    logger.info('Starting single player game with bot for room:', roomId);
     let room = await getGameRoom(roomId);
     if (!room) {
         console.log('Room not found for bot creation');
@@ -3553,7 +3547,7 @@ async function startSinglePlayerGame(roomId) {
     }
 
     if (room.roomMode !== 'bot') {
-        console.log(`Room ${roomId} is no longer in bot mode, not adding bot`);
+        logger.info(`Room ${roomId} is no longer in bot mode, not adding bot`);
         return;
     }
 
@@ -3578,7 +3572,7 @@ async function startSinglePlayerGame(roomId) {
             const shuffledCorrectAnswer = shuffledOptions.indexOf(options[question.correctAnswer]);
             
             if (shuffledCorrectAnswer === -1) {
-                console.error(`Failed to shuffle question ${tempId} correctly`);
+                logger.error(`Failed to shuffle question ${tempId} correctly`);
                 throw new Error('Question shuffle failed');
             }
             
@@ -3598,7 +3592,7 @@ async function startSinglePlayerGame(roomId) {
         const humanPlayers = room.players.filter(p => !p.isBot);
 
         if (humanPlayers.length !== 1) {
-            console.log(`Room ${roomId} has ${humanPlayers.length} human players, expected exactly 1`);
+            logger.info(`Room ${roomId} has ${humanPlayers.length} human players, expected exactly 1`);
             if (humanPlayers.length === 0) {
                 await deleteGameRoom(roomId);
                 await logGameRoomsState();
@@ -3617,7 +3611,7 @@ async function startSinglePlayerGame(roomId) {
         }
 
         humanPlayer = humanPlayers[0];
-        console.log('Human player:', humanPlayer.username);
+        logger.info('Human player:', humanPlayer.username);
 
         humanPlayer.score = 0;
         humanPlayer.totalResponseTime = 0;
@@ -3625,7 +3619,7 @@ async function startSinglePlayerGame(roomId) {
         humanPlayer.lastAnswer = null;
 
         if (room.players.some(p => p.isBot)) {
-            console.log(`Room ${roomId} already has a bot player`);
+            logger.info(`Room ${roomId} already has a bot player`);
             if (!room.gameStarted) {
                 room.gameStarted = true;
                 await updateGameRoom(roomId, room);
@@ -3636,10 +3630,10 @@ async function startSinglePlayerGame(roomId) {
 
         const difficultyString = await determineBotDifficulty(humanPlayer.username);
         const botName = chooseBotName();
-        console.log('Creating bot with name:', botName, 'and difficulty:', difficultyString);
+        logger.info('Creating bot with name:', botName, 'and difficulty:', difficultyString);
 
         const bot = new TriviaBot(botName, difficultyString);
-        console.log('Bot instance created:', {
+        logger.info('Bot instance created:', {
             username: bot.username,
             difficulty: bot.difficultyLevelString,
             hasAnswerQuestion: typeof bot.answerQuestion === 'function'
@@ -3658,7 +3652,7 @@ async function startSinglePlayerGame(roomId) {
             lastResponseTime: bot.lastResponseTime
         });
         room.hasBot = true;
-        console.log('Bot added to room. Total players:', room.players.length);
+        logger.info('Bot added to room. Total players:', room.players.length);
 
         await updateGameRoom(roomId, room);
 
@@ -3700,7 +3694,7 @@ async function startSinglePlayerGame(roomId) {
         await startNextQuestion(roomId);
         await logGameRoomsState();
     } catch (error) {
-        console.error('Error starting single player game with bot:', error);
+        logger.error('Error starting single player game with bot:', { error: error });
         io.to(roomId).emit('gameError', 'Failed to start the game. Please try again.');
         await deleteGameRoom(roomId);
     }
@@ -3709,13 +3703,13 @@ async function startSinglePlayerGame(roomId) {
 async function startNextQuestion(roomId) {
     let room = await getGameRoom(roomId);
     if (!room) {
-        console.log(`Room ${roomId} not found when trying to start next question`);
+        logger.info(`Room ${roomId} not found when trying to start next question`);
         return;
     }
 
     // Check if room is deleted
     if (room.isDeleted) {
-        console.log(`Room ${roomId} is marked as deleted, stopping game`);
+        logger.info(`Room ${roomId} is marked as deleted, stopping game`);
         if (room.questionTimeout) {
             clearTimeout(room.questionTimeout);
             room.questionTimeout = null;
@@ -3728,7 +3722,7 @@ async function startNextQuestion(roomId) {
     // Check if there are any human players
     const humanPlayers = room.players.filter(p => !p.isBot);
     if (humanPlayers.length === 0) {
-        console.log(`No human players in room ${roomId}. Stopping game.`);
+        logger.info(`No human players in room ${roomId}. Stopping game.`);
         if (room.questionTimeout) {
             clearTimeout(room.questionTimeout);
             room.questionTimeout = null;
@@ -3741,14 +3735,14 @@ async function startNextQuestion(roomId) {
     }
 
     if (room.currentQuestionIndex >= room.questions.length) {
-        console.log(`No more questions for room ${roomId}. Ending game.`);
+        logger.info(`No more questions for room ${roomId}. Ending game.`);
         await handleGameOver(room, roomId);
         return;
     }
 
     const currentQuestion = room.questions[room.currentQuestionIndex];
     if (!currentQuestion || !currentQuestion.options || currentQuestion.correctAnswer === undefined) {
-        console.error(`Invalid question data for room ${roomId}, question index ${room.currentQuestionIndex}`);
+        logger.error(`Invalid question data for room ${roomId}, question index ${room.currentQuestionIndex}`);
         io.to(roomId).emit('gameError', 'Invalid question data');
         room.isDeleted = true;
         await updateGameRoom(roomId, room);
@@ -3769,7 +3763,7 @@ async function startNextQuestion(roomId) {
 
     // ✅ Validation with recovery
     if (!shuffledOptions || !Array.isArray(shuffledOptions) || shuffledOptions.length === 0) {
-        console.error(`❌ Missing shuffledOptions for question ${currentQuestion.tempId} in room ${roomId}`);
+        logger.error(`❌ Missing shuffledOptions for question ${currentQuestion.tempId} in room ${roomId}`);
         console.error('Current question data:', JSON.stringify(currentQuestion, null, 2));
         
         // Try recovery from room.questions array
@@ -3789,7 +3783,7 @@ async function startNextQuestion(roomId) {
     }
 
     if (shuffledCorrectAnswer === undefined || shuffledCorrectAnswer === -1) {
-        console.error(`❌ Invalid shuffledCorrectAnswer for question ${currentQuestion.tempId}`);
+        logger.error(`❌ Invalid shuffledCorrectAnswer for question ${currentQuestion.tempId}`);
         io.to(roomId).emit('gameError', 'Invalid question configuration');
         room.isDeleted = true;
         await updateGameRoom(roomId, room);
@@ -3805,7 +3799,7 @@ async function startNextQuestion(roomId) {
     });
 
     await updateGameRoom(roomId, room);
-    console.log(`Question ${room.currentQuestionIndex + 1} started at timestamp: ${room.questionStartTime} for room ${roomId}`);
+    logger.info(`Question ${room.currentQuestionIndex + 1} started at timestamp: ${room.questionStartTime} for room ${roomId}`);
 
     io.to(roomId).emit('clearQuestionUI');
     io.to(roomId).emit('nextQuestion', {
@@ -3835,7 +3829,7 @@ async function startNextQuestion(roomId) {
             // Re-check room state before updating
             room = await getGameRoom(roomId);
             if (!room || room.isDeleted) {
-                console.log(`Room ${roomId} deleted or not found during bot answer processing`);
+                logger.info(`Room ${roomId} deleted or not found during bot answer processing`);
                 return;
             }
 
@@ -3855,7 +3849,7 @@ async function startNextQuestion(roomId) {
                 await updateGameRoom(roomId, room);
             }
 
-            console.log(`Bot ${bot.username} answered question ${currentQuestion.tempId}: ${botAnswer.answer} (correct: ${botAnswer.isCorrect}, time: ${botAnswer.responseTime}ms)`);
+            logger.info(`Bot ${bot.username} answered question ${currentQuestion.tempId}: ${botAnswer.answer} (correct: ${botAnswer.isCorrect}, time: ${botAnswer.responseTime}ms)`);
             io.to(roomId).emit('playerAnswered', {
                 username: bot.username,
                 isBot: true,
@@ -3875,14 +3869,14 @@ async function startNextQuestion(roomId) {
     room.questionTimeout = setTimeout(async () => {
         room = await getGameRoom(roomId);
         if (!room || room.isDeleted) {
-            console.log(`Room ${roomId} not found or deleted during timeout`);
+            logger.info(`Room ${roomId} not found or deleted during timeout`);
             return;
         }
 
         // Check again for human players
         const remainingHumanPlayers = room.players.filter(p => !p.isBot);
         if (remainingHumanPlayers.length === 0) {
-            console.log(`No human players remaining in room ${roomId} during timeout. Stopping game.`);
+            logger.info(`No human players remaining in room ${roomId} during timeout. Stopping game.`);
             if (room.questionTimeout) {
                 clearTimeout(room.questionTimeout);
                 room.questionTimeout = null;
@@ -3904,7 +3898,7 @@ async function startNextQuestion(roomId) {
                 room.answersReceived += 1;
                 timedOut = true;
 
-                console.log(`Player ${player.username} timed out on question ${currentQuestion.tempId} with responseTime: ${timeoutResponseTime}ms`);
+                logger.info(`Player ${player.username} timed out on question ${currentQuestion.tempId} with responseTime: ${timeoutResponseTime}ms`);
                 io.to(roomId).emit('playerAnswered', {
                     username: player.username,
                     isBot: false,
@@ -3942,7 +3936,7 @@ async function determineBotDifficulty(playerUsername) {
         const winRate = player.wins / player.gamesPlayed;
         return winRate < 0.4 ? 'MEDIUM' : 'HARD';
     } catch (error) {
-        console.error('Error determining bot difficulty:', error);
+        logger.error('Error determining bot difficulty:', { error: error });
         return 'HARD';
     }
 }
@@ -3950,14 +3944,14 @@ async function determineBotDifficulty(playerUsername) {
 async function completeQuestion(roomId) {
     let room = await getGameRoom(roomId);
     if (!room) {
-        console.error(`Room ${roomId} not found in completeQuestion`);
+        logger.error(`Room ${roomId} not found in completeQuestion`);
         io.to(roomId).emit('gameError', 'Room not found');
         return;
     }
 
     // Check if room is deleted
     if (room.isDeleted) {
-        console.log(`Room ${roomId} is marked as deleted, stopping game`);
+        logger.info(`Room ${roomId} is marked as deleted, stopping game`);
         if (room.questionTimeout) {
             clearTimeout(room.questionTimeout);
             room.questionTimeout = null;
@@ -3970,7 +3964,7 @@ async function completeQuestion(roomId) {
     // Check if there are any human players
     const humanPlayers = room.players.filter(p => !p.isBot);
     if (humanPlayers.length === 0) {
-        console.log(`No human players in room ${roomId}. Stopping game.`);
+        logger.info(`No human players in room ${roomId}. Stopping game.`);
         if (room.questionTimeout) {
             clearTimeout(room.questionTimeout);
             room.questionTimeout = null;
@@ -3984,7 +3978,7 @@ async function completeQuestion(roomId) {
 
     const currentQuestion = room.questions[room.currentQuestionIndex];
     if (!currentQuestion || !currentQuestion.shuffledOptions || currentQuestion.shuffledCorrectAnswer === undefined) {
-        console.error(`Invalid question data for room ${roomId}, index ${room.currentQuestionIndex}`);
+        logger.error(`Invalid question data for room ${roomId}, index ${room.currentQuestionIndex}`);
         io.to(roomId).emit('gameError', 'Invalid question data');
         room.isDeleted = true;
         await updateGameRoom(roomId, room);
@@ -4026,7 +4020,7 @@ async function completeQuestion(roomId) {
     await updateGameRoom(roomId, room);
 
     if (room.playerLeft) {
-        console.log(`Game in room ${roomId} ending early because a player left`);
+        logger.info(`Game in room ${roomId} ending early because a player left`);
         await handleGameOver(room, roomId);
         return;
     }
@@ -4036,7 +4030,7 @@ async function completeQuestion(roomId) {
             startNextQuestion(roomId);
         }, 3000);
     } else {
-        console.log(`Game over in room ${roomId}`);
+        logger.info(`Game over in room ${roomId}`);
         await handleGameOver(room, roomId);
     }
 }
@@ -4118,9 +4112,9 @@ async function handleGameOver(room, roomId) {
                     { botOpponent, singlePlayerMode: isSinglePlayerEncounter }
                 );
                 paymentId = queuedPayment._id.toString();
-                console.log(`Payout queued for ${winner}: Payment ID ${paymentId}, Amount ${winningAmount} USDC`);
+                logger.info(`Payout queued for ${winner}: Payment ID ${paymentId}, Amount ${winningAmount} USDC`);
             } catch (error) {
-                console.error('Error queueing payout:', error);
+                logger.error('Error queueing payout:', { error: error });
                 // Emit error but continue (payout is queued or will be retried)
                 io.to(roomId).emit('gameOver', {
                     error: 'Payout queued but initial setup failed. Check your balance or contact support.',
@@ -4160,7 +4154,7 @@ async function handleGameOver(room, roomId) {
         await deleteGameRoom(roomId);
         await logGameRoomsState();
     } catch (error) {
-        console.error('Error handling game over:', error);
+        logger.error('Error handling game over:', { error: error });
         io.to(roomId).emit('gameError', 'An error occurred while ending the game.');
         await deleteGameRoom(roomId);
     }
@@ -4176,11 +4170,11 @@ async function startServer() {
         await initializeRedis();
         
         server.listen(PORT, () => {
-            console.log(`🚀 Server is running on port ${PORT}`);
-            console.log(`🔐 Treasury wallet loaded from AWS Secrets Manager`);
+            logger.info(`🚀 Server is running on port ${PORT}`);
+            logger.info(`🔐 Treasury wallet loaded from AWS Secrets Manager`);
         });
     } catch (error) {
-        console.error('❌ Failed to start server:', error);
+        logger.error('❌ Failed to start server:', { error: error });
         process.exit(1);
     }
 }
@@ -4208,15 +4202,7 @@ async function verifyRecaptcha(token) {
             console.warn('reCAPTCHA secret key not configured, skipping verification');
             return { success: true, score: 1.0 }; // Default to success in development
         }
-        
-        /*
-        const response = await axios.post('https://www.google.com/recaptcha/api/siteverify', null, {
-            params: {
-                secret: secretKey,
-                response: token
-            }
-        });
-        */
+
         const response = await axios.post('https://www.google.com/recaptcha/api/siteverify', null, {
             params: {
                 secret: secretKey,
@@ -4225,7 +4211,7 @@ async function verifyRecaptcha(token) {
             httpsAgent: new https.Agent({ family: 4 }) // <--- FIX: Forces IPv4 to avoid ENETUNREACH
         });
         
-        console.log('reCAPTCHA verification response:', response.data);
+        logger.info('reCAPTCHA verification response:', response.data);
         
         // FIXED: Strict enforcement - throw on failure
         if (!response.data.success) {
@@ -4235,13 +4221,13 @@ async function verifyRecaptcha(token) {
         
         // FIXED: Enforce score threshold for v3
         if (response.data.score !== undefined && response.data.score < 0.5) {
-            console.warn(`reCAPTCHA score too low: ${response.data.score}`);
+            logger.warn(`reCAPTCHA score too low: ${response.data.score}`);
             throw new Error('Bot activity suspected (low reCAPTCHA score)');
         }
         
         return { success: true, score: response.data.score };
     } catch (error) {
-        console.error('reCAPTCHA verification error:', error);
+        logger.error('reCAPTCHA verification error:', { error: error });
         throw new Error('Verification service unavailable. Please try again later.');
     }
 }
@@ -4296,7 +4282,7 @@ async function createGameRoom(roomId, betAmount, roomMode = 'waiting') {
             // Execute all at once
             await multi.exec();
             
-            console.log(`Created & tracked room ${roomId} in Redis with bet ${betAmount}`);
+            logger.info(`Created & tracked room ${roomId} in Redis with bet ${betAmount}`);
         },
         `Create game room ${roomId}`
     );
@@ -4341,7 +4327,7 @@ async function getGameRoom(roomId) {
                     );
                 } else if (typeof mapData === 'object' && mapData !== null) {
                     // Legacy format: plain object (convert to Map)
-                    console.warn(`Room ${roomId} using legacy questionIdMap format - converting`);
+                    logger.warn(`Room ${roomId} using legacy questionIdMap format - converting`);
                     questionIdMap = new Map(
                         Object.entries(mapData).map(([key, val]) => [
                             key,
@@ -4385,7 +4371,7 @@ async function getGameRoom(roomId) {
 async function updateGameRoom(roomId, room) {
     try {
         if (room.isDeleted) {
-            console.log(`Room ${roomId} is marked as deleted, skipping update`);
+            logger.info(`Room ${roomId} is marked as deleted, skipping update`);
             return;
         }
 
@@ -4434,7 +4420,7 @@ async function updateGameRoom(roomId, room) {
         multi.hset(`room:${roomId}`, roomData);
         multi.expire(`room:${roomId}`, 3600);
         await multi.exec();
-        console.log(`Updated room ${roomId} in Redis`);
+        logger.info(`Updated room ${roomId} in Redis`);
     } catch (error) {
         console.error(`Error updating room ${roomId} in Redis:`, error);
     // Redis health auto-managed by ioredis
@@ -4469,12 +4455,12 @@ async function deleteGameRoom(roomId) {
         // 3. Cleanup waiting room index if applicable
         if (room && room.betAmount && room.roomMode === 'human') {
             multi.zrem(`waiting_rooms:${room.betAmount}`, roomId);
-            console.log(`Queued removal from waiting_rooms:${room.betAmount}`);
+            logger.info(`Queued removal from waiting_rooms:${room.betAmount}`);
         }
 
         // Execute transaction
         await multi.exec();
-        console.log(`Deleted room ${roomId} and cleaned up tracking sets`);
+        logger.info(`Deleted room ${roomId} and cleaned up tracking sets`);
 
     } catch (error) {
         console.error(`Error deleting room ${roomId} from Redis:`, error);
@@ -4486,7 +4472,7 @@ async function addToMatchmakingPool(betAmount, playerData) {
     try {
         await redisClient.lpush(`matchmaking:human:${betAmount}`, JSON.stringify(playerData));
         await trackMatchmakingPlayer(betAmount, playerData.walletAddress);
-        console.log(`Added player ${playerData.walletAddress} to matchmaking pool for ${betAmount}`);
+        logger.info(`Added player ${playerData.walletAddress} to matchmaking pool for ${betAmount}`);
         return true;  // ✅ Return success for caller to verify
     } catch (error) {
         console.error(`Error adding to matchmaking pool for ${betAmount}:`, error);
@@ -4515,7 +4501,7 @@ async function removeFromMatchmakingPool(betAmount, socketId) {
 
         if (playerIndex !== -1) {
             const removedPlayer = await redisClient.lrem(`matchmaking:human:${betAmount}`, 1, pool[playerIndex]);
-            console.log(`Removed player with socketId ${socketId} from matchmaking pool for ${betAmount}`);
+            logger.info(`Removed player with socketId ${socketId} from matchmaking pool for ${betAmount}`);
             try {
                 const playerData = JSON.parse(pool[playerIndex]);  // ← ADD THIS LINE
                 await untrackMatchmakingPlayer(betAmount, playerData.walletAddress);  // ← FIXED
@@ -4527,7 +4513,7 @@ async function removeFromMatchmakingPool(betAmount, socketId) {
             }
         }
 
-        console.log(`Player with socketId ${socketId} not found in matchmaking pool for ${betAmount}`);
+        logger.info(`Player with socketId ${socketId} not found in matchmaking pool for ${betAmount}`);
         return null;
     } catch (error) {
         console.error(`Error removing from matchmaking pool for ${betAmount}:`, error);
@@ -4561,7 +4547,7 @@ async function findAssociatedTokenAddress(walletAddress, tokenMintAddress) {
 
 app.get('/api/tokens.json', async (req, res) => {
     const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    console.warn(`Potential bot detected accessing honeypot: ${clientIP}`);
+    logger.warn(`Potential bot detected accessing honeypot: ${clientIP}`);
     // Redis operation wrapped in safeRedisOp
     await redisClient.set(`blocklist:${clientIP}`, 1, 'EX', 86400); // Block for 24 hours
     
@@ -4589,14 +4575,14 @@ app.get('/api/leaderboard', async (req, res) => {
         
         res.json(transformedLeaderboard);
     } catch (error) {
-        console.error('Error fetching leaderboard:', error);
+        logger.error('Error fetching leaderboard:', { error: error });
         res.status(500).json({ error: 'Failed to fetch leaderboard' });
     }
 });
 
 app.get('/admin', (req, res) => {
     const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    console.warn(`Potential bot detected accessing admin honeypot: ${clientIP}`);
+    logger.warn(`Potential bot detected accessing admin honeypot: ${clientIP}`);
     // Redis operation wrapped in safeRedisOp
     redisClient.set(`blocklist:${clientIP}`, 1, 'EX', 86400);
     
@@ -4622,7 +4608,7 @@ async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, 
                 { botOpponent, forfeit: true }
             );
             paymentId = queuedPayment._id.toString();
-            console.log(`Forfeit payout queued for ${remainingPlayer.username}: Payment ID ${paymentId}`);
+            logger.info(`Forfeit payout queued for ${remainingPlayer.username}: Payment ID ${paymentId}`);
         }
 
         // Emit game over event with forfeit information
@@ -4647,7 +4633,7 @@ async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, 
         await deleteGameRoom(roomId);
         await logGameRoomsState();
     } catch (error) {
-        console.error('Error processing player left win:', error);
+        logger.error('Error processing player left win:', { error: error });
         io.to(roomId).emit('gameError', 'Error processing win after player left. Please contact support.');
         await deleteGameRoom(roomId);
         await logGameRoomsState();
@@ -4658,23 +4644,23 @@ async function logGameRoomsState() {
     console.log('Current game rooms state:');
     
     const roomIds = await getCleanActiveRooms(); 
-    console.log(`Total rooms: ${roomIds.length}`);
+    logger.info(`Total rooms: ${roomIds.length}`);
 
     for (const roomId of roomIds) {
         const room = await getGameRoom(roomId);
         if (room) {
-            console.log(`Room ID: ${roomId}`);
-            console.log(`  Mode: ${room.roomMode}`);
-            console.log(`  Game started: ${room.gameStarted}`);
-            console.log(`  Bet amount: ${room.betAmount}`);
-            console.log(`  Players (${room.players.length}):`);
+            logger.info(`Room ID: ${roomId}`);
+            logger.info(`  Mode: ${room.roomMode}`);
+            logger.info(`  Game started: ${room.gameStarted}`);
+            logger.info(`  Bet amount: ${room.betAmount}`);
+            logger.info(`  Players (${room.players.length}):`);
 
             room.players.forEach(player => {
-                console.log(`    - ${player.username}${player.isBot ? ' (BOT)' : ''}`);
+                logger.info(`    - ${player.username}${player.isBot ? ' (BOT)' : ''}`);
             });
 
-            console.log(`  Questions: ${room.questions?.length || 0}`);
-            console.log(`  Current question index: ${room.currentQuestionIndex}`);
+            logger.info(`  Questions: ${room.questions?.length || 0}`);
+            logger.info(`  Current question index: ${room.currentQuestionIndex}`);
             console.log('-------------------');
         }
     }
@@ -4690,7 +4676,7 @@ async function logMatchmakingState() {
         const pools = await getAllMatchmakingPools();
         
         for (const [betAmount, wallets] of Object.entries(pools)) {
-            console.log(`  Bet Amount ${betAmount}: ${wallets.length} players waiting`);
+            logger.info(`  Bet Amount ${betAmount}: ${wallets.length} players waiting`);
             
             // Get full player data for each wallet
             const pool = await getMatchmakingPool(betAmount);  // ← FIXED
@@ -4701,7 +4687,7 @@ async function logMatchmakingState() {
                     const player = playersByWallet.get(wallet);
                     if (player) {
                         const waitTime = Math.round((Date.now() - player.joinTime) / 1000);
-                        console.log(`    - ${wallet} (waiting for ${waitTime}s)`);
+                        logger.info(`    - ${wallet} (waiting for ${waitTime}s)`);
                     }
                 }
             }
@@ -4710,7 +4696,7 @@ async function logMatchmakingState() {
         console.log('Game Rooms:');
         await logGameRoomsState();
     } catch (error) {
-        console.error('Error logging matchmaking state:', error);
+        logger.error('Error logging matchmaking state:', { error: error });
     }
 }
 
@@ -4731,7 +4717,7 @@ setInterval(async () => {
             const expiredPlayers = pool.filter(player => (now - player.joinTime) > MAX_WAIT_TIME);
 
             if (expiredPlayers.length > 0) {
-                console.log(`Removing ${expiredPlayers.length} expired players from matchmaking pool for ${betAmount}`);
+                logger.info(`Removing ${expiredPlayers.length} expired players from matchmaking pool for ${betAmount}`);
                 
                 for (const player of expiredPlayers) {
                     const playerSocket = io.sockets.sockets.get(player.socketId);
@@ -4748,17 +4734,17 @@ setInterval(async () => {
             }
         }
     } catch (error) {
-        console.error('Error in matchmaking cleanup:', error);
+        logger.error('Error in matchmaking cleanup:', { error: error });
     }
 }, 60000); // Run every minute
 
 async function updatePlayerStats(players, roomData) {
-    console.log('Updating stats for all players:', players);
+    logger.info('Updating stats for all players:', players);
     const winner = roomData.winner;
     const multiplier = roomData.botOpponent ? 1.5 : 1.8;
     const winningAmount = roomData.betAmount * multiplier;
     
-    console.log(`Game stats: winner=${winner}, betAmount=${roomData.betAmount}, winnings=${winningAmount}`);
+    logger.info(`Game stats: winner=${winner}, betAmount=${roomData.betAmount}, winnings=${winningAmount}`);
     
     // ✅ Check if MongoDB supports transactions (replica set or Atlas)
     const supportsTransactions = mongoose.connection.client.topology?.description?.type !== 'Single';
@@ -4772,17 +4758,17 @@ async function updatePlayerStats(players, roomData) {
         try {
             for (const player of players) {
                 if (player.isBot) {
-                    console.log(`Skipping bot: ${player.username}`);
+                    logger.info(`Skipping bot: ${player.username}`);
                     continue;
                 }
                 
                 if (!player.username) {
-                    console.log(`Skipping player with no username`);
+                    logger.info(`Skipping player with no username`);
                     continue;
                 }
                 
                 const isWinner = player.username === winner;
-                console.log(`Updating ${player.username} (winner: ${isWinner})`);
+                logger.info(`Updating ${player.username} (winner: ${isWinner})`);
                 
                 const updateObj = {
                     $inc: {
@@ -4817,7 +4803,7 @@ async function updatePlayerStats(players, roomData) {
             console.log('All player stats committed successfully (transaction)');
         } catch (error) {
             await session.abortTransaction();
-            console.error('Player stats transaction failed (rolled back):', error);
+            logger.error('Player stats transaction failed (rolled back):', { error: error });
             throw error;
         } finally {
             session.endSession();
@@ -4829,17 +4815,17 @@ async function updatePlayerStats(players, roomData) {
         try {
             for (const player of players) {
                 if (player.isBot) {
-                    console.log(`Skipping bot: ${player.username}`);
+                    logger.info(`Skipping bot: ${player.username}`);
                     continue;
                 }
                 
                 if (!player.username) {
-                    console.log(`Skipping player with no username`);
+                    logger.info(`Skipping player with no username`);
                     continue;
                 }
                 
                 const isWinner = player.username === winner;
-                console.log(`Updating ${player.username} (winner: ${isWinner})`);
+                logger.info(`Updating ${player.username} (winner: ${isWinner})`);
                 
                 const updateObj = {
                     $inc: {
@@ -4873,7 +4859,7 @@ async function updatePlayerStats(players, roomData) {
             
             console.log('All player stats updated successfully (atomic)');
         } catch (error) {
-            console.error('Error in updatePlayerStats (atomic mode):', error);
+            logger.error('Error in updatePlayerStats (atomic mode):', { error: error });
             throw error;
         }
     }
