@@ -254,6 +254,41 @@ const logger = winston.createLogger({
 });
 
 // ============================================================================
+// PREVENT WRITES AFTER SHUTDOWN
+// ============================================================================
+
+// Track logger state to prevent writes after shutdown
+let loggerClosed = false;
+
+// Wrap the original log method to check if logger is closed
+const originalLog = logger.log.bind(logger);
+logger.log = function(level, message, meta) {
+    if (loggerClosed) {
+        // Fallback to console if logger is closed
+        try {
+            console.log(`[${level.toUpperCase()}] ${message}`, meta || '');
+        } catch (err) {
+            // Silently ignore if console also fails
+        }
+        return;
+    }
+    try {
+        return originalLog(level, message, meta);
+    } catch (err) {
+        // If Winston fails, fallback to console
+        try {
+            console.error('Logger error:', err.message);
+            console.log(`[${level.toUpperCase()}] ${message}`, meta || '');
+        } catch (consoleErr) {
+            // Silently ignore
+        }
+    }
+};
+
+// Add a method to check if logger is available
+logger.isAvailable = () => !loggerClosed;
+
+// ============================================================================
 // SPECIALIZED LOGGING METHODS
 // ============================================================================
 
@@ -495,9 +530,12 @@ logger.sample = (sampleRate, level, message, meta = {}) => {
 };
 
 // Clean up sampling counters periodically
-setInterval(() => {
+const samplingCleanupInterval = setInterval(() => {
     samplingCounters.clear();
 }, 3600000); // Every hour
+
+// Prevent this interval from keeping the process alive
+samplingCleanupInterval.unref();
 
 // ============================================================================
 // STARTUP MESSAGE
@@ -515,18 +553,38 @@ logger.info('Logger initialized', {
 // GRACEFUL SHUTDOWN
 // ============================================================================
 
-const gracefulShutdown = () => {
-    logger.info('Logger shutting down gracefully');
+const gracefulShutdown = async (signal) => {
+    if (loggerClosed) {
+        return;
+    }
+    
+    console.log(`\n📡 Received ${signal} signal, shutting down gracefully...`);
+    
+    loggerClosed = true;
+    
+    // Clear the sampling cleanup interval
+    if (samplingCleanupInterval) {
+        clearInterval(samplingCleanupInterval);
+    }
+    
+    // Log shutdown message
+    logger.info('Logger shutting down gracefully', { signal });
     
     // Close all transports
-    return new Promise((resolve) => {
+    await new Promise((resolve) => {
+        setTimeout(resolve, 100); // Give logger time to flush
         logger.on('finish', resolve);
         logger.end();
     });
+    
+    console.log('✅ Logger closed');
+    
+    // Exit the process
+    process.exit(0);
 };
 
-process.on('SIGTERM', gracefulShutdown);
-process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // ============================================================================
 // EXPORT

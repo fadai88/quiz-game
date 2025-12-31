@@ -1,0 +1,4 @@
+{"environment":"development","error":{},"hostname":"WIN-7DM6N36LL6N","level":"error","message":"❌ Failed to start server:","pid":8433,"service":"trivia-game","timestamp":"2025-12-25 11:29:12.437","version":"1.0.0"}
+{"environment":"development","error":{},"hostname":"WIN-7DM6N36LL6N","level":"error","message":"❌ Failed to start server:","pid":8470,"service":"trivia-game","timestamp":"2025-12-25 11:32:45.247","version":"1.0.0"}
+{"environment":"development","error":{},"hostname":"WIN-7DM6N36LL6N","level":"error","message":"❌ Failed to start server:","pid":8548,"service":"trivia-game","timestamp":"2025-12-25 11:48:28.172","version":"1.0.0"}
+{"environment":"development","error":{},"hostname":"WIN-7DM6N36LL6N","level":"error","message":"[AUTH] Connection middleware error:","pid":10207,"service":"trivia-game","timestamp":"2025-12-25 22:13:18.909","version":"1.0.0"}

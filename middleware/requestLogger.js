@@ -252,22 +252,38 @@ function wrapSocketHandler(eventName, handler) {
         } catch (error) {
             // Log error
             const duration = Date.now() - startTime;
+            let errorId = 'unknown';
             
-            const errorId = logger.trackError(error, {
-                event: eventName,
-                walletAddress: socket.user?.walletAddress,
-                socketId: socket.id,
-                correlationId: socket.correlationId,
-                duration
-            });
+            try {
+                if (logger.isAvailable && logger.isAvailable()) {
+                    errorId = logger.trackError(error, {
+                        event: eventName,
+                        walletAddress: socket.user?.walletAddress,
+                        socketId: socket.id,
+                        correlationId: socket.correlationId,
+                        duration
+                    });
+                } else {
+                    console.error('Socket event error (logger unavailable):', error.message);
+                    errorId = Date.now().toString(36);
+                }
+            } catch (logError) {
+                console.error('Failed to log socket error:', logError.message);
+                errorId = Date.now().toString(36);
+            }
             
-            socket.logger.error('Socket event error', {
-                event: eventName,
-                errorId,
-                error: error.message,
-                walletAddress: socket.user?.walletAddress,
-                duration
-            });
+            try {
+                socket.logger.error('Socket event error', {
+                    event: eventName,
+                    errorId,
+                    error: error.message,
+                    walletAddress: socket.user?.walletAddress,
+                    duration
+                });
+            } catch (logError) {
+                // Ignore logging errors
+                console.error('Failed to log to socket logger:', logError.message);
+            }
             
             throw error;
         }
@@ -283,34 +299,61 @@ function wrapSocketHandler(eventName, handler) {
  * Must be added AFTER all routes
  */
 function errorHandler(err, req, res, next) {
-    const errorId = logger.trackError(err, {
-        method: req.method,
-        path: req.path,
-        query: req.query,
-        body: req.body,
-        correlationId: req.correlationId,
-        walletAddress: req.user?.walletAddress,
-        ip: req.ip
-    });
+    let errorId = 'unknown';
     
-    req.logger.error('Request error', {
-        errorId,
-        error: err.message,
-        stack: err.stack,
-        code: err.code,
-        statusCode: err.statusCode || 500
-    });
+    // Try to track error with logger
+    try {
+        if (logger.isAvailable && logger.isAvailable()) {
+            errorId = logger.trackError(err, {
+                method: req.method,
+                path: req.path,
+                query: req.query,
+                body: req.body,
+                correlationId: req.correlationId,
+                walletAddress: req.user?.walletAddress,
+                ip: req.ip
+            });
+        } else {
+            // Logger not available, use console
+            console.error('Error occurred (logger unavailable):', err.message);
+            errorId = Date.now().toString(36);
+        }
+    } catch (logError) {
+        // If logging fails, fallback to console
+        console.error('Failed to log error:', logError.message);
+        console.error('Original error:', err.message);
+        errorId = Date.now().toString(36);
+    }
+    
+    // Try to log to request logger
+    try {
+        if (req.logger) {
+            req.logger.error('Request error', {
+                errorId,
+                error: err.message,
+                stack: err.stack,
+                code: err.code,
+                statusCode: err.statusCode || 500
+            });
+        }
+    } catch (logError) {
+        // Ignore logging errors
+        console.error('Failed to log request error:', logError.message);
+    }
     
     // Send error response
     const statusCode = err.statusCode || 500;
     const isDev = process.env.NODE_ENV !== 'production';
     
-    res.status(statusCode).json({
-        error: isDev ? err.message : 'Internal server error',
-        errorId,
-        correlationId: req.correlationId,
-        ...(isDev && { stack: err.stack })
-    });
+    // Make sure response hasn't been sent already
+    if (!res.headersSent) {
+        res.status(statusCode).json({
+            error: isDev ? err.message : 'Internal server error',
+            errorId,
+            correlationId: req.correlationId,
+            ...(isDev && { stack: err.stack })
+        });
+    }
 }
 
 // ============================================================================

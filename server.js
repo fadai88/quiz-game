@@ -122,6 +122,8 @@ const VALIDATION_FAILURE_WINDOW = 3600000; // 1 hour
 const VALIDATION_FAILURE_THRESHOLD = 100; // Max failures per hour
 const blockedIdentifiers = new Set();
 
+let paymentProcessorInterval;
+let roomCleanupInterval;
 
 /**
  * Check if identifier is blocked
@@ -142,7 +144,7 @@ function clearValidationTracking() {
 }
 
 // Periodic cleanup of old records (every 5 minutes)
-setInterval(() => {
+roomCleanupInterval = setInterval(() => {
     const now = Date.now();
     let cleaned = 0;
     
@@ -1849,15 +1851,18 @@ class TriviaBot {
 // ============================================================================
 // Validates session from httpOnly cookie before allowing Socket.IO connection
 io.use(async (socket, next) => {
+    const startTime = Date.now();
+    
     try {
+        // Check if this is a login/reconnect event (exempt from auth)
+        const incomingEvent = socket.handshake.auth?.event || '';
+        if (incomingEvent === 'walletLogin' || incomingEvent === 'walletReconnect') {
+            console.log('[AUTH] Allowing unauthenticated connection for:', incomingEvent);
+            return next(); // Allow without auth
+        }
+        
         // Extract cookies from handshake
         const cookieHeader = socket.handshake.headers.cookie;
-        
-        // Allow unauthenticated connection for login flow
-        const incomingEvent = socket.handshake.auth?.event;
-        if (incomingEvent === 'walletLogin') {
-            return next(); // Let login happen first
-        }
         
         if (!cookieHeader) {
             console.warn('[AUTH] No cookies in Socket.IO handshake');
@@ -1901,26 +1906,39 @@ io.use(async (socket, next) => {
             sessionToken: sessionToken
         };
         
+        // Log successful authentication
         SecurityLogger.socketAuthSuccess(sessionData.walletAddress, socket);
+        
+        console.log('[AUTH] Socket authenticated successfully:', {
+            walletAddress: sessionData.walletAddress.substring(0, 6) + '...',
+            socketId: socket.id
+        });
+        
         next();
         
     } catch (error) {
-        logger.error('[AUTH] Socket authentication error:', { error: error });
+        const duration = Date.now() - startTime;
+        
+        // ✅ PROPERLY LOG ERROR - THIS IS THE FIX!
+        console.error('[AUTH] Socket authentication error:', error);
+        
+        logger.error('[AUTH] Connection middleware error', {
+            error: error.message || String(error),     // ← Extract message
+            errorName: error.name || 'Error',          // ← Get error type
+            errorCode: error.code,                     // ← Get error code
+            stack: error.stack,                        // ← Get stack trace
+            socketId: socket.id,
+            duration,
+            hasUser: !!socket.user,
+            walletAddress: socket.user?.walletAddress,
+            hasCookies: !!socket.handshake.headers.cookie,
+            incomingEvent: socket.handshake.auth?.event
+        });
+        
         next(new Error('Authentication failed'));
     }
 });
 
-// Enable authentication middleware with exemptions for login events
-io.use((socket, next) => {
-    // Exempt login/reconnect (no socket.user yet) - check handshake auth
-    const incomingEvent = socket.handshake.auth?.event || '';  // Client sends this on connect (e.g., { auth: { event: 'walletLogin' } })
-    if (incomingEvent === 'walletLogin' || incomingEvent === 'walletReconnect') {
-        return next();  // Allow without auth
-    }
-    
-    // Otherwise, enforce full middleware for game events
-    authMiddleware(socket, next);
-});
 
 io.on('connection', (socket) => {
     logger.info('New client connected:', socket.id);
@@ -4701,7 +4719,7 @@ async function logMatchmakingState() {
 }
 
 // Cleanup expired matchmaking players (REFACTORED - No scanKeys!)
-setInterval(async () => {
+paymentProcessorInterval = setInterval(async () => {
     const now = Date.now();
     const MAX_WAIT_TIME = 5 * 60 * 1000; // 5 minutes
 
@@ -4864,3 +4882,65 @@ async function updatePlayerStats(players, roomData) {
         }
     }
 }
+
+async function gracefulShutdown(signal) {
+    console.log(`\n📡 Received ${signal} signal, shutting down gracefully...`);
+    
+    // Clear all intervals
+    if (paymentProcessorInterval) clearInterval(paymentProcessorInterval);
+    if (roomCleanupInterval) clearInterval(roomCleanupInterval);
+    
+    // Close server
+    if (server) {
+        console.log('🔌 Closing HTTP server...');
+        await new Promise((resolve) => {
+            server.close(() => {
+                console.log('✅ HTTP server closed');
+                resolve();
+            });
+        });
+    }
+    
+    // Close Socket.IO
+    if (io) {
+        console.log('🔌 Closing Socket.IO...');
+        await new Promise((resolve) => {
+            io.close(() => {
+                console.log('✅ Socket.IO closed');
+                resolve();
+            });
+        });
+    }
+    
+    // Close database connections
+    if (mongoose.connection) {
+        console.log('🔌 Closing MongoDB connection...');
+        await mongoose.connection.close();
+        console.log('✅ MongoDB closed');
+    }
+    
+    // Close Redis
+    if (redisClient) {
+        console.log('🔌 Closing Redis connection...');
+        await redisClient.quit();
+        console.log('✅ Redis closed');
+    }
+    
+    // Close logger (this will also call process.exit(0))
+    await require('./logger').gracefulShutdown(signal);
+}
+
+// Listen for shutdown signals
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Also handle uncaught exceptions gracefully
+process.on('uncaughtException', (error) => {
+    console.error('❌ Uncaught Exception:', error);
+    gracefulShutdown('UNCAUGHT_EXCEPTION');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+    gracefulShutdown('UNHANDLED_REJECTION');
+});
