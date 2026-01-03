@@ -14,6 +14,11 @@
             "date": 1767181200764,
             "name": "logs/performance-2025-12-31.log",
             "hash": "a331906eeb16fce11f9bfdee10d486790229bb2d8a83f20f5d9aa82fad49607c"
+        },
+        {
+            "date": 1767251491096,
+            "name": "logs/performance-2026-01-01.log",
+            "hash": "1fe53a8c859576179132447c7d9fdb87f51c0579d7915c1aa176d942b1350871"
         }
     ],
     "hashType": "sha256"

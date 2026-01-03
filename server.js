@@ -477,6 +477,28 @@ const matchFoundSchema = Joi.object({
     newRoomId: roomIdSchema
 });
 
+// ============================================================================
+// HTTP ENDPOINT VALIDATION SCHEMAS (NoSQL Injection Prevention)
+// ============================================================================
+// Validate all user inputs from HTTP requests before database queries
+
+const loginSchema = Joi.object({
+    walletAddress: solanaPublicKey,
+    verifyToken: Joi.string().required(),
+    recaptchaToken: Joi.string().optional(),
+    clientData: Joi.object().optional()
+});
+
+const walletParamSchema = Joi.object({
+    wallet: solanaPublicKey
+});
+
+const paymentIdParamSchema = Joi.object({
+    paymentId: Joi.string().pattern(/^[a-f0-9]{24}$/).required().messages({
+        'string.pattern.base': 'Invalid payment ID format'
+    })
+});
+
 const { 
     createAssociatedTokenAccountInstruction, 
     getAssociatedTokenAddress, 
@@ -765,7 +787,22 @@ logger.info('✅ Secure cookie middleware initialized', {
 
 app.post('/api/auth/login', async (req, res) => {
     try {
-        const { walletAddress, verifyToken, recaptchaToken, clientData } = req.body;
+        // ✅ SECURITY FIX: Validate all inputs to prevent NoSQL injection
+        const { error, value } = loginSchema.validate(req.body, {
+            abortEarly: false,
+            stripUnknown: true
+        });
+        
+        if (error) {
+            const errorDetails = error.details.map(d => d.message).join('; ');
+            logger.warn(`[SECURITY] Validation failed for login from ${req.ip}: ${errorDetails}`);
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Invalid input data' 
+            });
+        }
+        
+        const { walletAddress, verifyToken, recaptchaToken, clientData } = value;
         
         // Validate verification token (proves Socket.IO already verified signature)
         const storedToken = await redisClient.get(`verify:${walletAddress}`);
@@ -3436,7 +3473,22 @@ app.get('/login.html', (req, res) => {
 
 app.get('/api/balance/:wallet', async (req, res) => {
     try {
-        const user = await User.findOne({ walletAddress: req.params.wallet });
+        // ✅ SECURITY FIX: Validate wallet parameter to prevent NoSQL injection
+        const { error, value } = walletParamSchema.validate(req.params, {
+            abortEarly: false,
+            stripUnknown: true
+        });
+        
+        if (error) {
+            const errorDetails = error.details.map(d => d.message).join('; ');
+            logger.warn(`[SECURITY] Validation failed for balance from ${req.ip}: ${errorDetails}`);
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Invalid wallet address' 
+            });
+        }
+        
+        const user = await User.findOne({ walletAddress: value.wallet });
         if (user) {
             res.json({ balance: user.virtualBalance });
         } else {
@@ -3450,7 +3502,22 @@ app.get('/api/balance/:wallet', async (req, res) => {
 // NEW: API endpoint to check payment status
 app.get('/api/payment/:paymentId', async (req, res) => {
     try {
-        const payment = await PaymentQueue.findById(req.params.paymentId);
+        // ✅ SECURITY FIX: Validate payment ID to prevent NoSQL injection
+        const { error, value } = paymentIdParamSchema.validate(req.params, {
+            abortEarly: false,
+            stripUnknown: true
+        });
+        
+        if (error) {
+            const errorDetails = error.details.map(d => d.message).join('; ');
+            logger.warn(`[SECURITY] Validation failed for payment from ${req.ip}: ${errorDetails}`);
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Invalid payment ID' 
+            });
+        }
+        
+        const payment = await PaymentQueue.findById(value.paymentId);
         if (!payment) {
             return res.status(404).json({ error: 'Payment not found' });
         }
