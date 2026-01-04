@@ -69,35 +69,6 @@ const {
 //    - External API calls
 // ============================================================================
 
-/**
- * Comprehensive validation middleware for socket events
- * @param {Object} schema - Joi validation schema
- * @param {string} eventName - Name of the socket event (for logging)
- * @returns {Function} Validation middleware function
- */
-function validateInput(schema, eventName) {
-    return (data) => {
-        const { error, value } = schema.validate(data, {
-            abortEarly: false,        // Report all errors, not just first
-            stripUnknown: true,       // Remove unknown properties (security)
-            convert: true             // Type coercion where safe
-        });
-        
-        if (error) {
-            const errorDetails = error.details.map(d => d.message).join('; ');
-            logger.security('security_error', {
-                message: `Validation failed for ${eventName}:`,
-                errorDetails
-            });
-            throw new Error(`Validation failed: ${errorDetails}`);
-        }
-        
-        logger.security('security_info', {
-            message: `Validation passed for ${eventName}`
-        });
-        return value;
-    };
-}
 
 /**
  * Sanitize user input for logging (prevent log injection)
@@ -112,54 +83,8 @@ function sanitizeForLog(input) {
         .substring(0, 100);               // Limit length
 }
 
-// ============================================================================
-// VALIDATION FAILURE TRACKING (Anti-Abuse System)
-// ============================================================================
-// Track validation failures per IP/wallet to detect attack patterns
-
-const validationFailures = new Map(); // Map<identifier, {count, firstFailure, lastFailure}>
-const VALIDATION_FAILURE_WINDOW = 3600000; // 1 hour
-const VALIDATION_FAILURE_THRESHOLD = 100; // Max failures per hour
-const blockedIdentifiers = new Set();
-
 let paymentProcessorInterval;
 let roomCleanupInterval;
-
-/**
- * Check if identifier is blocked
- * @param {string} identifier - IP or wallet to check
- * @returns {boolean} True if blocked
- */
-function isBlocked(identifier) {
-    return blockedIdentifiers.has(identifier);
-}
-
-/**
- * Clear validation failure records (for testing/maintenance)
- */
-function clearValidationTracking() {
-    validationFailures.clear();
-    blockedIdentifiers.clear();
-    console.log('✅ Validation tracking cleared');
-}
-
-// Periodic cleanup of old records (every 5 minutes)
-roomCleanupInterval = setInterval(() => {
-    const now = Date.now();
-    let cleaned = 0;
-    
-    for (const [identifier, record] of validationFailures.entries()) {
-        if (now - record.lastFailure > VALIDATION_FAILURE_WINDOW) {
-            validationFailures.delete(identifier);
-            cleaned++;
-        }
-    }
-    
-    if (cleaned > 0) {
-        logger.info(`🧹 Cleaned ${cleaned} expired validation failure records`);
-    }
-}, 300000);
-
 
 // ============================================================================
 // OUTPUT SANITIZATION (XSS Prevention)
@@ -795,6 +720,7 @@ app.post('/api/auth/login', async (req, res) => {
         
         if (error) {
             const errorDetails = error.details.map(d => d.message).join('; ');
+            trackValidationFailure(req.ip, 'login', errorDetails);  // ← ADD THIS LINE
             logger.warn(`[SECURITY] Validation failed for login from ${req.ip}: ${errorDetails}`);
             return res.status(400).json({ 
                 success: false, 
@@ -3481,6 +3407,7 @@ app.get('/api/balance/:wallet', async (req, res) => {
         
         if (error) {
             const errorDetails = error.details.map(d => d.message).join('; ');
+            trackValidationFailure(req.ip, 'balance', errorDetails);  // ← ADD THIS LINE
             logger.warn(`[SECURITY] Validation failed for balance from ${req.ip}: ${errorDetails}`);
             return res.status(400).json({ 
                 success: false, 
@@ -3510,6 +3437,7 @@ app.get('/api/payment/:paymentId', async (req, res) => {
         
         if (error) {
             const errorDetails = error.details.map(d => d.message).join('; ');
+            trackValidationFailure(req.ip, 'payment', errorDetails);  // ← ADD THIS LINE
             logger.warn(`[SECURITY] Validation failed for payment from ${req.ip}: ${errorDetails}`);
             return res.status(400).json({ 
                 success: false, 
