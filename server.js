@@ -42,15 +42,63 @@ const Joi = require('joi');
 const logger = require('./logger');
 const { httpRequestLogger, socketLogger, errorHandler } = require('./middleware/requestLogger');
 const { SecurityLogger, AuditLogger, PerformanceLogger } = require('./utils/securityLogger');
-const { 
-    alertManager, 
-    trackFailedLogin, 
+const {
+    alertManager,
+    trackFailedLogin,
     trackRateLimitViolation,
     trackValidationFailure,
     trackRecaptchaFailure,
     trackBotSuspicion,
-    trackFailedTransaction 
+    trackFailedTransaction
 } = require('./config/alerts');
+
+// ============================================================================
+// RACE CONDITION MONITORING METRICS
+// ============================================================================
+const raceConditionMetrics = {
+    totalAttempts: 0,
+    totalRetries: 0,
+    maxRetriesExceeded: 0,
+    lastResetTime: Date.now(),
+    byHandler: {} // Track metrics per handler
+};
+
+// Log metrics every 5 minutes
+setInterval(() => {
+    if (raceConditionMetrics.totalAttempts > 0) {
+        const retryRate = raceConditionMetrics.totalRetries / raceConditionMetrics.totalAttempts;
+        logger.info('Race condition metrics:', {
+            totalAttempts: raceConditionMetrics.totalAttempts,
+            totalRetries: raceConditionMetrics.totalRetries,
+            maxRetriesExceeded: raceConditionMetrics.maxRetriesExceeded,
+            retryRate: (retryRate * 100).toFixed(2) + '%',
+            byHandler: raceConditionMetrics.byHandler
+        });
+
+        // Alert if retry rate is high
+        if (retryRate > 0.1) {  // More than 10% retry rate
+            logger.warn(`⚠️ High race condition retry rate: ${(retryRate * 100).toFixed(2)}%`);
+        }
+
+        // Alert if max retries exceeded
+        if (raceConditionMetrics.maxRetriesExceeded > 0) {
+            logger.error(`❌ Max retries exceeded ${raceConditionMetrics.maxRetriesExceeded} times!`);
+            alertManager.sendAlert({
+                severity: 'high',
+                category: 'race_condition',
+                message: `Race condition max retries exceeded ${raceConditionMetrics.maxRetriesExceeded} times`,
+                details: raceConditionMetrics
+            });
+        }
+
+        // Reset metrics
+        raceConditionMetrics.totalAttempts = 0;
+        raceConditionMetrics.totalRetries = 0;
+        raceConditionMetrics.maxRetriesExceeded = 0;
+        raceConditionMetrics.byHandler = {};
+        raceConditionMetrics.lastResetTime = Date.now();
+    }
+}, 5 * 60 * 1000);  // Every 5 minutes
 
 // ============================================================================
 // INPUT VALIDATION SECURITY MODULE
@@ -2272,14 +2320,23 @@ io.on('connection', (socket) => {
 
                     const roomId = generateRoomId();
                     await createGameRoom(roomId, betAmount, 'waiting');
-                    let room = await getGameRoom(roomId);
-                    room.players.push({
-                        id: socket.id,
-                        username: walletAddress,
-                        score: 0,
-                        totalResponseTime: 0
-                    });
-                    await updateGameRoom(roomId, room);
+
+                    // ✅ ATOMIC ROOM UPDATE to prevent race conditions
+                    try {
+                        await atomicRoomUpdate(roomId, async (room) => {
+                            room.players.push({
+                                id: socket.id,
+                                username: walletAddress,
+                                score: 0,
+                                totalResponseTime: 0
+                            });
+                            return room;
+                        });
+                    } catch (error) {
+                        logger.error(`Failed to add player to room ${roomId}:`, error);
+                        socket.emit('joinGameFailure', 'Failed to join game room');
+                        return;
+                    }
 
                     socket.join(roomId);
                     socket.roomId = roomId;  // FIXED: Store roomId on socket for O(1) disconnect cleanup
@@ -2289,11 +2346,11 @@ io.on('connection', (socket) => {
                     await logGameRoomsState();
                 } else if (event === 'playerReady') {
                     const { roomId, preferredMode, recaptchaToken } = args[0];
-                    
+
                     // ✅ NEW: Rate limit playerReady to prevent DoS
                     const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                     await rateLimitEvent(socket.user.walletAddress, 'playerReady', clientIP, socket);
-                    
+
                     const { error } = playerReadySchema.validate({ roomId, preferredMode, recaptchaToken });
                     if (error) {
                         const sanitized = sanitizeValidationError(error, 'playerReady');
@@ -2302,20 +2359,26 @@ io.on('connection', (socket) => {
                     }
 
                     logger.info(`Player ${socket.id} ready in room ${roomId}, preferred mode: ${preferredMode || 'not specified'}`);
-                    let room = await getGameRoom(roomId);
 
-                    if (!room) {
+                    // ===== VALIDATION: Read room and validate player (before any modifications) =====
+                    let initialRoom = await getGameRoom(roomId);
+                    if (!initialRoom) {
                         logger.error(`Room ${roomId} not found when player ${socket.id} marked ready`);
                         socket.emit('gameError', 'Room not found');
                         return;
                     }
 
-                    const player = room.players.find(p => p.id === socket.id);
+                    const player = initialRoom.players.find(p => p.id === socket.id);
                     if (!player) {
                         socket.emit('gameError', 'Player not found in room');
                         return;
                     }
                     const username = player.username;
+
+                    if (initialRoom.roomMode === 'bot') {
+                        logger.info(`Room ${roomId} is set for bot play, not starting regular game`);
+                        return;
+                    }
 
                     // Device fingerprint check
                     const user = await User.findOne({ walletAddress: username });
@@ -2339,75 +2402,114 @@ io.on('connection', (socket) => {
                     // BotDetector integration
                     botDetector.trackEvent(username, 'player_ready', { preferredMode, roomId });
 
-                    if (room.roomMode === 'bot') {
-                        logger.info(`Room ${roomId} is set for bot play, not starting regular game`);
-                        return;
-                    }
+                    // ===== ATOMIC OPERATIONS BASED ON GAME MODE =====
 
                     if (preferredMode === 'human') {
-                        room.roomMode = 'human';
-                        await updateGameRoom(roomId, room);
+                        // ✅ ATOMIC: Set room mode to 'human'
+                        let updatedRoom;
+                        try {
+                            updatedRoom = await atomicRoomUpdate(roomId, async (room) => {
+                                room.roomMode = 'human';
+                                return room;
+                            });
+                        } catch (error) {
+                            logger.error(`Failed to set room mode for ${roomId}:`, error);
+                            socket.emit('gameError', 'Failed to update room');
+                            return;
+                        }
                         logger.info(`Room ${roomId} marked for human vs human play`);
 
-                        if (room.players.length === 1) {
+                        // ===== MATCHMAKING LOGIC (if single player) =====
+                        if (updatedRoom.players.length === 1) {
                             let matchFound = false;
 
                             // ✅ FIXED: O(1) lookup instead of O(N) scanKeys
-                            const otherRoomId = await getWaitingRoom(room.betAmount);
-                            
+                            const otherRoomId = await getWaitingRoom(updatedRoom.betAmount);
+
                             if (otherRoomId && otherRoomId !== roomId) {
+                                // Validate other room before attempting match
                                 const otherRoom = await getGameRoom(otherRoomId);
                                 if (
                                     otherRoom &&
                                     otherRoom.roomMode === 'human' &&
                                     !otherRoom.gameStarted &&
-                                    otherRoom.betAmount === room.betAmount &&
+                                    otherRoom.betAmount === updatedRoom.betAmount &&
                                     otherRoom.players.length === 1
                                 ) {
                                     logger.info(`Found matching room ${otherRoomId} for player in room ${roomId} (O(1) lookup)`);
-                                    const player = room.players[0];
-                                    otherRoom.players.push(player);
-                                    await updateGameRoom(otherRoomId, otherRoom);
 
-                                    socket.leave(roomId);
-                                    if (roomId === socket.roomId) socket.roomId = null;
-                                    socket.join(otherRoomId);
-                                    socket.roomId = otherRoomId;
+                                    // ✅ ATOMIC: Add player to other room and start game
+                                    try {
+                                        const playerToMove = updatedRoom.players[0];
+                                        await atomicRoomUpdate(otherRoomId, async (otherRoom) => {
+                                            // Add player from current room
+                                            otherRoom.players.push(playerToMove);
 
-                                    socket.emit('matchFound', { newRoomId: otherRoomId });
-                                    io.to(otherRoomId).emit('playerJoined', player.username);
+                                            // Start the game
+                                            otherRoom.gameStarted = true;
 
-                                    otherRoom.gameStarted = true;
-                                    await updateGameRoom(otherRoomId, otherRoom);
-                                    await startGame(otherRoomId);
+                                            return otherRoom;
+                                        });
 
-                                    // ✅ Clean up both rooms from waiting index
-                                    await removeWaitingRoom(room.betAmount, roomId);
-                                    await removeWaitingRoom(room.betAmount, otherRoomId);
-                                    await deleteGameRoom(roomId);
-                                    matchFound = true;
+                                        // POST-TRANSACTION: Socket operations and cleanup
+                                        socket.leave(roomId);
+                                        if (roomId === socket.roomId) socket.roomId = null;
+                                        socket.join(otherRoomId);
+                                        socket.roomId = otherRoomId;
+
+                                        socket.emit('matchFound', { newRoomId: otherRoomId });
+                                        io.to(otherRoomId).emit('playerJoined', playerToMove.username);
+
+                                        await startGame(otherRoomId);
+
+                                        // ✅ Clean up both rooms from waiting index
+                                        await removeWaitingRoom(updatedRoom.betAmount, roomId);
+                                        await removeWaitingRoom(updatedRoom.betAmount, otherRoomId);
+                                        await deleteGameRoom(roomId);
+                                        matchFound = true;
+
+                                    } catch (error) {
+                                        logger.error(`Failed to match rooms ${roomId} and ${otherRoomId}:`, error);
+                                        // Fall through to add current room to waiting list
+                                    }
                                 } else {
                                     // Other room invalid/gone, remove from index and add current room
                                     logger.info(`Waiting room ${otherRoomId} no longer valid, replacing with ${roomId}`);
-                                    await removeWaitingRoom(room.betAmount, otherRoomId);
-                                    await addWaitingRoom(room.betAmount, roomId);
+                                    await removeWaitingRoom(updatedRoom.betAmount, otherRoomId);
+                                    await addWaitingRoom(updatedRoom.betAmount, roomId);
                                 }
-                            } else {
+                            }
+
+                            if (!matchFound && !otherRoomId) {
                                 // No waiting room found, add this one to index
-                                await addWaitingRoom(room.betAmount, roomId);
+                                await addWaitingRoom(updatedRoom.betAmount, roomId);
                                 logger.info(`No match found for player in room ${roomId}, added to waiting index`);
                             }
                         }
                     }
 
-                    if (room.players.length === 2 && !room.gameStarted) {
-                        logger.info(`Starting multiplayer game in room ${roomId} with 2 players`);
-                        room.gameStarted = true;
-                        room.roomMode = 'multiplayer';
-                        await updateGameRoom(roomId, room);
-                        await startGame(roomId);
-                    } else {
-                        logger.info(`Room ${roomId} has ${room.players.length} players, waiting for more to join`);
+                    // ===== CHECK IF ROOM NOW HAS 2 PLAYERS (for direct joins) =====
+                    // Re-read room to check current state
+                    const finalRoom = await getGameRoom(roomId);
+                    if (finalRoom && finalRoom.players.length === 2 && !finalRoom.gameStarted) {
+                        // ✅ ATOMIC: Start multiplayer game
+                        try {
+                            await atomicRoomUpdate(roomId, async (room) => {
+                                // Double-check conditions inside atomic block
+                                if (room.players.length === 2 && !room.gameStarted) {
+                                    logger.info(`Starting multiplayer game in room ${roomId} with 2 players`);
+                                    room.gameStarted = true;
+                                    room.roomMode = 'multiplayer';
+                                }
+                                return room;
+                            });
+
+                            await startGame(roomId);
+                        } catch (error) {
+                            logger.error(`Failed to start multiplayer game in ${roomId}:`, error);
+                        }
+                    } else if (finalRoom) {
+                        logger.info(`Room ${roomId} has ${finalRoom.players.length} players, waiting for more to join`);
                     }
 
                     await logGameRoomsState();
@@ -2654,24 +2756,47 @@ io.on('connection', (socket) => {
 
                     // FIXED: First, check if player is in a room (using socket.roomId, no scan)
                     if (socket.roomId) {
-                        let existingRoom = await getGameRoom(socket.roomId);
-                        if (existingRoom) {
-                            const playerIndex = existingRoom.players.findIndex(p => p.id === socket.id);
-                            if (playerIndex !== -1) {
+                        const oldRoomId = socket.roomId;
+                        try {
+                            // ✅ ATOMIC ROOM UPDATE for existing room
+                            const result = await atomicRoomUpdate(oldRoomId, async (existingRoom) => {
+                                const playerIndex = existingRoom.players.findIndex(p => p.id === socket.id);
+                                if (playerIndex === -1) {
+                                    throw new Error('Player not in room');
+                                }
+
                                 playerData = existingRoom.players[playerIndex];
                                 playerBetAmount = existingRoom.betAmount;
                                 playerFound = true;
-                                logger.info(`Found player ${playerData.username} in room ${socket.roomId} with bet ${playerBetAmount}`);
+                                logger.info(`Found player ${playerData.username} in room ${oldRoomId} with bet ${playerBetAmount}`);
+
                                 existingRoom.players.splice(playerIndex, 1);
-                                socket.leave(socket.roomId);
-                                socket.roomId = null;  // FIXED: Clear roomId
-                                if (existingRoom.players.length === 0) {
-                                    await deleteGameRoom(socket.roomId);
-                                    logger.info(`Deleted empty room ${socket.roomId}`);
-                                } else {
-                                    await updateGameRoom(socket.roomId, existingRoom);
-                                    io.to(socket.roomId).emit('playerLeft', playerData.username);
-                                }
+
+                                // Store metadata
+                                existingRoom._switchMetadata = {
+                                    isEmpty: existingRoom.players.length === 0,
+                                    playerUsername: playerData.username
+                                };
+
+                                return existingRoom;
+                            });
+
+                            // POST-TRANSACTION: Socket operations
+                            socket.leave(oldRoomId);
+                            socket.roomId = null;
+
+                            const metadata = result._switchMetadata;
+                            if (metadata.isEmpty) {
+                                await deleteGameRoom(oldRoomId);
+                                logger.info(`Deleted empty room ${oldRoomId}`);
+                            } else {
+                                io.to(oldRoomId).emit('playerLeft', metadata.playerUsername);
+                            }
+                        } catch (error) {
+                            if (error.message.includes('not found') || error.message === 'Player not in room') {
+                                logger.info(`Player ${socket.id} not found in room ${oldRoomId}`);
+                            } else {
+                                throw error;
                             }
                         }
                     }
@@ -2712,25 +2837,27 @@ io.on('connection', (socket) => {
 
                     // Create a new game room in Redis
                     await createGameRoom(newRoomId, playerBetAmount, 'bot');
-                    let room = await getGameRoom(newRoomId);
-                    if (!room) {
-                        logger.error(`Failed to create or retrieve room ${newRoomId}`);
+
+                    // ✅ ATOMIC ROOM UPDATE for adding player to new room
+                    try {
+                        await atomicRoomUpdate(newRoomId, async (room) => {
+                            // Add player to the room
+                            room.players.push({
+                                id: socket.id,
+                                username: playerIdentifier,
+                                score: 0,
+                                totalResponseTime: 0,
+                                answered: false,
+                                lastAnswer: null
+                            });
+
+                            return room;
+                        });
+                    } catch (error) {
+                        logger.error(`Failed to add player to room ${newRoomId}:`, error);
                         socket.emit('matchmakingError', { message: 'Failed to create bot game room' });
                         return;
                     }
-
-                    // Add player to the room
-                    room.players.push({
-                        id: socket.id,
-                        username: playerIdentifier,
-                        score: 0,
-                        totalResponseTime: 0,
-                        answered: false,
-                        lastAnswer: null
-                    });
-
-                    // Update the room in Redis
-                    await updateGameRoom(newRoomId, room);
 
                     socket.join(newRoomId);
                     socket.roomId = newRoomId;  // FIXED: Set roomId on socket
@@ -2768,7 +2895,7 @@ io.on('connection', (socket) => {
                         // Rate limit leaveRoom to prevent spam
                         const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                         await rateLimitEvent(socket.user.walletAddress, 'leaveRoom', clientIP, socket);
-                        
+
                         const { error } = leaveRoomSchema.validate({ roomId });
                         if (error) {
                             const sanitized = sanitizeValidationError(error, 'leaveRoom');
@@ -2778,38 +2905,59 @@ io.on('connection', (socket) => {
 
                         logger.info(`Player ${socket.id} requested to leave room ${roomId}`);
 
-                        let room = await getGameRoom(roomId);
-                        if (!room) {
-                            logger.info(`Room ${roomId} not found when player tried to leave`);
-                            socket.emit('leftRoom', { roomId });
-                            return;
-                        }
+                        // ✅ ATOMIC ROOM UPDATE to prevent race conditions
+                        try {
+                            const result = await atomicRoomUpdate(roomId, async (room) => {
+                                if (room.gameStarted) {
+                                    throw new Error('Game already started');
+                                }
 
-                        if (room.gameStarted) {
-                            logger.info(`Game already started in room ${roomId}, handling as disconnect`);
-                            return;
-                        }
+                                const playerIndex = room.players.findIndex(p => p.id === socket.id);
+                                if (playerIndex === -1) {
+                                    throw new Error('Player not in room');
+                                }
 
-                        const playerIndex = room.players.findIndex(p => p.id === socket.id);
-                        if (playerIndex !== -1) {
-                            const player = room.players[playerIndex];
-                            logger.info(`Removing player ${player.username} from room ${roomId}`);
-                            room.players.splice(playerIndex, 1);
+                                const player = room.players[playerIndex];
+                                logger.info(`Removing player ${player.username} from room ${roomId}`);
+                                room.players.splice(playerIndex, 1);
 
+                                // Store metadata for post-transaction actions
+                                room._leaveMetadata = {
+                                    playerUsername: player.username,
+                                    isEmpty: room.players.length === 0
+                                };
+
+                                return room;
+                            });
+
+                            // POST-TRANSACTION: Socket operations
                             socket.leave(roomId);
-                            if (roomId === socket.roomId) socket.roomId = null;  // FIXED: Clear roomId if matching
+                            if (roomId === socket.roomId) socket.roomId = null;
 
-                            if (room.players.length === 0) {
+                            const metadata = result._leaveMetadata;
+                            if (metadata.isEmpty) {
                                 logger.info(`Room ${roomId} is now empty, deleting it`);
                                 await deleteGameRoom(roomId);
                             } else {
-                                await updateGameRoom(roomId, room);
                                 logger.info(`Notifying remaining players in room ${roomId}`);
-                                io.to(roomId).emit('playerLeft', player.username);
+                                io.to(roomId).emit('playerLeft', metadata.playerUsername);
+                            }
+
+                        } catch (error) {
+                            if (error.message === 'Game already started') {
+                                logger.info(`Game already started in room ${roomId}, handling as disconnect`);
+                                return;
+                            }
+                            if (error.message === 'Player not in room') {
+                                logger.info(`Player ${socket.id} not in room ${roomId}`);
+                            } else if (error.message.includes('not found')) {
+                                logger.info(`Room ${roomId} not found when player tried to leave`);
+                            } else {
+                                throw error;
                             }
                         }
-                        
-                        // ✅ NEW: Clear matchmaking ref if somehow set (edge case)
+
+                        // ✅ Clear matchmaking ref if somehow set (edge case)
                         socket.matchmakingPool = null;
 
                         socket.emit('leftRoom', { roomId });
@@ -2929,259 +3077,212 @@ io.on('connection', (socket) => {
 
                         console.log(`Received answer from ${authenticatedUsername} in room ${roomId} for question ${questionId}:`, { answer });
 
-                        // ===== 3. ROOM & QUESTION VALIDATION =====
-                        let room = await getGameRoom(roomId);
-                        if (!room) {
-                            logger.error(`Room ${roomId} not found for answer submission`);
-                            socket.emit('answerError', 'Room not found');
-                            return;
-                        }
+                        // ===== 3. ATOMIC ROOM UPDATE WITH RACE CONDITION PROTECTION =====
+                        try {
+                            const updatedRoom = await atomicRoomUpdate(roomId, async (room) => {
+                                // All validation and updates happen inside atomic block
 
-                        if (!room.questions || room.questions.length === 0) {
-                            logger.error(`Room ${roomId} has no questions`);
-                            socket.emit('answerError', 'Game not properly initialized');
-                            return;
-                        }
-
-                        if (!room.questionStartTime || room.currentQuestionIndex >= room.questions.length) {
-                            logger.error(`No active question in room ${roomId} when ${authenticatedUsername} submitted answer`);
-                            socket.emit('answerError', 'No active question');
-                            return;
-                        }
-
-                        const currentQuestion = room.questionIdMap.get(questionId);
-                        if (!currentQuestion) {
-                            logger.error(`No current question for room ${roomId}`);
-                            socket.emit('answerError', 'No active question');
-                            return;
-                        }
-
-                        // ✅ Check if question exists in the map (more reliable than array index)
-                        const questionData = room.questionIdMap.get(questionId);
-                        if (!questionData) {
-                            logger.error(`Question ${questionId} not found in room ${roomId} questionIdMap`);
-                            socket.emit('answerError', 'Invalid question ID');
-                            return;
-                        }
-
-                        // ✅ Verify it's the current question (allowing for timing edge cases)
-                        if (questionId !== currentQuestion.tempId) {
-                            // Check if this is a late answer from previous question
-                            const questionIndex = room.questions.findIndex(q => q.tempId === questionId);
-                            if (questionIndex !== -1 && questionIndex < room.currentQuestionIndex) {
-                                logger.info(`Player ${authenticatedUsername} submitted late answer for previous question ${questionId}`);
-                                socket.emit('answerError', 'Question expired');
-                                return;
-                            }
-                            
-                            logger.error(`Invalid question ${questionId} for room ${roomId} (expected ${currentQuestion.tempId})`);
-                            socket.emit('answerError', 'Invalid question');
-                            return;
-                        }
-
-                        const player = room.players.find(p => p.username === authenticatedUsername && !p.isBot);
-                        if (!player) {
-                            logger.error(`Player ${authenticatedUsername} not found in room ${roomId} or is a bot`);
-                            socket.emit('answerError', 'Player not found');
-                            return;
-                        }
-
-                        if (player.answered) {
-                            logger.info(`Player ${authenticatedUsername} already answered this question`);
-                            socket.emit('answerError', 'Already answered');
-                            return;
-                        }
-
-                        // ============================================================================
-                        // CRITICAL: Mark player as answered IMMEDIATELY to prevent race condition
-                        // This prevents the timeout handler from marking this player as timed out
-                        // while we're doing async verification (reCAPTCHA, etc.)
-                        // We'll update the actual answer and score later after verification
-                        // ============================================================================
-                        player.answered = true; // Mark NOW before any async operations
-
-                        // ===== 4. TIMING VALIDATION =====
-                        const serverResponseTime = Date.now() - room.questionStartTime;
-                        if (serverResponseTime < 200 || serverResponseTime > 15000) {
-                            logger.warn(`Invalid response time ${serverResponseTime}ms from ${authenticatedUsername} in room ${roomId}`);
-                            // Redis operation wrapped in safeRedisOp
-                            await redisClient.set(`suspect:${authenticatedUsername}`, 1, 'EX', 3600);
-                            socket.emit('answerError', 'Invalid response timing');
-                            return;
-                        }
-
-                        // ===== 5. BOT DETECTION =====
-                        const botSuspicion = botDetector.getSuspicionScore(authenticatedUsername);
-                        SecurityLogger.botSuspicion(authenticatedUsername, botSuspicion, 'submitAnswer', 0.7);
-                        if (botSuspicion >= 0.8) {
-                            trackBotSuspicion(authenticatedUsername, { score: botSuspicion, event: 'submitAnswer' });
-                        }
-
-                        // ===== 6. RECAPTCHA VERIFICATION (ENVIRONMENT-AWARE) =====
-                        const isProduction = process.env.NODE_ENV === 'production';
-                        let recaptchaResult = null;
-
-                        if (isProduction) {
-                            // PRODUCTION: ALWAYS require reCAPTCHA (no exceptions)
-                            if (!recaptchaToken) {
-                                logger.error(`Missing reCAPTCHA token from ${authenticatedUsername} in PRODUCTION`);
-                                socket.emit('answerError', 'Verification required');
-                                return;
-                            }
-
-                            try {
-                                recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                                logger.info(`reCAPTCHA verified for ${authenticatedUsername} (score: ${recaptchaResult.score || 'N/A'})`);
-
-                                // Check score threshold (v3 only)
-                                if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
-                                    logger.warn(`Low reCAPTCHA score ${recaptchaResult.score} for ${authenticatedUsername}`);
-                                    botDetector.trackEvent(authenticatedUsername, 'low_recaptcha_score', { 
-                                        score: recaptchaResult.score,
-                                        event: 'submitAnswer'
-                                    });
-                                    socket.emit('answerError', 'Suspicious activity detected. Please try again.');
-                                    return;
+                                // Room validation
+                                if (!room.questions || room.questions.length === 0) {
+                                    throw new Error('Game not properly initialized');
                                 }
-                            } catch (error) {
-                                SecurityLogger.recaptchaFailed(authenticatedUsername, error.message, null, socket.handshake.headers['x-forwarded-for'] || socket.handshake.address);
-                        trackRecaptchaFailure(authenticatedUsername, { error: error.message });
-                                
-                                // Track failed attempt for rate limiting
-                                // Redis operation wrapped in safeRedisOp
-                                const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                                try {
-                                    await rateLimitFailedRecaptcha(clientIP);
-                                } catch (rateError) {
-                                    console.warn(`reCAPTCHA rate limit hit for IP ${clientIP}:`, rateError.message);
-                                    socket.emit('answerError', 'Too many failed verification attempts. Please try again later.');
-                                    return;
+
+                                if (!room.questionStartTime || room.currentQuestionIndex >= room.questions.length) {
+                                    throw new Error('No active question');
                                 }
-                                socket.emit('answerError', 'Verification failed. Please try again.');
-                                return;
-                            }
-                        } else if (process.env.ENABLE_RECAPTCHA === 'true') {
-                            // DEVELOPMENT: Optional reCAPTCHA (for testing)
-                            if (recaptchaToken) {
-                                try {
-                                    recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                                    logger.info(`✅ Dev reCAPTCHA verified (score: ${recaptchaResult.score || 'N/A'})`);
-                                    
-                                    // Still check score in dev for testing
-                                    if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
-                                        logger.warn(`⚠️ Low score in dev: ${recaptchaResult.score} (allowing anyway)`);
+
+                                const currentQuestion = room.questionIdMap.get(questionId);
+                                if (!currentQuestion) {
+                                    throw new Error('Invalid question ID');
+                                }
+
+                                const questionData = room.questionIdMap.get(questionId);
+                                if (!questionData) {
+                                    throw new Error('Question not found in map');
+                                }
+
+                                if (questionId !== currentQuestion.tempId) {
+                                    const questionIndex = room.questions.findIndex(q => q.tempId === questionId);
+                                    if (questionIndex !== -1 && questionIndex < room.currentQuestionIndex) {
+                                        throw new Error('Question expired');
                                     }
-                                } catch (error) {
-                                    logger.warn(`⚠️ Dev reCAPTCHA failed (allowing anyway): ${error.message}`);
+                                    throw new Error('Invalid question');
                                 }
-                            } else {
-                                logger.info(`🔓 Dev mode - no reCAPTCHA token provided`);
-                            }
-                        } else {
-                            // DEVELOPMENT: reCAPTCHA disabled
-                            logger.info(`🔓 Dev mode - reCAPTCHA disabled for ${authenticatedUsername}`);
-                        }
 
-                        // ===== 7. DEVICE FINGERPRINT CHECK (RISK-BASED) =====
-                        const user = await User.findOne({ walletAddress: authenticatedUsername });
-                        if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint) {
-                            SecurityLogger.deviceMismatch(authenticatedUsername, user.deviceFingerprint, socket.user.fingerprint, { event: 'submitAnswer' });
-                            botDetector.trackEvent(authenticatedUsername, 'fingerprint_mismatch', { event: 'submitAnswer' });
-                            
-                            // In production, if reCAPTCHA score is also suspicious = likely bot attack
-                            if (isProduction && recaptchaResult && recaptchaResult.score !== undefined && recaptchaResult.score < 0.7) {
-                                logger.error(`Device mismatch + low reCAPTCHA score (${recaptchaResult.score}) for ${authenticatedUsername}`);
-                                socket.emit('answerError', 'Device verification failed. Please relogin.');
-                                return;
-                            }
-                            
-                            // In development or if score is high, just log and continue
-                            logger.info(`Allowing fingerprint mismatch (production: ${isProduction}, score: ${recaptchaResult?.score || 'N/A'})`);
-                        }
-
-                        // ===== 8. HIGH-WIN STREAK CHECK (USES STORED RESULT) =====
-                        if (user && user.gamesPlayed > 5 && (user.wins / user.gamesPlayed) > 0.8) {
-                            // FIXED: Use stored recaptchaResult instead of re-verifying
-                            if (isProduction) {
-                                // In production, reCAPTCHA already verified above
-                                if (!recaptchaResult || !recaptchaResult.success) {
-                                    logger.error(`High-win player ${authenticatedUsername} failed verification`);
-                                    socket.emit('answerError', 'Additional verification required due to high win rate.');
-                                    return;
+                                const player = room.players.find(p => p.username === authenticatedUsername && !p.isBot);
+                                if (!player) {
+                                    throw new Error('Player not found');
                                 }
-                                logger.info(`High-win verification passed for ${authenticatedUsername} (score: ${recaptchaResult.score})`);
-                            } else if (process.env.ENABLE_RECAPTCHA === 'true' && !recaptchaToken) {
-                                // In dev with reCAPTCHA enabled, require token for high-win players
-                                logger.warn(`High-win player ${authenticatedUsername} in dev without reCAPTCHA`);
-                                socket.emit('answerError', 'Verification required for high win rate players.');
-                                return;
-                            }
-                        }
 
-                        // ===== 9. PROCESS ANSWER =====
-                        logger.info(`SERVER CALCULATED: ${authenticatedUsername} response time: ${serverResponseTime}ms`);
+                                if (player.answered) {
+                                    throw new Error('Already answered');
+                                }
 
-                        const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
-                        // Note: player.answered was already set to true earlier to prevent race condition
-                        player.lastAnswer = answer;
-                        player.lastResponseTime = serverResponseTime;
-                        player.totalResponseTime = (player.totalResponseTime || 0) + serverResponseTime;
+                                // Timing validation
+                                const serverResponseTime = Date.now() - room.questionStartTime;
+                                if (serverResponseTime < 200 || serverResponseTime > 15000) {
+                                    logger.warn(`Invalid response time ${serverResponseTime}ms from ${authenticatedUsername}`);
+                                    await redisClient.set(`suspect:${authenticatedUsername}`, 1, 'EX', 3600);
+                                    throw new Error('Invalid response timing');
+                                }
 
-                        if (isCorrect) {
-                            player.score = (player.score || 0) + 1;
-                            logger.info(`Correct answer from ${authenticatedUsername}. New score: ${player.score}`);
-                            try {
-                                await User.findOneAndUpdate(
-                                    { walletAddress: authenticatedUsername },
-                                    {
-                                        $inc: {
-                                            correctAnswers: 1,
-                                            totalPoints: 1
+                                // Bot detection
+                                const botSuspicion = botDetector.getSuspicionScore(authenticatedUsername);
+                                SecurityLogger.botSuspicion(authenticatedUsername, botSuspicion, 'submitAnswer', 0.7);
+                                if (botSuspicion >= 0.8) {
+                                    trackBotSuspicion(authenticatedUsername, { score: botSuspicion, event: 'submitAnswer' });
+                                }
+
+                                // reCAPTCHA verification
+                                const isProduction = process.env.NODE_ENV === 'production';
+                                let recaptchaResult = null;
+
+                                if (isProduction) {
+                                    if (!recaptchaToken) {
+                                        throw new Error('Verification required');
+                                    }
+                                    try {
+                                        recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                                        if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
+                                            botDetector.trackEvent(authenticatedUsername, 'low_recaptcha_score', {
+                                                score: recaptchaResult.score,
+                                                event: 'submitAnswer'
+                                            });
+                                            throw new Error('Verification failed');
                                         }
+                                    } catch (error) {
+                                        SecurityLogger.recaptchaFailed(authenticatedUsername, error.message, null, clientIP);
+                                        trackRecaptchaFailure(authenticatedUsername, { error: error.message });
+
+                                        try {
+                                            await rateLimitFailedRecaptcha(clientIP);
+                                        } catch (rateError) {
+                                            throw new Error('Too many failed verification attempts. Please try again later.');
+                                        }
+                                        throw new Error('Verification failed');
                                     }
-                                );
-                            } catch (error) {
-                                logger.error('Error updating user stats:', { error: error });
+                                } else if (process.env.ENABLE_RECAPTCHA === 'true' && recaptchaToken) {
+                                    try {
+                                        recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                                        if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
+                                            logger.warn(`⚠️ Low score in dev: ${recaptchaResult.score} (allowing anyway)`);
+                                        }
+                                    } catch (error) {
+                                        logger.warn(`⚠️ Dev reCAPTCHA failed (allowing anyway): ${error.message}`);
+                                    }
+                                }
+
+                                // Device fingerprint check
+                                const user = await User.findOne({ walletAddress: authenticatedUsername });
+                                if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint) {
+                                    SecurityLogger.deviceMismatch(authenticatedUsername, user.deviceFingerprint, socket.user.fingerprint, { event: 'submitAnswer' });
+                                    botDetector.trackEvent(authenticatedUsername, 'fingerprint_mismatch', { event: 'submitAnswer' });
+
+                                    if (isProduction && recaptchaResult && recaptchaResult.score !== undefined && recaptchaResult.score < 0.7) {
+                                        throw new Error('Device verification failed. Please relogin.');
+                                    }
+                                }
+
+                                // High-win streak check
+                                if (user && user.gamesPlayed > 5 && (user.wins / user.gamesPlayed) > 0.8) {
+                                    if (isProduction && (!recaptchaResult || !recaptchaResult.success)) {
+                                        throw new Error('Additional verification required due to high win rate.');
+                                    }
+                                }
+
+                                // ✅ PROCESS ANSWER (ATOMIC UPDATES)
+                                logger.info(`SERVER CALCULATED: ${authenticatedUsername} response time: ${serverResponseTime}ms`);
+
+                                const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
+
+                                // Mark as answered to prevent timeout handler
+                                player.answered = true;
+                                player.lastAnswer = answer;
+                                player.lastResponseTime = serverResponseTime;
+                                player.totalResponseTime = (player.totalResponseTime || 0) + serverResponseTime;
+
+                                if (isCorrect) {
+                                    player.score = (player.score || 0) + 1;
+                                    logger.info(`Correct answer from ${authenticatedUsername}. New score: ${player.score}`);
+                                }
+
+                                // ✅ CRITICAL: Increment answersReceived atomically with score update
+                                room.answersReceived += 1;
+
+                                // BotDetector tracking
+                                botDetector.trackEvent(authenticatedUsername, 'answer_submitted', {
+                                    responseTime: serverResponseTime,
+                                    isCorrect,
+                                    answer,
+                                    questionId,
+                                    recaptchaScore: recaptchaResult?.score
+                                });
+
+                                // Store metadata for post-transaction actions
+                                room._submitMetadata = {
+                                    username: authenticatedUsername,
+                                    isCorrect,
+                                    serverResponseTime,
+                                    recaptchaResult,
+                                    user
+                                };
+
+                                return room; // Return modified room for atomic commit
+                            });
+
+                            // ===== POST-TRANSACTION: Update MongoDB (non-critical) =====
+                            const metadata = updatedRoom._submitMetadata;
+                            if (metadata.isCorrect) {
+                                try {
+                                    await User.findOneAndUpdate(
+                                        { walletAddress: authenticatedUsername },
+                                        {
+                                            $inc: {
+                                                correctAnswers: 1,
+                                                totalPoints: 1
+                                            }
+                                        }
+                                    );
+                                } catch (error) {
+                                    logger.error('Error updating user stats (non-critical):', error);
+                                }
+                            }
+
+                            // ===== EMIT RESULTS =====
+                            socket.emit('answerResult', {
+                                username: authenticatedUsername,
+                                isCorrect: metadata.isCorrect,
+                                questionId,
+                                selectedAnswer: answer
+                            });
+
+                            socket.to(roomId).emit('playerAnswered', {
+                                username: authenticatedUsername,
+                                isBot: false,
+                                responseTime: metadata.serverResponseTime,
+                                timedOut: false
+                            });
+
+                            // Emit score update to all players
+                            io.to(roomId).emit('scoreUpdate', updatedRoom.players.map(p => ({
+                                username: p.username,
+                                score: p.score || 0,
+                                totalResponseTime: p.totalResponseTime || 0,
+                                isBot: p.isBot || false,
+                                difficulty: p.isBot ? p.difficultyLevelString : undefined
+                            })));
+
+                        } catch (error) {
+                            // Handle specific errors
+                            if (error.message.includes('Max retries')) {
+                                logger.error(`CRITICAL: Severe race condition in room ${roomId}:`, error);
+                                socket.emit('answerError', 'Server is busy. Please try again.');
+                            } else {
+                                logger.error(`Answer validation failed:`, error.message);
+                                socket.emit('answerError', error.message);
                             }
                         }
 
-                        // BotDetector integration
-                        botDetector.trackEvent(authenticatedUsername, 'answer_submitted', {
-                            responseTime: serverResponseTime,
-                            isCorrect,
-                            answer,
-                            questionId,
-                            recaptchaScore: recaptchaResult?.score
-                        });
-
-                        room.answersReceived += 1;
-                        await updateGameRoom(roomId, room);
-
-                        // ===== 10. EMIT RESULTS =====
-                        socket.emit('answerResult', {
-                            username: player.username,
-                            isCorrect,
-                            questionId,
-                            selectedAnswer: answer
-                        });
-
-                        socket.to(roomId).emit('playerAnswered', {
-                            username: authenticatedUsername,
-                            isBot: false,
-                            responseTime: serverResponseTime,
-                            timedOut: false
-                        });
-
-                        // Emit score update to all players in the room
-                        io.to(roomId).emit('scoreUpdate', room.players.map(p => ({
-                            username: p.username,
-                            score: p.score || 0,
-                            totalResponseTime: p.totalResponseTime || 0,
-                            isBot: p.isBot || false,
-                            difficulty: p.isBot ? p.difficultyLevelString : undefined
-                        })));
-
-                        // Do not call completeQuestion here; wait for the timeout
                     } catch (error) {
                         const sanitized = sanitizeError(error, 'submitAnswer', 'Error submitting answer. Please try again.');
                         socket.emit('answerError', sanitized);
@@ -4439,6 +4540,121 @@ async function updateGameRoom(roomId, room) {
     // Redis health auto-managed by ioredis
         throw error;
     }
+}
+
+// ============================================================================
+// CRITICAL FIX: Atomic Room Update with Optimistic Locking
+// ============================================================================
+/**
+ * Atomically update game room using Redis WATCH (optimistic locking)
+ * Prevents race conditions when multiple players modify room simultaneously
+ *
+ * @param {string} roomId - The room ID
+ * @param {function} updateFn - Function that receives room and returns modified room
+ * @param {number} maxRetries - Maximum number of retry attempts (default: 5)
+ * @returns {Object} Updated room data
+ * @throws {Error} If max retries exceeded or other error
+ */
+async function atomicRoomUpdate(roomId, updateFn, maxRetries = 5) {
+    let retries = 0;
+
+    // Track metrics
+    raceConditionMetrics.totalAttempts++;
+
+    while (retries < maxRetries) {
+        try {
+            // ✅ STEP 1: WATCH the room key before reading
+            await redisClient.watch(`room:${roomId}`);
+
+            // ✅ STEP 2: READ current room state
+            let room = await getGameRoom(roomId);
+
+            if (!room) {
+                await redisClient.unwatch();
+                throw new Error(`Room ${roomId} not found`);
+            }
+
+            // ✅ STEP 3: Apply modifications (updateFn can modify room in-place)
+            const updatedRoom = await updateFn(room);
+
+            // ✅ STEP 4: Prepare transaction (MULTI)
+            const multi = redisClient.multi();
+
+            // Serialize the updated room data (same logic as updateGameRoom)
+            const serializedQuestions = updatedRoom.questions.map(q => ({
+                tempId: q.tempId,
+                _id: q._id ? q._id.toString() : null,
+                question: q.question,
+                options: q.options,
+                correctAnswer: q.correctAnswer,
+                shuffledOptions: q.shuffledOptions || [],
+                shuffledCorrectAnswer: q.shuffledCorrectAnswer ?? -1
+            }));
+
+            const serializedMap = Array.from(updatedRoom.questionIdMap.entries()).map(([key, val]) => ({
+                key: key,
+                value: {
+                    tempId: val.tempId,
+                    _id: val._id ? val._id.toString() : null,
+                    question: val.question,
+                    options: val.options,
+                    correctAnswer: val.correctAnswer,
+                    shuffledOptions: val.shuffledOptions || [],
+                    shuffledCorrectAnswer: val.shuffledCorrectAnswer ?? -1
+                }
+            }));
+
+            const roomData = {
+                players: JSON.stringify(updatedRoom.players),
+                questions: JSON.stringify(serializedQuestions),
+                questionIdMap: JSON.stringify(serializedMap),
+                betAmount: updatedRoom.betAmount.toString(),
+                currentQuestionIndex: updatedRoom.currentQuestionIndex.toString(),
+                answersReceived: updatedRoom.answersReceived.toString(),
+                gameStarted: updatedRoom.gameStarted.toString(),
+                roomMode: updatedRoom.roomMode || '',
+                hasBot: updatedRoom.hasBot.toString(),
+                playerLeft: updatedRoom.playerLeft.toString(),
+                questionStartTime: updatedRoom.questionStartTime ? updatedRoom.questionStartTime.toString() : '',
+                roundStartTime: updatedRoom.roundStartTime ? updatedRoom.roundStartTime.toString() : '',
+                isDeleted: updatedRoom.isDeleted.toString()
+            };
+
+            multi.hset(`room:${roomId}`, roomData);
+            multi.expire(`room:${roomId}`, 3600);
+
+            // ✅ STEP 5: Execute transaction (EXEC)
+            const results = await multi.exec();
+
+            if (results === null) {
+                // ⚠️ RACE CONDITION DETECTED! Another request modified the room
+                retries++;
+                raceConditionMetrics.totalRetries++;
+                logger.warn(`Race condition detected in room ${roomId}, retry ${retries}/${maxRetries}`);
+
+                // Small exponential backoff to reduce contention
+                await new Promise(resolve => setTimeout(resolve, Math.random() * Math.pow(2, retries) * 10));
+                continue; // Retry the operation
+            }
+
+            // ✅ SUCCESS! Transaction committed atomically
+            if (retries > 0) {
+                logger.info(`Atomic update succeeded for room ${roomId} (retries: ${retries})`);
+            }
+            return updatedRoom;
+
+        } catch (error) {
+            await redisClient.unwatch();
+            logger.error(`Error in atomicRoomUpdate for room ${roomId}:`, error);
+            throw error;
+        }
+    }
+
+    // ❌ Max retries exceeded - this indicates severe contention
+    raceConditionMetrics.maxRetriesExceeded++;
+    const error = new Error(`Max retries (${maxRetries}) exceeded for room ${roomId} - severe race condition`);
+    logger.error(error.message);
+    throw error;
 }
 
 
