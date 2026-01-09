@@ -59,6 +59,7 @@ const raceConditionMetrics = {
     totalAttempts: 0,
     totalRetries: 0,
     maxRetriesExceeded: 0,
+    idempotencyKeyHits: 0, // NEW: Track duplicate submission attempts
     lastResetTime: Date.now(),
     byHandler: {} // Track metrics per handler
 };
@@ -71,6 +72,7 @@ setInterval(() => {
             totalAttempts: raceConditionMetrics.totalAttempts,
             totalRetries: raceConditionMetrics.totalRetries,
             maxRetriesExceeded: raceConditionMetrics.maxRetriesExceeded,
+            idempotencyKeyHits: raceConditionMetrics.idempotencyKeyHits,
             retryRate: (retryRate * 100).toFixed(2) + '%',
             byHandler: raceConditionMetrics.byHandler
         });
@@ -91,14 +93,58 @@ setInterval(() => {
             });
         }
 
+        // NEW: Alert if many duplicate submissions detected
+        if (raceConditionMetrics.idempotencyKeyHits > 10) {
+            logger.warn(`⚠️ Detected ${raceConditionMetrics.idempotencyKeyHits} duplicate submission attempts`);
+        }
+
         // Reset metrics
         raceConditionMetrics.totalAttempts = 0;
         raceConditionMetrics.totalRetries = 0;
         raceConditionMetrics.maxRetriesExceeded = 0;
+        raceConditionMetrics.idempotencyKeyHits = 0;
         raceConditionMetrics.byHandler = {};
         raceConditionMetrics.lastResetTime = Date.now();
     }
 }, 5 * 60 * 1000);  // Every 5 minutes
+
+// ============================================================================
+// ✅ CRITICAL FIX: IDEMPOTENCY KEY HELPER FUNCTIONS
+// ============================================================================
+/**
+ * Atomic idempotency check using Redis SET NX (Set if Not eXists)
+ * Prevents race conditions by ensuring only ONE request can claim this action
+ *
+ * @param {string} key - Unique idempotency key for this action
+ * @param {number} ttlSeconds - Time-to-live for the key (default: 30 seconds)
+ * @returns {Promise<boolean>} - true if lock acquired (first request), false if already claimed
+ */
+async function acquireIdempotencyLock(key, ttlSeconds = 30) {
+    try {
+        // SET key value NX EX ttl
+        // NX = Only set if key does NOT exist (atomic check-and-set)
+        // EX = Set expiration time in seconds
+        const result = await redisClient.set(key, '1', 'NX', 'EX', ttlSeconds);
+
+        // result will be 'OK' if lock acquired, null if key already exists
+        return result === 'OK';
+    } catch (error) {
+        logger.error('Error acquiring idempotency lock:', { key, error });
+        throw error;
+    }
+}
+
+/**
+ * Release idempotency lock (optional - usually we let it expire)
+ * @param {string} key - Idempotency key to release
+ */
+async function releaseIdempotencyLock(key) {
+    try {
+        await redisClient.del(key);
+    } catch (error) {
+        logger.error('Error releasing idempotency lock:', { key, error });
+    }
+}
 
 // ============================================================================
 // INPUT VALIDATION SECURITY MODULE
@@ -3141,6 +3187,26 @@ io.on('connection', (socket) => {
 
                         console.log(`Received answer from ${authenticatedUsername} in room ${roomId} for question ${questionId}:`, { answer });
 
+                        // ============================================================================
+                        // ✅ CRITICAL FIX: IDEMPOTENCY KEY - ACQUIRE LOCK BEFORE ANY EXPENSIVE WORK
+                        // ============================================================================
+                        // This prevents ALL race conditions by using Redis's atomic SET NX operation
+                        // Only ONE request can acquire this lock - all others are rejected immediately
+
+                        const idempotencyKey = `answer:${roomId}:${questionId}:${authenticatedUsername}`;
+                        const lockAcquired = await acquireIdempotencyLock(idempotencyKey, 30);
+
+                        if (!lockAcquired) {
+                            // This request is a duplicate - another request already claimed this answer
+                            raceConditionMetrics.idempotencyKeyHits++;
+                            logger.warn(`Duplicate answer submission blocked by idempotency key: ${authenticatedUsername} in room ${roomId} for question ${questionId}`);
+                            socket.emit('answerError', 'Already answered this question');
+                            return;
+                        }
+
+                        logger.info(`✅ Idempotency lock acquired for ${authenticatedUsername} - question ${questionId}`);
+                        // ============================================================================
+
                         // ===== 3. ATOMIC ROOM UPDATE WITH RACE CONDITION PROTECTION =====
                         try {
                             const updatedRoom = await atomicRoomUpdate(roomId, async (room) => {
@@ -3337,6 +3403,9 @@ io.on('connection', (socket) => {
                             })));
 
                         } catch (error) {
+                            // ✅ IMPORTANT: Release lock on error so user can retry if needed
+                            await releaseIdempotencyLock(idempotencyKey);
+
                             // Handle specific errors
                             if (error.message.includes('Max retries')) {
                                 logger.error(`CRITICAL: Severe race condition in room ${roomId}:`, error);
@@ -3348,6 +3417,8 @@ io.on('connection', (socket) => {
                         }
 
                     } catch (error) {
+                        // ✅ IMPORTANT: Release lock on outer error as well
+                        await releaseIdempotencyLock(idempotencyKey);
                         const sanitized = sanitizeError(error, 'submitAnswer', 'Error submitting answer. Please try again.');
                         socket.emit('answerError', sanitized);
                     }
@@ -3527,7 +3598,7 @@ io.on('connection', (socket) => {
 
                     socket.roomId = null;  // FIXED: Clear roomId
                 }
-            } else {
+            else {
                 logger.info(`No room associated with disconnected socket ${socket.id}`);
             }
         } catch (error) {
