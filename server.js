@@ -64,6 +64,15 @@ const raceConditionMetrics = {
     byHandler: {} // Track metrics per handler
 };
 
+// ============================================================================
+// ORPHANED PLAYER METRICS - Socket.roomId Desynchronization Recovery
+// ============================================================================
+const orphanedPlayerMetrics = {
+    totalOrphaned: 0,
+    totalRestored: 0,
+    lastResetTime: Date.now()
+};
+
 // Log metrics every 5 minutes
 setInterval(() => {
     if (raceConditionMetrics.totalAttempts > 0) {
@@ -105,6 +114,33 @@ setInterval(() => {
         raceConditionMetrics.idempotencyKeyHits = 0;
         raceConditionMetrics.byHandler = {};
         raceConditionMetrics.lastResetTime = Date.now();
+    }
+}, 5 * 60 * 1000);  // Every 5 minutes
+
+// Log orphaned player metrics every 5 minutes
+setInterval(() => {
+    if (orphanedPlayerMetrics.totalOrphaned > 0) {
+        logger.info('Orphaned player metrics:', {
+            totalOrphaned: orphanedPlayerMetrics.totalOrphaned,
+            totalRestored: orphanedPlayerMetrics.totalRestored,
+            restoreRate: ((orphanedPlayerMetrics.totalRestored / orphanedPlayerMetrics.totalOrphaned) * 100).toFixed(2) + '%'
+        });
+
+        // Alert if many orphaned players
+        if (orphanedPlayerMetrics.totalOrphaned > 10) {
+            logger.warn(`⚠️ High orphaned player count: ${orphanedPlayerMetrics.totalOrphaned}`);
+            alertManager.sendAlert({
+                severity: 'high',
+                category: 'orphaned_players',
+                message: `High orphaned player count detected: ${orphanedPlayerMetrics.totalOrphaned}`,
+                details: orphanedPlayerMetrics
+            });
+        }
+
+        // Reset metrics
+        orphanedPlayerMetrics.totalOrphaned = 0;
+        orphanedPlayerMetrics.totalRestored = 0;
+        orphanedPlayerMetrics.lastResetTime = Date.now();
     }
 }, 5 * 60 * 1000);  // Every 5 minutes
 
@@ -2237,25 +2273,77 @@ io.on('connection', (socket) => {
             
             // ===== SESSION VALID - RESTORE USER =====
             const user = await User.findOne({ walletAddress });
-            if (user) {
-                // Restore socket.user with fingerprint from session
-                socket.user = { 
-                    walletAddress,
-                    fingerprint: sessionData.fingerprint 
-                };
-                
-                // Join wallet-specific room for notifications
-                socket.join(`wallet:${walletAddress}`);
-                
-                logger.info(`[RECONNECT] ✓ Successful for ${walletAddress} (session age: ${Math.round((Date.now() - sessionData.timestamp)/1000)}s)`);
-                socket.emit('loginSuccess', {
-                    walletAddress: user.walletAddress,
-                    virtualBalance: user.virtualBalance || 0
-                });
-            } else {
+            if (!user) {
                 logger.warn(`[RECONNECT] User not found in database for ${walletAddress}`);
-                socket.emit('loginFailure', 'Wallet not found - please login again');
+                return socket.emit('loginFailure', 'Wallet not found - please login again');
             }
+
+            // Restore socket.user with fingerprint from session
+            socket.user = {
+                walletAddress,
+                fingerprint: sessionData.fingerprint
+            };
+
+            // Join wallet-specific room for notifications
+            socket.join(`wallet:${walletAddress}`);
+
+            // ===== NEW: CHECK FOR ACTIVE GAME ROOM =====
+            const activeGame = await findPlayerActiveRoom(walletAddress);
+
+            if (activeGame) {
+                const { roomId, room, player } = activeGame;
+
+                logger.info(`[RECONNECT] Found active game room ${roomId} for ${walletAddress}`);
+
+                try {
+                    // 1. Restore socket state
+                    socket.roomId = roomId;
+                    socket.join(roomId);
+
+                    // 2. Update player's socket ID in Redis (atomic)
+                    await atomicRoomUpdate(roomId, async (room) => {
+                        const playerIndex = room.players.findIndex(p => p.username === walletAddress);
+                        if (playerIndex !== -1) {
+                            const oldSocketId = room.players[playerIndex].id;
+                            room.players[playerIndex].id = socket.id;
+
+                            logger.info(`[RECONNECT] Updated socket ID: ${oldSocketId} → ${socket.id}`);
+                        }
+                        return room;
+                    });
+
+                    // 3. Track restored player in metrics
+                    orphanedPlayerMetrics.totalRestored++;
+
+                    // 4. Notify client to restore game UI
+                    socket.emit('gameStateRestore', {
+                        roomId,
+                        currentQuestionIndex: room.currentQuestionIndex,
+                        gameStarted: room.gameStarted,
+                        players: room.players,
+                        betAmount: room.betAmount,
+                        roomMode: room.roomMode,
+                        playerData: {
+                            score: player.score || 0,
+                            totalResponseTime: player.totalResponseTime || 0
+                        }
+                    });
+
+                    logger.info(`[RECONNECT] ✅ Restored game state for ${walletAddress} in room ${roomId}`);
+
+                } catch (error) {
+                    logger.error(`[RECONNECT] Failed to restore game room ${roomId}:`, error);
+                    // Continue with normal login even if room restore fails
+                }
+            }
+
+            // Send login success (always, even if no active game)
+            logger.info(`[RECONNECT] ✓ Successful for ${walletAddress} (session age: ${Math.round((Date.now() - sessionData.timestamp)/1000)}s)`);
+            socket.emit('loginSuccess', {
+                walletAddress: user.walletAddress,
+                virtualBalance: user.virtualBalance || 0
+            });
+
         } catch (error) {
             const sanitized = sanitizeError(error, 'walletReconnect', 'Reconnection failed. Please login again.');
             socket.emit('loginFailure', sanitized.error);
@@ -3453,9 +3541,34 @@ io.on('connection', (socket) => {
 
         // 2. Handle disconnection from active game rooms (FIXED: Use socket.roomId—no scan!)
         try {
-            if (socket.roomId) {
-                const roomId = socket.roomId;
+            let roomId = socket.roomId;
 
+            // ===== NEW: FALLBACK FOR ORPHANED PLAYERS =====
+            // When socket.roomId is lost (e.g., server restart), find player's room via Redis
+            if (!roomId && socket.user && socket.user.walletAddress) {
+                logger.warn(`[DISCONNECT] No socket.roomId for ${socket.user.walletAddress}, searching Redis...`);
+
+                const activeGame = await findPlayerActiveRoom(socket.user.walletAddress);
+                if (activeGame) {
+                    roomId = activeGame.roomId;
+                    logger.warn(`[DISCONNECT] Found orphaned player ${socket.user.walletAddress} in room ${roomId}`);
+
+                    // Track this in metrics
+                    orphanedPlayerMetrics.totalOrphaned++;
+                    alertManager.sendAlert({
+                        severity: 'medium',
+                        category: 'orphaned_player',
+                        message: `Orphaned player detected: ${socket.user.walletAddress} in room ${roomId}`,
+                        details: {
+                            walletAddress: socket.user.walletAddress,
+                            socketId: socket.id,
+                            roomId: roomId
+                        }
+                    });
+                }
+            }
+
+            if (roomId) {
                 // ===== VALIDATION: Check if room exists and player is in it =====
                 let initialRoom = await getGameRoom(roomId);
                 if (!initialRoom || initialRoom.isDeleted) {
@@ -3465,21 +3578,39 @@ io.on('connection', (socket) => {
 
                 const playerIndex = initialRoom.players.findIndex(p => p.id === socket.id);
                 if (playerIndex === -1) {
-                    logger.info(`Player ${socket.id} not found in room ${roomId} on disconnect`);
-                    socket.roomId = null;
-                    return;
+                    // For orphaned players, search by wallet address instead of socket.id
+                    const walletIndex = socket.user && socket.user.walletAddress
+                        ? initialRoom.players.findIndex(p => p.username === socket.user.walletAddress)
+                        : -1;
+
+                    if (walletIndex === -1) {
+                        logger.info(`Player ${socket.id} not found in room ${roomId} on disconnect`);
+                        socket.roomId = null;
+                        return;
+                    }
+                    // Use wallet-based player instead
+                    var disconnectedPlayer = initialRoom.players[walletIndex];
+                    logger.info(`[DISCONNECT] Found orphaned player ${disconnectedPlayer.username} by wallet in room ${roomId}`);
+                } else {
+                    var disconnectedPlayer = initialRoom.players[playerIndex];
                 }
 
-                const disconnectedPlayer = initialRoom.players[playerIndex];
                 logger.info(`Player ${disconnectedPlayer.username} (socket ${socket.id}) disconnected from room ${roomId}`);
 
                 // ✅ ATOMIC: Remove player and mark room state
                 let room;
+                const walletAddress = disconnectedPlayer.username;
                 try {
                     room = await atomicRoomUpdate(roomId, async (room) => {
-                        const playerIdx = room.players.findIndex(p => p.id === socket.id);
+                        // First try to find by socket.id, then fall back to wallet address (for orphaned players)
+                        let playerIdx = room.players.findIndex(p => p.id === socket.id);
                         if (playerIdx === -1) {
-                            throw new Error('Player not in room');
+                            // Fallback: find by wallet address for orphaned players
+                            playerIdx = room.players.findIndex(p => p.username === walletAddress);
+                            if (playerIdx === -1) {
+                                throw new Error('Player not in room');
+                            }
+                            logger.info(`[DISCONNECT] Found orphaned player ${walletAddress} by wallet in atomicRoomUpdate`);
                         }
 
                         // Clear question timeout
@@ -3497,7 +3628,7 @@ io.on('connection', (socket) => {
                     });
                 } catch (error) {
                     if (error.message.includes('not found') || error.message === 'Player not in room') {
-                        logger.info(`Player ${socket.id} already removed from room ${roomId}`);
+                        logger.info(`Player ${socket.id} (${walletAddress}) already removed from room ${roomId}`);
                         socket.roomId = null;
                         return;
                     }
@@ -3597,9 +3728,8 @@ io.on('connection', (socket) => {
                     }
 
                     socket.roomId = null;  // FIXED: Clear roomId
-                }
-            else {
-                logger.info(`No room associated with disconnected socket ${socket.id}`);
+            } else {
+                logger.info(`[DISCONNECT] No active room found for socket ${socket.id}`);
             }
         } catch (error) {
             logger.error('Error cleaning up game rooms', {
@@ -5128,6 +5258,47 @@ paymentProcessorInterval = setInterval(async () => {
         logger.error('Error in matchmaking cleanup:', { error: error });
     }
 }, 60000); // Run every minute
+
+// ============================================================================
+// CRITICAL FIX: Socket.roomId State Recovery - Find Player's Active Room
+// ============================================================================
+/**
+ * Find if a player is in any active game room
+ * Used for recovering socket.roomId state after server restart/reconnect
+ * @param {string} walletAddress - Player's wallet address
+ * @returns {Promise<{roomId: string, room: object, player: object}|null>}
+ */
+async function findPlayerActiveRoom(walletAddress) {
+    try {
+        // Get all active room IDs from Redis set
+        const roomIds = await redisClient.smembers('active:rooms');
+
+        logger.info(`[ROOM_SEARCH] Checking ${roomIds.length} active rooms for ${walletAddress}`);
+
+        // Check each room for this wallet address
+        for (const roomId of roomIds) {
+            const room = await getGameRoom(roomId);
+
+            // Skip deleted or invalid rooms
+            if (!room || room.isDeleted) {
+                continue;
+            }
+
+            // Check if player is in this room
+            const player = room.players.find(p => p.username === walletAddress);
+            if (player) {
+                logger.info(`[ROOM_SEARCH] Found player ${walletAddress} in room ${roomId}`);
+                return { roomId, room, player };
+            }
+        }
+
+        logger.info(`[ROOM_SEARCH] No active room found for ${walletAddress}`);
+        return null;
+    } catch (error) {
+        logger.error(`[ROOM_SEARCH] Error finding active room for ${walletAddress}:`, error);
+        return null;
+    }
+}
 
 async function updatePlayerStats(players, roomData) {
     logger.info('Updating stats for all players:', players);

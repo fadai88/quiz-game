@@ -339,6 +339,38 @@
             socket.io.engine.once('upgrade', () => {
                 console.log('Upgraded to:', socket.io.engine.transport.name);
             });
+
+            // Check if this is a reconnection attempt
+            if (isReconnecting) {
+                console.log('Reconnected! Waiting for game state restoration...');
+                updateReconnectAttemptDisplay();
+
+                // Wait up to 3 seconds for gameStateRestore event
+                const reconnectTimeout = setTimeout(() => {
+                    if (isReconnecting) {
+                        console.log('No game state received within timeout');
+                        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                            // Max attempts reached - give up
+                            hideReconnectingOverlay();
+                            isReconnecting = false;
+                            hasGameToRestore = false;
+                            reconnectAttempts = 0;
+                            showNotification('Unable to restore game session. Please start a new game.', 'error');
+                            resetGame();
+                        } else {
+                            // Try to restore via explicit request
+                            socket.emit('requestGameRestore', {
+                                walletAddress: connectedWallet,
+                                roomId: currentRoomId
+                            });
+                        }
+                    }
+                }, 3000);
+
+                // Store timeout reference to clear if state is restored
+                window.reconnectTimeoutRef = reconnectTimeout;
+            }
+
             // Trigger session init after connect
             initializeFromSession();
         });
@@ -354,6 +386,12 @@
         let balanceUpdateInterval;
         let gameTransactionInfo = null;
         let isProcessingBet = false;  // NEW: Prevent multi-clicks
+
+        // Reconnection state variables
+        let isReconnecting = false;
+        let reconnectAttempts = 0;
+        let hasGameToRestore = false;
+        const MAX_RECONNECT_ATTEMPTS = 5;
 
 
         const joinGameBtn = document.getElementById('joinGameBtn');
@@ -1195,10 +1233,107 @@
 
         socket.on('disconnect', () => {
             console.log('Disconnected from server');
-            alert('You have been disconnected from the game server. Please refresh the page to reconnect.');
-            
-            // Reset game UI
-            resetGame();
+
+            // Check if player is in active game
+            if (currentRoomId !== null) {
+                // Player was in a game - attempt reconnection
+                console.log('Disconnected during active game. Attempting to reconnect...');
+                isReconnecting = true;
+                reconnectAttempts++;
+                hasGameToRestore = true;
+                showReconnectingOverlay();
+                updateReconnectAttemptDisplay();
+                // Do NOT call resetGame() - we want to preserve state for restoration
+            } else {
+                // Player was not in a game - show simple message
+                alert('You have been disconnected from the game server. Please refresh the page to reconnect.');
+                resetGame();
+            }
+        });
+
+        // Game state restoration handler for reconnection
+        socket.on('gameStateRestore', (data) => {
+            console.log('Received gameStateRestore:', data);
+
+            // Clear any pending reconnect timeout
+            if (window.reconnectTimeoutRef) {
+                clearTimeout(window.reconnectTimeoutRef);
+                window.reconnectTimeoutRef = null;
+            }
+
+            // Hide reconnecting overlay
+            hideReconnectingOverlay();
+
+            // Validate data
+            if (!data || !data.roomId || !Array.isArray(data.players)) {
+                console.error('Invalid gameStateRestore data:', data);
+                showNotification('Failed to restore game state. Starting fresh.', 'error');
+                isReconnecting = false;
+                hasGameToRestore = false;
+                reconnectAttempts = 0;
+                resetGame();
+                return;
+            }
+
+            // Restore game state
+            currentRoomId = data.roomId;
+            currentBetAmount = data.betAmount || currentBetAmount;
+
+            console.log('Restoring game state:', {
+                roomId: currentRoomId,
+                betAmount: currentBetAmount,
+                gameStarted: data.gameStarted,
+                playerCount: data.players.length
+            });
+
+            if (data.gameStarted) {
+                // Game is in progress - show game screen
+                joinGameBtn.style.display = 'none';
+                document.getElementById('betAmount').disabled = true;
+
+                // Update players display
+                updatePlayerUI(data.players);
+
+                // Show current question status
+                if (data.currentQuestion) {
+                    questionDiv.innerHTML = `<h2>Question ${data.currentQuestion.questionNumber} of ${data.currentQuestion.totalQuestions}</h2>`;
+                    waitingMessage.textContent = 'Reconnected! Waiting for next question...';
+                } else {
+                    waitingMessage.textContent = 'Reconnected! Game in progress...';
+                }
+
+                // Handle bot game indicator
+                if (data.botOpponent) {
+                    document.body.classList.add('playing-bot');
+                }
+            } else {
+                // Game hasn't started yet - show waiting room
+                joinGameBtn.style.display = 'none';
+                document.getElementById('betAmount').disabled = true;
+
+                // Update player list
+                playersDiv.innerHTML = '<h2>Players:</h2>' + data.players.map(p =>
+                    `<p>${p.username}${p.isBot ? ' 🤖' : ''}: Ready</p>`
+                ).join('');
+
+                waitingMessage.textContent = 'Reconnected! Waiting for game to start...';
+            }
+
+            // Reset reconnection state
+            isReconnecting = false;
+            hasGameToRestore = false;
+            reconnectAttempts = 0;
+
+            // Show success notification
+            showNotification('Successfully reconnected to game!', 'success');
+
+            // Log restoration details
+            console.log('Game state restored successfully:', {
+                roomId: currentRoomId,
+                betAmount: currentBetAmount,
+                players: data.players.map(p => p.username),
+                gameStarted: data.gameStarted
+            });
         });
 
         const forfeitStyles = document.createElement('style');
@@ -1342,6 +1477,12 @@
         }
 
         function resetGame() {
+            // Skip reset if we're in the middle of reconnecting
+            if (isReconnecting) {
+                console.log('Skipping resetGame() - reconnection in progress');
+                return;
+            }
+
             currentRoomId = null;
             playersDiv.innerHTML = '';
             questionDiv.innerHTML = '';
@@ -1377,6 +1518,56 @@
             currentQuestionId = null;
             
             console.log('Game UI reset.');
+        }
+
+        // Reconnection helper functions
+        function showReconnectingOverlay() {
+            const overlay = document.getElementById('reconnectingOverlay');
+            if (overlay) {
+                overlay.style.display = 'flex';
+            }
+        }
+
+        function hideReconnectingOverlay() {
+            const overlay = document.getElementById('reconnectingOverlay');
+            if (overlay) {
+                overlay.style.display = 'none';
+            }
+        }
+
+        function updateReconnectAttemptDisplay() {
+            const attemptCounter = document.getElementById('reconnectAttemptCount');
+            if (attemptCounter) {
+                attemptCounter.textContent = `Attempt ${reconnectAttempts} of ${MAX_RECONNECT_ATTEMPTS}`;
+            }
+        }
+
+        function showNotification(message, type) {
+            const notification = document.getElementById('notification');
+            if (notification) {
+                notification.textContent = message;
+                notification.style.display = 'block';
+
+                // Style based on type
+                if (type === 'success') {
+                    notification.style.backgroundColor = '#d4edda';
+                    notification.style.color = '#155724';
+                    notification.style.border = '1px solid #c3e6cb';
+                } else if (type === 'error') {
+                    notification.style.backgroundColor = '#f8d7da';
+                    notification.style.color = '#721c24';
+                    notification.style.border = '1px solid #f5c6cb';
+                } else {
+                    notification.style.backgroundColor = '#f0f0f0';
+                    notification.style.color = '#333';
+                    notification.style.border = '1px solid #ddd';
+                }
+
+                // Auto-hide after 5 seconds
+                setTimeout(() => {
+                    notification.style.display = 'none';
+                }, 5000);
+            }
         }
 
         function toggleTheme() {
@@ -1913,5 +2104,56 @@
             }
         }
     </script>
+
+    <!-- Reconnection Overlay -->
+    <div id="reconnectingOverlay" style="
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background-color: rgba(0, 0, 0, 0.8);
+        z-index: 10000;
+        justify-content: center;
+        align-items: center;
+    ">
+        <div style="
+            background-color: white;
+            padding: 40px;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            max-width: 400px;
+        ">
+            <div class="reconnect-spinner" style="
+                width: 50px;
+                height: 50px;
+                border: 4px solid #f3f3f3;
+                border-top: 4px solid #3498db;
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
+                margin: 0 auto 20px auto;
+            "></div>
+            <h2 style="margin: 0 0 10px 0; color: #333;">Reconnecting...</h2>
+            <p id="reconnectAttemptCount" style="color: #666; margin: 0;">Attempt 1 of 5</p>
+            <p style="color: #888; font-size: 14px; margin-top: 15px;">Please wait while we restore your game session.</p>
+        </div>
+    </div>
+    <style>
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .dark-theme #reconnectingOverlay > div {
+            background-color: #2d2d2d;
+        }
+        .dark-theme #reconnectingOverlay h2 {
+            color: #fff;
+        }
+        .dark-theme #reconnectingOverlay p {
+            color: #ccc;
+        }
+    </style>
 </body>
 </html>
