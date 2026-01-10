@@ -4513,11 +4513,11 @@ async function handleGameOver(room, roomId) {
         if (winnerIsActuallyHuman && paymentProcessor) {
             try {
                 const multiplier = botOpponent ? 1.5 : 1.8;
-                const winningAmount = calculateWinnings(roomData.betAmount, multiplier);
+                const winningAmount = calculateWinnings(room.betAmount, multiplier);
                 // FIXED: Queue the payout instead of sending directly
                 const queuedPayment = await paymentProcessor.queuePayment(
                     winner,
-                    winningAmount,
+                    Number(winningAmount),
                     roomId, // Use roomId as gameId
                     room.betAmount,
                     { botOpponent, singlePlayerMode: isSinglePlayerEncounter }
@@ -5120,7 +5120,7 @@ async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, 
     try {
         // Calculate winnings using the appropriate multiplier
         const multiplier = botOpponent ? 1.5 : 1.8;
-        const winningAmount = calculateWinnings(roomData.betAmount, multiplier);
+        const winningAmount = calculateWinnings(betAmount, multiplier);
 
         // FIXED: Queue payout instead of sending directly
         let payoutSignature = null;
@@ -5128,7 +5128,7 @@ async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, 
         if (!botOpponent && paymentProcessor) {
             const queuedPayment = await paymentProcessor.queuePayment(
                 remainingPlayer.username,
-                winningAmount,
+                Number(winningAmount),
                 roomId,
                 betAmount,
                 { botOpponent, forfeit: true }
@@ -5346,7 +5346,8 @@ async function updatePlayerStats(players, roomData) {
                 
                 if (isWinner) {
                     updateObj.$inc.wins = 1;
-                    updateObj.$inc.totalWinnings = winningAmount;
+                    // Convert from atomic units to USDC (divide by 1,000,000)
+                    updateObj.$inc.totalWinnings = fromAtomicUnits(Number(winningAmount));
                 }
                 
                 const result = await User.findOneAndUpdate(
@@ -5403,7 +5404,8 @@ async function updatePlayerStats(players, roomData) {
                 
                 if (isWinner) {
                     updateObj.$inc.wins = 1;
-                    updateObj.$inc.totalWinnings = winningAmount;
+                    // Convert from atomic units to USDC (divide by 1,000,000)
+                    updateObj.$inc.totalWinnings = fromAtomicUnits(Number(winningAmount));
                 }
                 
                 // ✅ Atomic $inc operations (safe without transactions for single-doc updates)
