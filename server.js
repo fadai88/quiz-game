@@ -35,6 +35,7 @@ const fs = require('fs');
 const path = require('path');
 const { Connection, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, Keypair } = require('@solana/web3.js');
 const Joi = require('joi');
+const { VALID_BET_AMOUNTS_ATOMIC, fromAtomicUnits, isValidBetAmount, calculateWinnings, formatUSDC } = require('./utils/usdcUtils');
 
 // ============================================================================
 // WINSTON LOGGING SYSTEM
@@ -464,7 +465,7 @@ const nonceSchema = Joi.string().guid({ version: 'uuidv4' }).required();
 
 const transactionSchema = Joi.object({
     walletAddress: solanaPublicKey,  // FIXED: Use custom validator
-    betAmount: Joi.number().valid(3, 10, 15, 20, 30).required(),
+    betAmount: Joi.number().integer().valid(...VALID_BET_AMOUNTS_ATOMIC).required(),
     transactionSignature: Joi.string().required(),
     nonce: nonceSchema,  // NEW: Add nonce
     gameMode: Joi.string().optional(),
@@ -516,7 +517,7 @@ const switchToBotSchema = Joi.object({
 
 const requestBotRoomSchema = Joi.object({
     walletAddress: solanaPublicKey,  // FIXED: Use custom validator
-    betAmount: Joi.number().valid(3, 10, 15, 20, 30).required(),  // FIXED: Tightened to game options
+    betAmount: Joi.number().integer().valid(...VALID_BET_AMOUNTS_ATOMIC).required(),
     nonce: nonceSchema.optional()  // NEW: Add nonce (optional for non-transaction events)
 });
 
@@ -1318,7 +1319,8 @@ async function removeWaitingRoom(betAmount, roomId) {
 
 async function verifyAndValidateTransaction(signature, expectedAmount, senderAddress, recipientAddress, nonce, maxRetries = 3, retryDelay = 500) {
     logger.info(`🔐 SECURE VERIFICATION: ${signature}`);
-    logger.info(`   Expected: ${expectedAmount} USDC from ${senderAddress} to ${recipientAddress}`);
+    logger.info(`   Expected: ${formatUSDC(expectedAmount)} from ${senderAddress} to ${recipientAddress}`);
+
     logger.info(`   Nonce: ${nonce}`);
 
     const key = `tx:${signature}`;
@@ -1539,23 +1541,26 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
     const actualTransferAmount = postAmount - preAmount;
 
     // USDC has 6 decimals - convert expectedAmount to raw amount
-    const expectedBigInt = BigInt(Math.round(expectedAmount * 1_000_000));
+    const expectedBigInt = BigInt(expectedAmount);
+    if (!Number.isInteger(expectedAmount)) {
+        throw new Error('Bet amount must be in atomic units (integer)');
+    }
 
     if (actualTransferAmount !== expectedBigInt) {
         logger.error(`❌ AMOUNT MISMATCH:`);
-        logger.error(`   Expected: ${expectedAmount} USDC (${expectedBigInt} raw)`);
-        logger.error(`   Received: ${Number(actualTransferAmount) / 1_000_000} USDC (${actualTransferAmount} raw)`);
+        logger.info(`Expected: ${formatUSDC(expectedAmount)}`);
+        logger.error(`   Received: ${formatUSDC(actualTransferAmount)} (${actualTransferAmount} raw units)`);
         await TransactionLog.findOneAndUpdate(
             { signature },
             { 
                 status: 'failed', 
-                errorMessage: `Amount mismatch: expected ${expectedAmount}, got ${Number(actualTransferAmount) / 1_000_000}` 
+                errorMessage: `Amount mismatch: expected ${formatUSDC(expectedAmount)}, got ${formatUSDC(actualTransferAmount)}`
             }
         );
-        throw new Error(`Amount mismatch: expected ${expectedAmount} USDC, received ${Number(actualTransferAmount) / 1_000_000} USDC`);
+        throw new Error(`Amount mismatch: expected ${formatUSDC(expectedAmount)}, received ${formatUSDC(actualTransferAmount)}`);
     }
 
-    logger.info(`✅ Amount verified: ${expectedAmount} USDC`);
+    logger.info(`✅ Amount verified: ${formatUSDC(expectedAmount)}`);
 
     // ========================================================================
     // STEP 8: VERIFY TOKEN ACCOUNT OWNERSHIP (ADVANCED SECURITY)
@@ -4508,7 +4513,7 @@ async function handleGameOver(room, roomId) {
         if (winnerIsActuallyHuman && paymentProcessor) {
             try {
                 const multiplier = botOpponent ? 1.5 : 1.8;
-                const winningAmount = room.betAmount * multiplier;
+                const winningAmount = calculateWinnings(roomData.betAmount, multiplier);
                 // FIXED: Queue the payout instead of sending directly
                 const queuedPayment = await paymentProcessor.queuePayment(
                     winner,
@@ -4754,7 +4759,7 @@ async function getGameRoom(roomId) {
 
             return {
                 players: JSON.parse(roomData.players || '[]'),
-                betAmount: parseFloat(roomData.betAmount) || 0,
+                betAmount: parseInt(roomData.betAmount) || 0,
                 questions: questions,
                 questionIdMap: questionIdMap,
                 currentQuestionIndex: parseInt(roomData.currentQuestionIndex) || 0,
@@ -5115,7 +5120,7 @@ async function handlePlayerLeftWin(roomId, remainingPlayer, disconnectedPlayer, 
     try {
         // Calculate winnings using the appropriate multiplier
         const multiplier = botOpponent ? 1.5 : 1.8;
-        const winningAmount = betAmount * multiplier;
+        const winningAmount = calculateWinnings(roomData.betAmount, multiplier);
 
         // FIXED: Queue payout instead of sending directly
         let payoutSignature = null;
@@ -5304,9 +5309,9 @@ async function updatePlayerStats(players, roomData) {
     logger.info('Updating stats for all players:', players);
     const winner = roomData.winner;
     const multiplier = roomData.botOpponent ? 1.5 : 1.8;
-    const winningAmount = roomData.betAmount * multiplier;
+    const winningAmount = calculateWinnings(roomData.betAmount, multiplier);
     
-    logger.info(`Game stats: winner=${winner}, betAmount=${roomData.betAmount}, winnings=${winningAmount}`);
+    logger.info(`Game stats: winner=${winner}, betAmount=${formatUSDC(roomData.betAmount)}, winnings=${formatUSDC(winningAmount)}`);
     
     // ✅ Check if MongoDB supports transactions (replica set or Atlas)
     const supportsTransactions = mongoose.connection.client.topology?.description?.type !== 'Single';

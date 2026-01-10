@@ -141,6 +141,27 @@
         const TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
         const ASSOCIATED_TOKEN_PROGRAM_ID = new solanaWeb3.PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
         const USDC_DECIMALS = 6;
+        const USDC_MULTIPLIER = 1_000_000; // 10^6 for 6 decimals
+
+        // Valid bet amounts in USDC (for display)
+        const VALID_BET_AMOUNTS_USDC = [3, 10, 15, 20, 30];
+        // Valid bet amounts in atomic units (what we send to backend)
+        const VALID_BET_AMOUNTS_ATOMIC = VALID_BET_AMOUNTS_USDC.map(x => x * USDC_MULTIPLIER);
+        // Result: [3000000, 10000000, 15000000, 20000000, 30000000]
+
+        /**
+         * Convert USDC display amount to atomic units
+         */
+        function toAtomicUnits(usdcAmount) {
+            return usdcAmount * USDC_MULTIPLIER;
+        }
+
+        /**
+         * Convert atomic units to USDC display amount
+         */
+        function fromAtomicUnits(atomicAmount) {
+            return atomicAmount / USDC_MULTIPLIER;
+        }
 
         const config = {
             USDC_MINT: new solanaWeb3.PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
@@ -173,11 +194,11 @@
         <div id="countdownTimer"></div>
         <div id="gameArea">
             <select id="betAmount">
-                <option value="3">3 USDC Game</option>
-                <option value="10">10 USDC Game</option>
-                <option value="15">15 USDC Game</option>
-                <option value="20">20 USDC Game</option>
-                <option value="30">30 USDC Game</option>
+                <option value="3000000">3 USDC Game</option>
+                <option value="10000000">10 USDC Game</option>
+                <option value="15000000">15 USDC Game</option>
+                <option value="20000000">20 USDC Game</option>
+                <option value="30000000">30 USDC Game</option>
             </select>
             <button id="joinGameBtn" type="button">Join Game</button>
             <div id="waitingMessage"></div>
@@ -548,12 +569,14 @@
 
             async createTransferTransaction(walletAddress, betAmount, nonce) {
                 try {
-                    if (betAmount < config.MIN_BET_AMOUNT || betAmount > config.MAX_BET_AMOUNT) {
-                        throw new Error(`Bet amount must be between ${config.MIN_BET_AMOUNT} and ${config.MAX_BET_AMOUNT} USDC`);
+                    // betAmount is now in atomic units (e.g., 3000000 for 3 USDC)
+                    // Validate against atomic unit values
+                    if (!VALID_BET_AMOUNTS_ATOMIC.includes(betAmount)) {
+                        throw new Error(`Invalid bet amount. Must be 3, 10, 15, 20, or 30 USDC`);
                     }
 
                     const fromWallet = new solanaWeb3.PublicKey(walletAddress);
-                    
+
                     // Get token accounts for user and treasury
                     const fromTokenAccount = await this.findAssociatedTokenAddress(
                         fromWallet,
@@ -565,8 +588,8 @@
                         this.usdcMint
                     );
 
-                    // Amount in token decimals
-                    const amount = betAmount * Math.pow(10, 6);
+                    // Amount is already in atomic units (no conversion needed)
+                    const amount = betAmount;
 
                     // Create transfer instruction
                     const keys = [
@@ -592,7 +615,7 @@
                     });
 
                     // NEW: Add unique memo for anti-dupe (prevents identical tx bytes across sessions)
-                    const memoText = `bet-${betAmount}-${nonce}-${Date.now()}`;
+                    const memoText = `bet-${fromAtomicUnits(betAmount)}-${nonce}-${Date.now()}`;
                     const memoIx = new solanaWeb3.TransactionInstruction({
                         keys: [],  // No accounts needed
                         programId: new solanaWeb3.PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),  // Standard Memo program
@@ -616,7 +639,8 @@
                     console.log('Created transfer transaction:', {
                         from: fromTokenAccount.toString(),
                         to: toTokenAccount.toString(),
-                        amount: amount,
+                        amountAtomic: amount,
+                        amountUSDC: fromAtomicUnits(amount),
                         feePayer: fromWallet.toString()
                     });
                     // NEW: Optional log for debugging uniqueness
@@ -920,8 +944,8 @@
 
         // NEW: Client-side pre-validation function for bet and wallet
         function validateBetAndWallet(betAmount, wallet) {
-            // Validate bet amount
-            if (!Number.isInteger(betAmount) || betAmount < 3 || betAmount > 30) {
+            // Validate bet amount (now in atomic units)
+            if (!Number.isInteger(betAmount) || !VALID_BET_AMOUNTS_ATOMIC.includes(betAmount)) {
                 throw new Error('Invalid bet amount. Must be 3, 10, 15, 20, or 30 USDC.');
             }
             // Rough base58 regex for wallet (server will do full PublicKey check)
@@ -942,7 +966,7 @@
                     alert('Please enter a valid bet amount');
                     return;
                 }
-                console.log('Selected bet amount:', betAmount, 'USDC');
+                console.log('Selected bet amount:', fromAtomicUnits(betAmount), 'USDC (atomic:', betAmount, ')');
                 currentBetAmount = betAmount; // Store bet amount
                 updateUIForJoining();
                 waitingMessage.textContent = 'Waiting for game mode selection...';
@@ -1122,7 +1146,9 @@
             // Display game outcome
             let gameOverMessage = '';
             const clientIsWinner = winner === connectedWallet;
-            const winnings = betAmount * (botOpponent ? 1.5 : 1.8);
+            // Convert betAmount from atomic units to USDC for display
+            const betAmountUSDC = fromAtomicUnits(betAmount);
+            const winnings = betAmountUSDC * (botOpponent ? 1.5 : 1.8);
 
             if (botOpponent) {
                 const humanPlayer = players.find(p => p.username === connectedWallet && !p.isBot);
@@ -1193,7 +1219,9 @@
 
             let forfeitMessage = message;
             const clientIsWinner = winner === connectedWallet;
-            const winnings = betAmount * (botOpponent ? 1.5 : 1.8);
+            // Convert betAmount from atomic units to USDC for display
+            const betAmountUSDC = fromAtomicUnits(betAmount);
+            const winnings = betAmountUSDC * (botOpponent ? 1.5 : 1.8);
 
             if (clientIsWinner) {
                 forfeitMessage += ` You've been awarded ${winnings.toFixed(2)} USDC for the win!`;
@@ -1281,7 +1309,8 @@
 
             console.log('Restoring game state:', {
                 roomId: currentRoomId,
-                betAmount: currentBetAmount,
+                betAmount: fromAtomicUnits(currentBetAmount) + ' USDC',
+                betAmountAtomic: currentBetAmount,
                 gameStarted: data.gameStarted,
                 playerCount: data.players.length
             });
@@ -1330,7 +1359,8 @@
             // Log restoration details
             console.log('Game state restored successfully:', {
                 roomId: currentRoomId,
-                betAmount: currentBetAmount,
+                betAmount: fromAtomicUnits(currentBetAmount) + ' USDC',
+                betAmountAtomic: currentBetAmount,
                 players: data.players.map(p => p.username),
                 gameStarted: data.gameStarted
             });
