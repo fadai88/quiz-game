@@ -1001,11 +1001,47 @@ app.get('/game.html', (req, res) => {
 });
 app.use(express.static(path.join(__dirname, 'public')));
 
-mongoose.connect(process.env.MONGODB_URI)  // <-- Remove options—modern default
-    .then(async () => {
-        console.log('Connected to MongoDB');
-    })
-    .catch(err => console.error('Could not connect to MongoDB', err));
+// Connection options for security and reliability
+const mongooseOptions = {
+  // Force TLS in production (mongodb+srv:// enables this automatically, but explicit is better)
+  ...(process.env.NODE_ENV === 'production' && {
+    tls: true,
+    tlsAllowInvalidCertificates: false, // Strict cert validation
+  }),
+  
+  // Connection reliability settings
+  serverSelectionTimeoutMS: 5000, // Fail fast if can't connect (5 seconds)
+  socketTimeoutMS: 45000, // Socket timeout (45 seconds)
+  
+  // Write concern for data consistency
+  retryWrites: true,
+  w: 'majority', // Wait for majority of replicas to acknowledge writes
+};
+
+// Connect with error handling
+mongoose.connect(process.env.MONGODB_URI, mongooseOptions)
+  .then(() => {
+    console.log('✅ MongoDB connected successfully');
+  })
+  .catch(err => {
+    console.error('❌ FATAL: MongoDB connection failed:', err.message);
+    console.error('Check your MONGODB_URI and network connectivity');
+    process.exit(1); // Exit immediately - can't run without database
+  });
+
+// Runtime error monitoring
+mongoose.connection.on('error', err => {
+  console.error('❌ MongoDB runtime error:', err.message);
+  // Don't exit here - just log. Connection might recover.
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.warn('⚠️  MongoDB disconnected. Mongoose will attempt to reconnect automatically...');
+});
+
+mongoose.connection.on('reconnected', () => {
+  console.log('✅ MongoDB reconnected');
+});
 
 const Quiz = mongoose.model('Quiz', new mongoose.Schema({
     question: String,
@@ -1652,14 +1688,14 @@ async function verifyAndValidateTransaction(signature, expectedAmount, senderAdd
         throw new Error('Transaction missing timestamp');
     }
 
-    const TX_MAX_AGE = 300000; // 5 minutes (increased from 1 minute for better UX)
+    const TX_MAX_AGE = 120000; // 2 minutes
     const txAge = Date.now() - (transaction.blockTime * 1000);
     
     if (txAge > TX_MAX_AGE) {
         logger.error(`❌ TRANSACTION TOO OLD: ${txAge}ms (max ${TX_MAX_AGE}ms)`);
         await TransactionLog.findOneAndUpdate(
             { signature },
-            { status: 'failed', errorMessage: 'Transaction expired (must be used within 5 minutes)' }
+            { status: 'failed', errorMessage: 'Transaction expired (must be used within 2 minutes)' }
         );
         throw new Error('Transaction expired - please create a new transaction');
     }
