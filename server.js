@@ -3582,6 +3582,8 @@ io.on('connection', (socket) => {
                 }
 
                 const playerIndex = initialRoom.players.findIndex(p => p.id === socket.id);
+                let disconnectedPlayer;
+
                 if (playerIndex === -1) {
                     // For orphaned players, search by wallet address instead of socket.id
                     const walletIndex = socket.user && socket.user.walletAddress
@@ -3593,11 +3595,12 @@ io.on('connection', (socket) => {
                         socket.roomId = null;
                         return;
                     }
-                    // Use wallet-based player instead
-                    var disconnectedPlayer = initialRoom.players[walletIndex];
+                    // Assign without var/let/const
+                    disconnectedPlayer = initialRoom.players[walletIndex];
                     logger.info(`[DISCONNECT] Found orphaned player ${disconnectedPlayer.username} by wallet in room ${roomId}`);
                 } else {
-                    var disconnectedPlayer = initialRoom.players[playerIndex];
+                    // Assign without var/let/const
+                    disconnectedPlayer = initialRoom.players[playerIndex];
                 }
 
                 logger.info(`Player ${disconnectedPlayer.username} (socket ${socket.id}) disconnected from room ${roomId}`);
