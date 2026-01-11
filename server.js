@@ -3300,7 +3300,69 @@ io.on('connection', (socket) => {
                         logger.info(`✅ Idempotency lock acquired for ${authenticatedUsername} - question ${questionId}`);
                         // ============================================================================
 
-                        // ===== 3. ATOMIC ROOM UPDATE WITH RACE CONDITION PROTECTION =====
+                        // ===== 3. PRE-FETCH: External API calls OUTSIDE atomic transaction =====
+                        // These calls can take 500-2500ms and must NOT be inside the Redis WATCH period
+                        let recaptchaResult = null;
+                        let user = null;
+                        const isProduction = process.env.NODE_ENV === 'production';
+
+                        // Pre-fetch reCAPTCHA verification
+                        if (isProduction) {
+                            if (!recaptchaToken) {
+                                await releaseIdempotencyLock(idempotencyKey);
+                                socket.emit('answerError', 'Verification required');
+                                return;
+                            }
+                            try {
+                                recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                                if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
+                                    botDetector.trackEvent(authenticatedUsername, 'low_recaptcha_score', {
+                                        score: recaptchaResult.score,
+                                        event: 'submitAnswer'
+                                    });
+                                    await releaseIdempotencyLock(idempotencyKey);
+                                    socket.emit('answerError', 'Verification failed');
+                                    return;
+                                }
+                            } catch (error) {
+                                SecurityLogger.recaptchaFailed(authenticatedUsername, error.message, null, clientIP);
+                                trackRecaptchaFailure(authenticatedUsername, { error: error.message });
+
+                                try {
+                                    await rateLimitFailedRecaptcha(clientIP);
+                                } catch (rateError) {
+                                    await releaseIdempotencyLock(idempotencyKey);
+                                    socket.emit('answerError', 'Too many failed verification attempts. Please try again later.');
+                                    return;
+                                }
+                                await releaseIdempotencyLock(idempotencyKey);
+                                socket.emit('answerError', 'Verification failed');
+                                return;
+                            }
+                        } else if (process.env.ENABLE_RECAPTCHA === 'true' && recaptchaToken) {
+                            try {
+                                recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                                if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
+                                    logger.warn(`⚠️ Low score in dev: ${recaptchaResult.score} (allowing anyway)`);
+                                }
+                            } catch (error) {
+                                logger.warn(`⚠️ Dev reCAPTCHA failed (allowing anyway): ${error.message}`);
+                            }
+                        }
+
+                        // Pre-fetch user data
+                        try {
+                            user = await User.findOne({ walletAddress: authenticatedUsername });
+                        } catch (error) {
+                            if (isProduction) {
+                                await releaseIdempotencyLock(idempotencyKey);
+                                socket.emit('answerError', 'Database error. Please try again.');
+                                return;
+                            }
+                            logger.warn(`User lookup failed (non-critical): ${error.message}`);
+                        }
+
+                        // ===== 4. ATOMIC ROOM UPDATE WITH RACE CONDITION PROTECTION =====
                         try {
                             const updatedRoom = await atomicRoomUpdate(roomId, async (room) => {
                                 // All validation and updates happen inside atomic block
@@ -3356,47 +3418,7 @@ io.on('connection', (socket) => {
                                     trackBotSuspicion(authenticatedUsername, { score: botSuspicion, event: 'submitAnswer' });
                                 }
 
-                                // reCAPTCHA verification
-                                const isProduction = process.env.NODE_ENV === 'production';
-                                let recaptchaResult = null;
-
-                                if (isProduction) {
-                                    if (!recaptchaToken) {
-                                        throw new Error('Verification required');
-                                    }
-                                    try {
-                                        recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                                        if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
-                                            botDetector.trackEvent(authenticatedUsername, 'low_recaptcha_score', {
-                                                score: recaptchaResult.score,
-                                                event: 'submitAnswer'
-                                            });
-                                            throw new Error('Verification failed');
-                                        }
-                                    } catch (error) {
-                                        SecurityLogger.recaptchaFailed(authenticatedUsername, error.message, null, clientIP);
-                                        trackRecaptchaFailure(authenticatedUsername, { error: error.message });
-
-                                        try {
-                                            await rateLimitFailedRecaptcha(clientIP);
-                                        } catch (rateError) {
-                                            throw new Error('Too many failed verification attempts. Please try again later.');
-                                        }
-                                        throw new Error('Verification failed');
-                                    }
-                                } else if (process.env.ENABLE_RECAPTCHA === 'true' && recaptchaToken) {
-                                    try {
-                                        recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                                        if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
-                                            logger.warn(`⚠️ Low score in dev: ${recaptchaResult.score} (allowing anyway)`);
-                                        }
-                                    } catch (error) {
-                                        logger.warn(`⚠️ Dev reCAPTCHA failed (allowing anyway): ${error.message}`);
-                                    }
-                                }
-
-                                // Device fingerprint check
-                                const user = await User.findOne({ walletAddress: authenticatedUsername });
+                                // Device fingerprint check (using pre-fetched user and recaptchaResult)
                                 if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint) {
                                     SecurityLogger.deviceMismatch(authenticatedUsername, user.deviceFingerprint, socket.user.fingerprint, { event: 'submitAnswer' });
                                     botDetector.trackEvent(authenticatedUsername, 'fingerprint_mismatch', { event: 'submitAnswer' });
