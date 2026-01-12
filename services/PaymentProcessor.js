@@ -325,7 +325,7 @@ class PaymentProcessor {
                     this.config.USDC_MINT,
                     recipientTokenAccount,
                     this.config.TREASURY_WALLET,
-                    Math.floor(amount * Math.pow(10, 6)), // Convert to USDC decimals
+                    amount, // Convert to USDC decimals
                     6
                 );
                 transaction.add(transferIx);
