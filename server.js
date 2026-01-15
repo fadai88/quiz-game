@@ -409,14 +409,19 @@ if (ENVIRONMENT === 'production') {
     }
     
     // Enforce Redis security in production
-    if (!process.env.REDIS_PASSWORD) {
-        console.error('❌ FATAL: REDIS_PASSWORD required in production!');
-        console.error('   Set REDIS_PASSWORD in your .env file to secure Redis');
+    if (!process.env.REDIS_URL && !process.env.REDIS_PASSWORD) {
+        console.error('❌ FATAL: Redis configuration required in production!');
+        console.error('   Option 1 (Heroku): heroku addons:create heroku-redis:mini');
+        console.error('   Option 2 (Manual): Set REDIS_PASSWORD in your .env file');
         process.exit(1);
     }
-    
+
     console.log('✅ reCAPTCHA properly configured for production');
-    console.log('✅ Redis security properly configured for production');
+    if (process.env.REDIS_URL) {
+        console.log('✅ Redis properly configured (using REDIS_URL)');
+    } else {
+        console.log('✅ Redis properly configured (using REDIS_PASSWORD)');
+    }
 } else {
     console.log('🔧 Starting in DEVELOPMENT mode');
     if (process.env.ENABLE_RECAPTCHA === 'true') {
