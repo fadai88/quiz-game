@@ -1111,45 +1111,70 @@ let redisClient;
 
 async function initializeRedis() {
     try {
-        // Build Redis configuration with security settings
-        const redisConfig = {
-            // Connection settings
-            host: process.env.REDIS_HOST || 'localhost',
-            port: process.env.REDIS_PORT || 6379,
-            
-            // Security: Password authentication
-            password: process.env.REDIS_PASSWORD,
-            
-            // Security: TLS encryption (only if explicitly enabled)
-            // Set REDIS_TLS=true in .env to enable TLS
-            tls: process.env.REDIS_TLS === 'true' ? {
-                rejectUnauthorized: process.env.REDIS_TLS_REJECT_UNAUTHORIZED !== 'false'
-            } : undefined,
-            
-            // Robust retry configuration
-            retryStrategy: (times) => {
-                const delay = Math.min(times * 50, 2000);
-                return delay;
-            },
-            maxRetriesPerRequest: 3,
-            retryDelayOnFailover: 100,
-            enableReadyCheck: true,
-            lazyConnect: true,
-            connectTimeout: 10000,
-            commandTimeout: 5000
-        };
+        let redisClient;
         
-        // Create Redis client with secure configuration
-        redisClient = new Redis(redisConfig);
+        // ============================================================================
+        // HEROKU COMPATIBILITY: Handle REDIS_URL from Heroku Redis add-on
+        // ============================================================================
+        
+        if (process.env.REDIS_URL) {
+            // Production (Heroku, Railway, Render, etc.)
+            console.log('📡 Using REDIS_URL from environment');
+            
+            // Parse the URL and create client
+            redisClient = new Redis(process.env.REDIS_URL, {
+                // Heroku Redis requires TLS
+                tls: {
+                    rejectUnauthorized: false
+                },
+                
+                // Robust retry configuration
+                retryStrategy: (times) => {
+                    const delay = Math.min(times * 50, 2000);
+                    return delay;
+                },
+                maxRetriesPerRequest: 3,
+                retryDelayOnFailover: 100,
+                enableReadyCheck: true,
+                connectTimeout: 10000,
+                commandTimeout: 5000
+            });
+            
+        } else {
+            // Local development (use individual env vars)
+            console.log('🔧 Using individual Redis env vars (local dev)');
+            const redisConfig = {
+                host: process.env.REDIS_HOST || 'localhost',
+                port: process.env.REDIS_PORT || 6379,
+                password: process.env.REDIS_PASSWORD,
+                tls: process.env.REDIS_TLS === 'true' ? {
+                    rejectUnauthorized: process.env.REDIS_TLS_REJECT_UNAUTHORIZED !== 'false'
+                } : undefined,
+                
+                retryStrategy: (times) => {
+                    const delay = Math.min(times * 50, 2000);
+                    return delay;
+                },
+                maxRetriesPerRequest: 3,
+                retryDelayOnFailover: 100,
+                enableReadyCheck: true,
+                connectTimeout: 10000,
+                commandTimeout: 5000
+            };
+            
+            redisClient = new Redis(redisConfig);
+        }
+        
+        // Make redisClient globally accessible
+        global.redisClient = redisClient;
         
         // Health monitoring events
         redisClient.on('ready', () => { 
             console.log('✅ Redis ready'); 
-            if (process.env.REDIS_PASSWORD) {
-                console.log('   🔒 Using password authentication');
-            }
-            if (process.env.REDIS_TLS === 'true') {
-                console.log('   🔐 Using TLS encryption');
+            if (process.env.REDIS_URL) {
+                console.log('   🔒 Connected via REDIS_URL (Heroku/Cloud)');
+            } else if (process.env.REDIS_PASSWORD) {
+                console.log('   🔒 Using password authentication (local)');
             }
         });
         
@@ -1165,18 +1190,19 @@ async function initializeRedis() {
             console.warn('⚠️  Redis connection closed (will auto-reconnect)'); 
         });
         
-        // Test Redis connection with ping
-        await redisClient.ping();  // Simple health check
+        // Test Redis connection
+        await redisClient.ping();
         await redisClient.set('test', '1', 'EX', 60);
         const testValue = await redisClient.get('test');
         logger.info(`Redis test: ${testValue}`);
-    // Redis health auto-managed by ioredis
-        await initializeRateLimiter(); // Init after Redis
+        
+        await initializeRateLimiter();
+        
+        return redisClient;
     } catch (error) {
         logger.error('Failed to initialize Redis:', { error: error });
-    // Redis health auto-managed by ioredis
-        // CRITICAL: Do not fallback; log and set unhealthy
         console.error('Redis unavailable - transaction processing disabled');
+        throw error;
     }
 }
 
