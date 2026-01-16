@@ -165,9 +165,9 @@
             }
         }
 
-        const socket = io('http://localhost:5000', { 
+        const socket = io({ 
             auth: { 
-                event: 'walletLogin'  // Exempts from middleware for initial auth
+                event: 'walletLogin'
             } 
         });
 

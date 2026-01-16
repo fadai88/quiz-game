@@ -327,8 +327,8 @@
             });
         }
 
-        const socket = io('http://localhost:5000', { 
-            withCredentials: true,  // CRITICAL: Send cookies for authentication
+        const socket = io({ 
+            withCredentials: true,
         });
 
         socket.on('error', (error) => {
