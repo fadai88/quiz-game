@@ -2015,6 +2015,7 @@ class TriviaBot {
 // SOCKET.IO COOKIE AUTHENTICATION MIDDLEWARE
 // ============================================================================
 // Validates session from httpOnly cookie before allowing Socket.IO connection
+/*
 io.use(async (socket, next) => {
     const startTime = Date.now();
     
@@ -2103,7 +2104,7 @@ io.use(async (socket, next) => {
         next(new Error('Authentication failed'));
     }
 });
-
+*/
 
 io.on('connection', (socket) => {
     logger.info('New client connected:', socket.id);
