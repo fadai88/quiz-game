@@ -989,6 +989,19 @@ app.get('/api/auth/session', async (req, res) => {
     }
 });
 
+// NEW: Config endpoint for client-side configuration
+app.get('/api/config', (req, res) => {
+    try {
+        res.json({
+            recaptchaEnabled: process.env.ENABLE_RECAPTCHA === 'true',
+            recaptchaSiteKey: process.env.RECAPTCHA_SITE_KEY || ''
+        });
+    } catch (error) {
+        logger.error('[CONFIG] Error serving config:', { error: error });
+        res.status(500).json({ error: 'Failed to load configuration' });
+    }
+});
+
 console.log('✅ HTTP authentication endpoints configured');
 
 app.get('/game.html', (req, res) => {
@@ -1331,7 +1344,12 @@ async function getMatchmakingPoolWallets(betAmount) {
     try {
         return await redisClient.smembers(`active:matchmaking:${betAmount}`);
     } catch (error) {
-        logger.error('Error getting matchmaking pool wallets:', { error: error });
+        logger.error('Error getting matchmaking pool wallets:', { 
+            message: error?.message || String(error),
+            code: error?.code,
+            name: error?.name,
+            betAmount
+        });
         return [];
     }
 }
@@ -2127,7 +2145,12 @@ io.on('connection', (socket) => {
                 socket.disconnect();
             }
         } catch (error) {
-            logger.error('Error checking IP blocklist:', { error: error });
+            logger.error('Error checking IP blocklist:', { 
+                message: error?.message || String(error),
+                code: error?.code,
+                name: error?.name,
+                ip: connectionData.ip
+            });
         }
     })();
 
@@ -2308,19 +2331,24 @@ io.on('connection', (socket) => {
                 });
             } catch (error) {
                 // Better error logging
-                console.error('❌ Unexpected login error:', error);
-                console.error('Error message:', error?.message);
-                console.error('Error stack:', error?.stack);
-                logger.error('Unexpected login error:', { 
-                    message: error?.message,
+                const errorDetails = {
+                    message: error?.message || String(error),
                     stack: error?.stack,
                     name: error?.name,
-                    toString: error?.toString()
-                });
+                    code: error?.code
+                };
+                console.error('❌ Unexpected login error:', errorDetails);
+                logger.error('Unexpected login error:', errorDetails);
                 socket.emit('loginFailure', 'An unexpected error occurred. Please try again.');
             }
         } catch (error) {
-            logger.error('Unexpected login error:', { error: error });
+            const errorDetails = {
+                message: error?.message || String(error),
+                stack: error?.stack,
+                name: error?.name,
+                code: error?.code
+            };
+            logger.error('Unexpected login error (outer):', errorDetails);
             socket.emit('loginFailure', 'An unexpected error occurred. Please try again.');
         }
     });

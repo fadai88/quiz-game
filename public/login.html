@@ -7,11 +7,12 @@
     <link rel="stylesheet" href="styles.css">
     <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.min.js"></script>
     <script>
-        window.recaptchaEnabled = true;
+        // Make reCAPTCHA optional - will be fetched from server config
+        window.recaptchaEnabled = false; // Default to false, will be updated by server
         window.recaptchaSiteKey = "6LeDS1IqAAAAAMx338dPnRkVkj75ggf6Yq4OYu8i";
-        console.log("reCAPTCHA config loaded:", { enabled: window.recaptchaEnabled, siteKey: window.recaptchaSiteKey });
+        console.log("reCAPTCHA config (initial):", { enabled: window.recaptchaEnabled, siteKey: window.recaptchaSiteKey });
     </script>
-    <script src="https://www.google.com/recaptcha/api.js?render=6LeDS1IqAAAAAMx338dPnRkVkj75ggf6Yq4OYu8i"></script>
+    <script src="https://www.google.com/recaptcha/api.js?render=6LeDS1IqAAAAAMx338dPnRkVkj75ggf6Yq4OYu8i" onerror="console.warn('reCAPTCHA script failed to load')"></script>
     <style>
         .container {
             max-width: 600px;
@@ -104,7 +105,7 @@
             </div>
             
             <button id="connectWalletBtn" class="wallet-button">
-                <img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">
+                <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128' fill='%23AB9FF2'%3E%3Cpath d='M96 24c17.7 0 32 14.3 32 32v48c0 17.7-14.3 32-32 32H32C14.3 136 0 121.7 0 104V56c0-17.7 14.3-32 32-32h64zm-32 40c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16zm32 0c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16z'/%3E%3C/svg%3E" alt="Phantom" class="wallet-icon">
                 Connect Phantom Wallet
             </button>
             
@@ -170,6 +171,25 @@
                 event: 'walletLogin'
             } 
         });
+
+        // Fetch server configuration on page load
+        async function fetchServerConfig() {
+            try {
+                const response = await fetch('/api/config');
+                if (response.ok) {
+                    const config = await response.json();
+                    window.recaptchaEnabled = config.recaptchaEnabled || false;
+                    console.log('Server config loaded - reCAPTCHA:', window.recaptchaEnabled);
+                } else {
+                    console.warn('Failed to fetch server config, using defaults');
+                }
+            } catch (error) {
+                console.warn('Error fetching server config:', error.message);
+            }
+        }
+        
+        // Load config when page loads
+        fetchServerConfig();
 
         socket.on('error', (error) => {
             logError('socket-error', error);  // ✅ Safe logging
@@ -285,19 +305,24 @@
                     return;
                 }
 
-                // Generate reCAPTCHA token using reusable function
+                // Generate reCAPTCHA token only if enabled
                 let recaptchaToken = null;
-                try {
-                    recaptchaToken = await getRecaptchaToken('wallet_connect');
-                } catch (error) {
-                    console.error('reCAPTCHA generation failed:', error);
-                    showError('Verification required. Please complete the reCAPTCHA challenge and try again.');
-                    return;
+                if (window.recaptchaEnabled) {
+                    try {
+                        recaptchaToken = await getRecaptchaToken('wallet_connect');
+                        console.log('reCAPTCHA token generated successfully');
+                    } catch (error) {
+                        console.error('reCAPTCHA generation failed:', error);
+                        showError('Verification required. Please complete the reCAPTCHA challenge and try again.');
+                        return;
+                    }
+                } else {
+                    console.log('reCAPTCHA disabled, skipping token generation');
                 }
                 
                 const connectButton = document.getElementById('connectWalletBtn');
                 connectButton.disabled = true;
-                connectButton.innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connecting...';
+                connectButton.innerHTML = '<img src="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 128 128%27 fill=%27%23AB9FF2%27%3E%3Cpath d=%27M96 24c17.7 0 32 14.3 32 32v48c0 17.7-14.3 32-32 32H32C14.3 136 0 121.7 0 104V56c0-17.7 14.3-32 32-32h64zm-32 40c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16zm32 0c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16z%27/%3E%3C/svg%3E" alt="Phantom" class="wallet-icon">Connecting...';
                 
                 try {
                     // Connect to wallet
@@ -318,10 +343,6 @@
                     // Store for HTTP authentication after Socket.IO verification
                     lastSignature = signature;
                     lastMessage = message;
-                    
-                    if (window.recaptchaEnabled && !recaptchaToken) {
-                        throw new Error('reCAPTCHA token required for login');
-                    }
 
                     // Send to server for verification
                     socket.emit('walletLogin', { 
@@ -344,14 +365,14 @@
                 } catch (error) {
                     logError('wallet-connection', error);  // ✅ Safe logging
                     connectButton.disabled = false;
-                    connectButton.innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
+                    connectButton.innerHTML = '<img src="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 128 128%27 fill=%27%23AB9FF2%27%3E%3Cpath d=%27M96 24c17.7 0 32 14.3 32 32v48c0 17.7-14.3 32-32 32H32C14.3 136 0 121.7 0 104V56c0-17.7 14.3-32 32-32h64zm-32 40c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16zm32 0c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16z%27/%3E%3C/svg%3E" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
                     showError(getErrorMessage(error) || 'Failed to connect wallet. Please try again.');  // ✅ Safe message
                 }
             } catch (err) {
                 logError('connect-wallet', err);  // ✅ Safe logging
                 const connectButton = document.getElementById('connectWalletBtn');
                 connectButton.disabled = false;
-                connectButton.innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
+                connectButton.innerHTML = '<img src="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 128 128%27 fill=%27%23AB9FF2%27%3E%3Cpath d=%27M96 24c17.7 0 32 14.3 32 32v48c0 17.7-14.3 32-32 32H32C14.3 136 0 121.7 0 104V56c0-17.7 14.3-32 32-32h64zm-32 40c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16zm32 0c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16z%27/%3E%3C/svg%3E" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
                 
                 const errorMsg = getErrorMessage(err);
                 if (errorMsg.toLowerCase().includes('recaptcha')) {
@@ -424,21 +445,21 @@
                     logError('http-auth-failed', { error: result.error });  // ✅ Safe logging
                     showError(getErrorMessage(result.error) || 'Authentication failed. Please try again.');
                     document.getElementById('connectWalletBtn').disabled = false;
-                    document.getElementById('connectWalletBtn').innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
+                    document.getElementById('connectWalletBtn').innerHTML = '<img src="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 128 128%27 fill=%27%23AB9FF2%27%3E%3Cpath d=%27M96 24c17.7 0 32 14.3 32 32v48c0 17.7-14.3 32-32 32H32C14.3 136 0 121.7 0 104V56c0-17.7 14.3-32 32-32h64zm-32 40c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16zm32 0c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16z%27/%3E%3C/svg%3E" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
                 }
-                
+
             } catch (error) {
                 logError('http-auth-error', error);  // ✅ Safe logging
                 showError('Authentication failed. Please try again.');
                 document.getElementById('connectWalletBtn').disabled = false;
-                document.getElementById('connectWalletBtn').innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
+                document.getElementById('connectWalletBtn').innerHTML = '<img src="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 128 128%27 fill=%27%23AB9FF2%27%3E%3Cpath d=%27M96 24c17.7 0 32 14.3 32 32v48c0 17.7-14.3 32-32 32H32C14.3 136 0 121.7 0 104V56c0-17.7 14.3-32 32-32h64zm-32 40c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16zm32 0c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16z%27/%3E%3C/svg%3E" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
             }
         });
 
         socket.on('loginFailure', (error) => {
             logError('login-failure', error);  // ✅ Safe logging
             document.getElementById('connectWalletBtn').disabled = false;
-            document.getElementById('connectWalletBtn').innerHTML = '<img src="assets/phantom-icon.svg" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
+            document.getElementById('connectWalletBtn').innerHTML = '<img src="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 128 128%27 fill=%27%23AB9FF2%27%3E%3Cpath d=%27M96 24c17.7 0 32 14.3 32 32v48c0 17.7-14.3 32-32 32H32C14.3 136 0 121.7 0 104V56c0-17.7 14.3-32 32-32h64zm-32 40c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16zm32 0c0 8.8-7.2 16-16 16s-16-7.2-16-16 7.2-16 16-16 16 7.2 16 16z%27/%3E%3C/svg%3E" alt="Phantom" class="wallet-icon">Connect Phantom Wallet';
             showError(getErrorMessage(error));  // ✅ User-friendly message
         });
 
