@@ -2155,6 +2155,10 @@ io.on('connection', (socket) => {
 
     socket.on('walletLogin', async ({ walletAddress, signature, message, recaptchaToken, clientData }) => {
         try {
+            const connectionData = {
+                ip: socket.handshake.headers['x-forwarded-for']?.split(',')[0]?.trim() || socket.handshake.address,
+                userAgent: socket.handshake.headers['user-agent'] || 'Unknown'
+            };
             // Redis operation wrapped in safeRedisOp
             const isWalletBlocked = await redisClient.get(`blocklist:wallet:${walletAddress}`);
             if (isWalletBlocked) {
