@@ -1124,7 +1124,6 @@ let redisClient;
 
 async function initializeRedis() {
     try {
-        let redisClient;
         
         // ============================================================================
         // HEROKU COMPATIBILITY: Handle REDIS_URL from Heroku Redis add-on
