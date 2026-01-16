@@ -2307,8 +2307,17 @@ io.on('connection', (socket) => {
                     verifyToken: verifyToken  // Send to client for HTTP authentication
                 });
             } catch (error) {
-                logger.error('Database error during login:', { error: error });
-                socket.emit('loginFailure', 'Server error during login. Please try again.');
+                // Better error logging
+                console.error('❌ Unexpected login error:', error);
+                console.error('Error message:', error?.message);
+                console.error('Error stack:', error?.stack);
+                logger.error('Unexpected login error:', { 
+                    message: error?.message,
+                    stack: error?.stack,
+                    name: error?.name,
+                    toString: error?.toString()
+                });
+                socket.emit('loginFailure', 'An unexpected error occurred. Please try again.');
             }
         } catch (error) {
             logger.error('Unexpected login error:', { error: error });
