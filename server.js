@@ -830,7 +830,7 @@ app.use(httpRequestLogger);
 const COOKIE_OPTIONS = {
     httpOnly: true,  // Prevents JavaScript access (XSS protection)
     secure: ENVIRONMENT === 'production',  // HTTPS only in production
-    sameSite: 'strict',  // CSRF protection
+    sameSite: 'lax',  // CSRF protection
     maxAge: 24 * 60 * 60 * 1000,  // 24 hours
     signed: true  // Sign cookies to prevent tampering
 };
