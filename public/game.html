@@ -168,11 +168,6 @@
             TREASURY_WALLET: new solanaWeb3.PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
         };
 
-        const connection = new solanaWeb3.Connection(
-            'https://devnet.helius-rpc.com/?api-key=8c34d064-0c20-401a-9c89-630ae042b567',
-            'confirmed'
-        );
-
     </script>
 </head>
 <body>
@@ -654,8 +649,12 @@
             }
         }
 
-        // Initialize USDC manager after connection is created
-        const usdcManager = new USDCManager(connection);
+        const minimalConnection = new solanaWeb3.Connection(
+            'https://api.devnet.solana.com',
+            'confirmed'
+        );
+        
+        const usdcManager = new USDCManager(minimalConnection);
 
         async function checkSession() {
             try {
@@ -776,31 +775,49 @@
                     return;
                 }
 
-                if (!usdcManager) {
-                    throw new Error('USDCManager not initialized');
+                console.log('[balance] Fetching balance for:', connectedWallet);
+
+                // Use secure server-side balance API
+                const response = await fetch(`/api/balance/${connectedWallet}`, {
+                    method: 'GET',
+                    credentials: 'include', // Send session cookie
+                    headers: {
+                        'Accept': 'application/json'
+                    }
+                });
+
+                if (!response.ok) {
+                    if (response.status === 401) {
+                        console.error('[balance] Not authenticated - redirecting');
+                        window.location.href = 'login.html';
+                        return;
+                    }
+                    if (response.status === 403) {
+                        console.error('[balance] Forbidden - wallet mismatch');
+                        throw new Error('Unauthorized wallet access');
+                    }
+                    throw new Error(`Balance check failed: ${response.status}`);
                 }
 
-                // Get balance using usdcManager
-                const balanceResult = await usdcManager.getUSDCBalance(connectedWallet);
-                
-                if (balanceResult.needsTokenAccount) {
-                    document.getElementById('balanceDisplay').textContent = 'Balance: 0 USDC';
-                    try {
-                        const transaction = balanceResult.createAccountTransaction;
-                        const signed = await window.solana.signTransaction(transaction);
-                        await connection.sendRawTransaction(signed.serialize());
-                        console.log('Created USDC token account');
-                        await updateBalance();
-                    } catch (error) {
-                        logError('token-account-creation:', error);
-                    }
-                } else {
-                    const formattedBalance = balanceResult.balance.toFixed(2);
-                    document.getElementById('balanceDisplay').textContent = `Balance: ${formattedBalance} USDC`;
+                const data = await response.json();
+                const balance = parseFloat(data.balance);
+
+                console.log('[balance] Balance retrieved:', balance);
+
+                // Update UI
+                const balanceElement = document.getElementById('balanceDisplay');
+                if (balanceElement) {
+                    balanceElement.textContent = `Balance: ${balance.toFixed(6)} USDC`;
                 }
+
             } catch (error) {
                 logError('balance-update', error);
-                document.getElementById('balanceDisplay').textContent = 'Error fetching balance';
+                console.error('[balance] Failed to update balance:', error);
+                
+                const balanceElement = document.getElementById('balanceDisplay');
+                if (balanceElement) {
+                    balanceElement.textContent = 'Error fetching balance';
+                }
             }
         }
 

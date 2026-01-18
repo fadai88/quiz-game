@@ -1002,6 +1002,137 @@ app.get('/api/config', (req, res) => {
     }
 });
 
+app.get('/api/balance/:walletAddress', async (req, res) => {
+    try {
+        const { walletAddress } = req.params;
+        
+        // Validate wallet address format
+        if (!walletAddress || walletAddress.length < 32 || walletAddress.length > 44) {
+            SecurityLogger.log('balance_check_invalid_address', {
+                ip: req.ip,
+                address: walletAddress
+            });
+            return res.status(400).json({ error: 'Invalid wallet address' });
+        }
+        
+        // Validate session
+        const session = req.cookies.session;
+        if (!session) {
+            return res.status(401).json({ error: 'Not authenticated' });
+        }
+        
+        const sessionData = await redisClient.get(`session:${session}`);
+        if (!sessionData) {
+            return res.status(401).json({ error: 'Session expired' });
+        }
+        
+        const sessionInfo = JSON.parse(sessionData);
+        
+        // Only allow users to check their own balance
+        if (sessionInfo.walletAddress !== walletAddress) {
+            SecurityLogger.log('balance_check_unauthorized', {
+                ip: req.ip,
+                requestedWallet: walletAddress,
+                sessionWallet: sessionInfo.walletAddress
+            });
+            return res.status(403).json({ error: 'Unauthorized' });
+        }
+        
+        // Use server-side connection (API key is secure)
+        const publicKey = new PublicKey(walletAddress);
+        
+        // Get USDC token accounts
+        const tokenAccounts = await config.connection.getTokenAccountsByOwner(
+            publicKey,
+            { mint: config.USDC_MINT }
+        );
+        
+        let balance = 0;
+        if (tokenAccounts.value.length > 0) {
+            const accountInfo = await config.connection.getTokenAccountBalance(
+                tokenAccounts.value[0].pubkey
+            );
+            balance = parseFloat(accountInfo.value.amount) / 1_000_000; // Convert to USDC
+        }
+        
+        logger.info('[BALANCE] Balance checked:', {
+            wallet: walletAddress,
+            balance: balance
+        });
+        
+        res.json({ 
+            balance: balance.toFixed(6),
+            walletAddress 
+        });
+        
+    } catch (error) {
+        logger.error('[BALANCE] Error fetching balance:', { 
+            error: error.message,
+            wallet: req.params.walletAddress 
+        });
+        res.status(500).json({ error: 'Failed to fetch balance' });
+    }
+});
+
+// Rate-limited public balance check (no authentication required)
+app.get('/api/public-balance/:walletAddress', async (req, res) => {
+    try {
+        const { walletAddress } = req.params;
+        
+        // Validate wallet address format
+        if (!walletAddress || walletAddress.length < 32 || walletAddress.length > 44) {
+            return res.status(400).json({ error: 'Invalid wallet address' });
+        }
+        
+        // Rate limiting: max 10 requests per minute per IP
+        const ip = req.ip || req.connection.remoteAddress;
+        const rateLimitKey = `balance-check:${ip}`;
+        
+        const requestCount = await redisClient.incr(rateLimitKey);
+        if (requestCount === 1) {
+            await redisClient.expire(rateLimitKey, 60); // 1 minute TTL
+        }
+        
+        if (requestCount > 10) {
+            SecurityLogger.log('balance_check_rate_limit', {
+                ip: ip,
+                wallet: walletAddress
+            });
+            return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
+        }
+        
+        // Use server-side connection (API key is secure)
+        const publicKey = new PublicKey(walletAddress);
+        
+        // Get USDC token accounts
+        const tokenAccounts = await config.connection.getTokenAccountsByOwner(
+            publicKey,
+            { mint: config.USDC_MINT }
+        );
+        
+        let balance = 0;
+        if (tokenAccounts.value.length > 0) {
+            const accountInfo = await config.connection.getTokenAccountBalance(
+                tokenAccounts.value[0].pubkey
+            );
+            balance = parseFloat(accountInfo.value.amount) / 1_000_000; // Convert to USDC
+        }
+        
+        res.json({ 
+            balance: balance.toFixed(6),
+            walletAddress 
+        });
+        
+    } catch (error) {
+        logger.error('[PUBLIC-BALANCE] Error:', { 
+            error: error.message,
+            wallet: req.params.walletAddress 
+        });
+        res.status(500).json({ error: 'Failed to fetch balance' });
+    }
+});
+
+console.log('✅ Secure balance check endpoints configured');
 console.log('✅ HTTP authentication endpoints configured');
 
 app.get('/game.html', (req, res) => {
