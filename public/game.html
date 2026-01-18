@@ -433,8 +433,6 @@
             return results === null ? '' : decodeURIComponent(results[1].replace(/\+/g, ' '));
         };
 
-        
-
         class USDCManager {
             constructor(connection) {
                 this.connection = connection;
@@ -650,7 +648,7 @@
         }
 
         const minimalConnection = new solanaWeb3.Connection(
-            'https://api.devnet.solana.com',
+            'https://devnet.helius-rpc.com/?api-key=94ce2c4c-e8bf-491c-98c3-8b25423f5240',
             'confirmed'
         );
         
