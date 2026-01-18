@@ -1016,12 +1016,12 @@ app.get('/api/balance/:walletAddress', async (req, res) => {
         }
         
         // Validate session
-        const session = req.cookies.session;
-        if (!session) {
+        const { sessionToken } = req.signedCookies;
+        if (!sessionToken) {
             return res.status(401).json({ error: 'Not authenticated' });
         }
         
-        const sessionData = await redisClient.get(`session:${session}`);
+        const sessionData = await redisClient.get(`session:${sessionToken}`);
         if (!sessionData) {
             return res.status(401).json({ error: 'Session expired' });
         }
