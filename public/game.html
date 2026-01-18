@@ -647,12 +647,12 @@
             }
         }
 
-        const minimalConnection = new solanaWeb3.Connection(
+        const connection = new solanaWeb3.Connection(
             'https://devnet.helius-rpc.com/?api-key=94ce2c4c-e8bf-491c-98c3-8b25423f5240',
             'confirmed'
         );
         
-        const usdcManager = new USDCManager(minimalConnection);
+        const usdcManager = new USDCManager(connection);
 
         async function checkSession() {
             try {
