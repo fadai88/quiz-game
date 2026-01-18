@@ -4592,6 +4592,7 @@ async function startNextQuestion(roomId) {
             }
         })();
     }
+}
 
 function chooseBotName() {
     const botNames = [
