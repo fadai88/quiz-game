@@ -2284,27 +2284,26 @@ io.on('connection', (socket) => {
         }
     })();
 
-    // TEMPORARY: Disabled packet rate limiting - redisClient not properly initialized
-    // socket.use(async (packet, next) => {
-    //     try {
-    //         if (packet.type === 0 || packet.type === 2) { // Skip for connect/events
-    //             next();
-    //             return;
-    //         }
-    //         // Use a separate, burst-friendly limiter for packets
-    //         const packetLimiter = new RateLimiterRedis({
-    //             storeClient: redisClient,
-    //             points: 10, // 10 packets/30s burst
-    //             duration: 30,
-    //             keyPrefix: 'socket-packet'
-    //         });
-    //         await packetLimiter.consume(socket.id);
-    //         next();
-    //     } catch (error) {
-    //         logger.warn(`Packet rate limit hit for ${socket.id}: ${error.message}`);
-    //         next(new Error('Rate limited'));
-    //     }
-    // });
+    socket.use(async (packet, next) => {
+        try {
+            if (packet.type === 0 || packet.type === 2) { // Skip for connect/events
+                next();
+                return;
+            }
+            // Use a separate, burst-friendly limiter for packets
+            const packetLimiter = new RateLimiterRedis({
+                storeClient: redisClient,
+                points: 10, // 10 packets/30s burst
+                duration: 30,
+                keyPrefix: 'socket-packet'
+            });
+            await packetLimiter.consume(socket.id);
+            next();
+        } catch (error) {
+            logger.warn(`Packet rate limit hit for ${socket.id}: ${error.message}`);
+            next(new Error('Rate limited'));
+        }
+    });
 
     socket.on('walletLogin', async ({ walletAddress, signature, message, recaptchaToken, clientData }) => {
         try {
