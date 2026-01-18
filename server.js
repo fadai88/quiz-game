@@ -1016,12 +1016,12 @@ app.get('/api/balance/:walletAddress', async (req, res) => {
         }
         
         // Validate session
-        const { sessionToken } = req.signedCookies;
-        if (!sessionToken) {
+        const session = req.cookies.session;
+        if (!session) {
             return res.status(401).json({ error: 'Not authenticated' });
         }
         
-        const sessionData = await redisClient.get(`session:${sessionToken}`);
+        const sessionData = await redisClient.get(`session:${session}`);
         if (!sessionData) {
             return res.status(401).json({ error: 'Session expired' });
         }
@@ -4485,62 +4485,7 @@ async function startNextQuestion(roomId) {
         totalQuestions: room.questions.length
     });
 
-    // Handle bot answer if applicable
-    const botData = room.players.find(p => p.isBot);
-    if (botData) {
-        const bot = new TriviaBot(botData.username, botData.difficultyLevelString || 'MEDIUM');
-        bot.score = botData.score || 0;
-        bot.totalResponseTime = botData.totalResponseTime || 0;
-        bot.currentQuestionIndex = botData.currentQuestionIndex || 0;
-        bot.answersGiven = botData.answersGiven || [];
-
-        try {
-            const botAnswer = await bot.answerQuestion(
-                currentQuestion.question,
-                currentQuestion.shuffledOptions,
-                shuffledCorrectAnswer
-            );
-
-            // Re-check room state before updating
-            room = await getGameRoom(roomId);
-            if (!room || room.isDeleted) {
-                logger.info(`Room ${roomId} deleted or not found during bot answer processing`);
-                return;
-            }
-
-            const botIndex = room.players.findIndex(p => p.isBot);
-            if (botIndex !== -1) {
-                room.players[botIndex] = {
-                    ...room.players[botIndex],
-                    score: bot.score,
-                    totalResponseTime: bot.totalResponseTime,
-                    currentQuestionIndex: bot.currentQuestionIndex,
-                    answersGiven: bot.answersGiven,
-                    answered: true,
-                    lastAnswer: botAnswer.answer,
-                    lastResponseTime: botAnswer.responseTime
-                };
-                room.answersReceived += 1;
-                await updateGameRoom(roomId, room);
-            }
-
-            logger.info(`Bot ${bot.username} answered question ${currentQuestion.tempId}: ${botAnswer.answer} (correct: ${botAnswer.isCorrect}, time: ${botAnswer.responseTime}ms)`);
-            io.to(roomId).emit('playerAnswered', {
-                username: bot.username,
-                isBot: true,
-                responseTime: botAnswer.responseTime,
-                timedOut: false
-            });
-        } catch (error) {
-            console.error(`Error processing bot answer in room ${roomId}:`, error);
-            io.to(roomId).emit('gameError', 'Error processing bot response. Game ended.');
-            room.isDeleted = true;
-            await updateGameRoom(roomId, room);
-            await redisClient.del(`room:${roomId}`);
-            return;
-        }
-    }
-
+    // Set up timeout BEFORE bot processing to ensure accurate timing
     room.questionTimeout = setTimeout(async () => {
         room = await getGameRoom(roomId);
         if (!room || room.isDeleted) {
@@ -4589,7 +4534,64 @@ async function startNextQuestion(roomId) {
 
         await completeQuestion(roomId);
     }, 10000);
-}
+
+    // Handle bot answer asynchronously (doesn't block timeout)
+    const botData = room.players.find(p => p.isBot);
+    if (botData) {
+        (async () => {
+            const bot = new TriviaBot(botData.username, botData.difficultyLevelString || 'MEDIUM');
+            bot.score = botData.score || 0;
+            bot.totalResponseTime = botData.totalResponseTime || 0;
+            bot.currentQuestionIndex = botData.currentQuestionIndex || 0;
+            bot.answersGiven = botData.answersGiven || [];
+
+            try {
+                const botAnswer = await bot.answerQuestion(
+                    currentQuestion.question,
+                    currentQuestion.shuffledOptions,
+                    shuffledCorrectAnswer
+                );
+
+                // Re-check room state before updating
+                room = await getGameRoom(roomId);
+                if (!room || room.isDeleted) {
+                    logger.info(`Room ${roomId} deleted or not found during bot answer processing`);
+                    return;
+                }
+
+                const botIndex = room.players.findIndex(p => p.isBot);
+                if (botIndex !== -1) {
+                    room.players[botIndex] = {
+                        ...room.players[botIndex],
+                        score: bot.score,
+                        totalResponseTime: bot.totalResponseTime,
+                        currentQuestionIndex: bot.currentQuestionIndex,
+                        answersGiven: bot.answersGiven,
+                        answered: true,
+                        lastAnswer: botAnswer.answer,
+                        lastResponseTime: botAnswer.responseTime
+                    };
+                    room.answersReceived += 1;
+                    await updateGameRoom(roomId, room);
+                }
+
+                logger.info(`Bot ${bot.username} answered question ${currentQuestion.tempId}: ${botAnswer.answer} (correct: ${botAnswer.isCorrect}, time: ${botAnswer.responseTime}ms)`);
+                io.to(roomId).emit('playerAnswered', {
+                    username: bot.username,
+                    isBot: true,
+                    responseTime: botAnswer.responseTime,
+                    timedOut: false
+                });
+            } catch (error) {
+                console.error(`Error processing bot answer in room ${roomId}:`, error);
+                io.to(roomId).emit('gameError', 'Error processing bot response. Game ended.');
+                room.isDeleted = true;
+                await updateGameRoom(roomId, room);
+                await redisClient.del(`room:${roomId}`);
+                return;
+            }
+        })();
+    }
 
 function chooseBotName() {
     const botNames = [
