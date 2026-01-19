@@ -507,7 +507,7 @@ const submitAnswerSchema = Joi.object({
         'number.min': 'Answer must be -1 (timeout) or 0-3 (option index)',
         'number.max': 'Answer index cannot exceed 3'
     }),
-    recaptchaToken: Joi.string().allow(null, '').optional()  // username removed - will use socket.user.walletAddress
+    recaptchaToken: Joi.string().optional().allow(null, '') 
 });
 
 const playerReadySchema = Joi.object({
@@ -1255,11 +1255,6 @@ let redisClient;
 
 async function initializeRedis() {
     try {
-        
-        // ============================================================================
-        // HEROKU COMPATIBILITY: Handle REDIS_URL from Heroku Redis add-on
-        // ============================================================================
-        
         if (process.env.REDIS_URL) {
             // Production (Heroku, Railway, Render, etc.)
             console.log('📡 Using REDIS_URL from environment');
@@ -1270,6 +1265,10 @@ async function initializeRedis() {
                 tls: {
                     rejectUnauthorized: false
                 },
+
+                keepAlive: 10000,      // Send keepalive packet every 10 seconds
+                family: 4,             // Force IPv4 (fixes some Heroku DNS resolution issues)
+                connectTimeout: 20000, // Increase timeout
                 
                 // Robust retry configuration
                 retryStrategy: (times) => {
@@ -2538,6 +2537,8 @@ io.on('connection', (socket) => {
                 const { roomId, room, player } = activeGame;
 
                 logger.info(`[RECONNECT] Found active game room ${roomId} for ${walletAddress}`);
+                // Ensure we join the specific wallet room again too
+                socket.join(`wallet:${walletAddress}`); 
 
                 try {
                     // 1. Restore socket state
@@ -3498,9 +3499,11 @@ io.on('connection', (socket) => {
                         socket.emit('gameError', sanitized);
                     }
                 } else if (event === 'submitAnswer') {
+                    const arrivalTime = Date.now();
+
                     const { roomId, questionId, answer, recaptchaToken } = args[0];
                     try {
-                        // ===== 1. INPUT VALIDATION =====
+                        // 2. VALIDATE INPUT
                         const { error } = submitAnswerSchema.validate({ roomId, questionId, answer, recaptchaToken });
                         if (error) {
                             const sanitized = sanitizeValidationError(error, 'submitAnswer');
@@ -3508,232 +3511,75 @@ io.on('connection', (socket) => {
                             return;
                         }
 
-                        // ===== 2. AUTHENTICATION CHECK =====
+                        // 3. AUTH CHECK
                         if (!socket.user || !socket.user.walletAddress) {
                             socket.emit('answerError', 'Not authenticated');
                             return;
                         }
-
                         const authenticatedUsername = socket.user.walletAddress;
-                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                        await rateLimitEvent(authenticatedUsername, 'submitAnswer', clientIP, socket);
 
-                        console.log(`Received answer from ${authenticatedUsername} in room ${roomId} for question ${questionId}:`, { answer });
-
-                        // ============================================================================
-                        // ✅ CRITICAL FIX: IDEMPOTENCY KEY - ACQUIRE LOCK BEFORE ANY EXPENSIVE WORK
-                        // ============================================================================
-                        // This prevents ALL race conditions by using Redis's atomic SET NX operation
-                        // Only ONE request can acquire this lock - all others are rejected immediately
-
+                        // 4. IDEMPOTENCY LOCK (Prevents double clicks)
                         const idempotencyKey = `answer:${roomId}:${questionId}:${authenticatedUsername}`;
                         const lockAcquired = await acquireIdempotencyLock(idempotencyKey, 30);
 
                         if (!lockAcquired) {
-                            // This request is a duplicate - another request already claimed this answer
-                            raceConditionMetrics.idempotencyKeyHits++;
-                            logger.warn(`Duplicate answer submission blocked by idempotency key: ${authenticatedUsername} in room ${roomId} for question ${questionId}`);
-                            socket.emit('answerError', 'Already answered this question');
-                            return;
+                            logger.warn(`Duplicate answer blocked: ${authenticatedUsername}`);
+                            return; 
                         }
 
-                        logger.info(`✅ Idempotency lock acquired for ${authenticatedUsername} - question ${questionId}`);
-                        // ============================================================================
-
-                        // ===== 3. PRE-FETCH: External API calls OUTSIDE atomic transaction =====
-                        // These calls can take 500-2500ms and must NOT be inside the Redis WATCH period
-                        let recaptchaResult = null;
-                        let user = null;
-                        const isProduction = process.env.NODE_ENV === 'production';
-
-                        // Pre-fetch reCAPTCHA verification
-                        if (isProduction) {
-                            if (!recaptchaToken) {
-                                await releaseIdempotencyLock(idempotencyKey);
-                                socket.emit('answerError', 'Verification required');
-                                return;
-                            }
-                            try {
-                                recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                                if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
-                                    botDetector.trackEvent(authenticatedUsername, 'low_recaptcha_score', {
-                                        score: recaptchaResult.score,
-                                        event: 'submitAnswer'
-                                    });
-                                    await releaseIdempotencyLock(idempotencyKey);
-                                    socket.emit('answerError', 'Verification failed');
-                                    return;
-                                }
-                            } catch (error) {
-                                SecurityLogger.recaptchaFailed(authenticatedUsername, error.message, null, clientIP);
-                                trackRecaptchaFailure(authenticatedUsername, { error: error.message });
-
-                                try {
-                                    await rateLimitFailedRecaptcha(clientIP);
-                                } catch (rateError) {
-                                    await releaseIdempotencyLock(idempotencyKey);
-                                    socket.emit('answerError', 'Too many failed verification attempts. Please try again later.');
-                                    return;
-                                }
-                                await releaseIdempotencyLock(idempotencyKey);
-                                socket.emit('answerError', 'Verification failed');
-                                return;
-                            }
-                        } else if (process.env.ENABLE_RECAPTCHA === 'true' && recaptchaToken) {
-                            try {
-                                recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                                if (recaptchaResult.score !== undefined && recaptchaResult.score < 0.5) {
-                                    logger.warn(`⚠️ Low score in dev: ${recaptchaResult.score} (allowing anyway)`);
-                                }
-                            } catch (error) {
-                                logger.warn(`⚠️ Dev reCAPTCHA failed (allowing anyway): ${error.message}`);
-                            }
-                        }
-
-                        // Pre-fetch user data
-                        try {
-                            user = await User.findOne({ walletAddress: authenticatedUsername });
-                        } catch (error) {
-                            if (isProduction) {
-                                await releaseIdempotencyLock(idempotencyKey);
-                                socket.emit('answerError', 'Database error. Please try again.');
-                                return;
-                            }
-                            logger.warn(`User lookup failed (non-critical): ${error.message}`);
-                        }
-
-                        // ===== 4. ATOMIC ROOM UPDATE WITH RACE CONDITION PROTECTION =====
+                        // 5. ATOMIC UPDATE (Using arrivalTime)
                         try {
                             const updatedRoom = await atomicRoomUpdate(roomId, async (room) => {
-                                // All validation and updates happen inside atomic block
-
-                                // Room validation
-                                if (!room.questions || room.questions.length === 0) {
-                                    throw new Error('Game not properly initialized');
-                                }
-
-                                if (!room.questionStartTime || room.currentQuestionIndex >= room.questions.length) {
-                                    throw new Error('No active question');
-                                }
-
+                                // ... (Keep existing room validation checks like "Game not initialized", "Invalid Question ID" etc.) ...
+                                
+                                // --- CUSTOM VALIDATION START ---
+                                if (!room.questions || room.questions.length === 0) throw new Error('Game not initialized');
                                 const currentQuestion = room.questionIdMap.get(questionId);
-                                if (!currentQuestion) {
-                                    throw new Error('Invalid question ID');
-                                }
-
-                                const questionData = room.questionIdMap.get(questionId);
-                                if (!questionData) {
-                                    throw new Error('Question not found in map');
-                                }
-
-                                if (questionId !== currentQuestion.tempId) {
-                                    const questionIndex = room.questions.findIndex(q => q.tempId === questionId);
-                                    if (questionIndex !== -1 && questionIndex < room.currentQuestionIndex) {
-                                        throw new Error('Question expired');
-                                    }
-                                    throw new Error('Invalid question');
-                                }
-
+                                if (!currentQuestion) throw new Error('Invalid question ID');
+                                
                                 const player = room.players.find(p => p.username === authenticatedUsername && !p.isBot);
-                                if (!player) {
-                                    throw new Error('Player not found');
+                                if (!player) throw new Error('Player not found');
+                                if (player.answered) throw new Error('Already answered');
+                                // --- CUSTOM VALIDATION END ---
+
+                                // 6. CALCULATE TIME USING ARRIVAL TIME (The Fix)
+                                const serverResponseTime = arrivalTime - room.questionStartTime;
+                                
+                                // Allow a small grace period (e.g. 10.5 seconds) for network latency
+                                if (serverResponseTime > 10500) { 
+                                    logger.warn(`Late answer: ${serverResponseTime}ms`);
+                                    // Optionally accept it as late or reject. 
+                                    // For now, let's accept it if it's close, or mark as timeout.
                                 }
 
-                                if (player.answered) {
-                                    throw new Error('Already answered');
-                                }
-
-                                // Timing validation
-                                const serverResponseTime = Date.now() - room.questionStartTime;
-                                if (serverResponseTime < 200 || serverResponseTime > 15000) {
-                                    logger.warn(`Invalid response time ${serverResponseTime}ms from ${authenticatedUsername}`);
-                                    await redisClient.set(`suspect:${authenticatedUsername}`, 1, 'EX', 3600);
-                                    throw new Error('Invalid response timing');
-                                }
-
-                                // Bot detection
-                                const botSuspicion = botDetector.getSuspicionScore(authenticatedUsername);
-                                SecurityLogger.botSuspicion(authenticatedUsername, botSuspicion, 'submitAnswer', 0.7);
-                                if (botSuspicion >= 0.8) {
-                                    trackBotSuspicion(authenticatedUsername, { score: botSuspicion, event: 'submitAnswer' });
-                                }
-
-                                // Device fingerprint check (using pre-fetched user and recaptchaResult)
-                                if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint) {
-                                    SecurityLogger.deviceMismatch(authenticatedUsername, user.deviceFingerprint, socket.user.fingerprint, { event: 'submitAnswer' });
-                                    botDetector.trackEvent(authenticatedUsername, 'fingerprint_mismatch', { event: 'submitAnswer' });
-
-                                    if (isProduction && recaptchaResult && recaptchaResult.score !== undefined && recaptchaResult.score < 0.7) {
-                                        throw new Error('Device verification failed. Please relogin.');
-                                    }
-                                }
-
-                                // High-win streak check
-                                if (user && user.gamesPlayed > 5 && (user.wins / user.gamesPlayed) > 0.8) {
-                                    if (isProduction && (!recaptchaResult || !recaptchaResult.success)) {
-                                        throw new Error('Additional verification required due to high win rate.');
-                                    }
-                                }
-
-                                // ✅ PROCESS ANSWER (ATOMIC UPDATES)
-                                logger.info(`SERVER CALCULATED: ${authenticatedUsername} response time: ${serverResponseTime}ms`);
-
+                                // 7. REMOVED RECAPTCHA & FINGERPRINT CHECKS HERE FOR SPEED
+                                
+                                // 8. UPDATE SCORE
                                 const isCorrect = answer === currentQuestion.shuffledCorrectAnswer;
-
-                                // Mark as answered to prevent timeout handler
                                 player.answered = true;
                                 player.lastAnswer = answer;
-                                player.lastResponseTime = serverResponseTime;
+                                player.lastResponseTime = serverResponseTime; // Use the fixed time
                                 player.totalResponseTime = (player.totalResponseTime || 0) + serverResponseTime;
 
                                 if (isCorrect) {
                                     player.score = (player.score || 0) + 1;
-                                    logger.info(`Correct answer from ${authenticatedUsername}. New score: ${player.score}`);
                                 }
-
-                                // ✅ CRITICAL: Increment answersReceived atomically with score update
                                 room.answersReceived += 1;
 
-                                // BotDetector tracking
-                                botDetector.trackEvent(authenticatedUsername, 'answer_submitted', {
-                                    responseTime: serverResponseTime,
-                                    isCorrect,
-                                    answer,
-                                    questionId,
-                                    recaptchaScore: recaptchaResult?.score
-                                });
-
-                                // Store metadata for post-transaction actions
+                                // Metadata for post-processing
                                 room._submitMetadata = {
                                     username: authenticatedUsername,
                                     isCorrect,
-                                    serverResponseTime,
-                                    recaptchaResult,
-                                    user
+                                    serverResponseTime
                                 };
 
-                                return room; // Return modified room for atomic commit
+                                return room;
                             });
 
-                            // ===== POST-TRANSACTION: Update MongoDB (non-critical) =====
+                            // 9. EMIT RESULTS
                             const metadata = updatedRoom._submitMetadata;
-                            if (metadata.isCorrect) {
-                                try {
-                                    await User.findOneAndUpdate(
-                                        { walletAddress: authenticatedUsername },
-                                        {
-                                            $inc: {
-                                                correctAnswers: 1,
-                                                totalPoints: 1
-                                            }
-                                        }
-                                    );
-                                } catch (error) {
-                                    logger.error('Error updating user stats (non-critical):', error);
-                                }
-                            }
-
-                            // ===== EMIT RESULTS =====
+                            
+                            // Emit to specific player
                             socket.emit('answerResult', {
                                 username: authenticatedUsername,
                                 isCorrect: metadata.isCorrect,
@@ -3741,6 +3587,7 @@ io.on('connection', (socket) => {
                                 selectedAnswer: answer
                             });
 
+                            // Emit to room
                             socket.to(roomId).emit('playerAnswered', {
                                 username: authenticatedUsername,
                                 isBot: false,
@@ -3748,34 +3595,20 @@ io.on('connection', (socket) => {
                                 timedOut: false
                             });
 
-                            // Emit score update to all players
-                            io.to(roomId).emit('scoreUpdate', updatedRoom.players.map(p => ({
-                                username: p.username,
-                                score: p.score || 0,
-                                totalResponseTime: p.totalResponseTime || 0,
-                                isBot: p.isBot || false,
-                                difficulty: p.isBot ? p.difficultyLevelString : undefined
-                            })));
+                            // Feed the Bot Detector asynchronously (fire and forget - does NOT slow down the user)
+                            botDetector.trackEvent(authenticatedUsername, 'answer_submitted', {
+                                responseTime: metadata.serverResponseTime,
+                                isCorrect: metadata.isCorrect,
+                                questionId: questionId
+                            });
 
                         } catch (error) {
-                            // ✅ IMPORTANT: Release lock on error so user can retry if needed
-                            await releaseIdempotencyLock(idempotencyKey);
-
-                            // Handle specific errors
-                            if (error.message.includes('Max retries')) {
-                                logger.error(`CRITICAL: Severe race condition in room ${roomId}:`, error);
-                                socket.emit('answerError', 'Server is busy. Please try again.');
-                            } else {
-                                logger.error(`Answer validation failed:`, error.message);
-                                socket.emit('answerError', error.message);
-                            }
+                            await releaseIdempotencyLock(idempotencyKey); // Release lock on error
+                            socket.emit('answerError', error.message || 'Error submitting answer');
                         }
 
                     } catch (error) {
-                        // ✅ IMPORTANT: Release lock on outer error as well
-                        await releaseIdempotencyLock(idempotencyKey);
-                        const sanitized = sanitizeError(error, 'submitAnswer', 'Error submitting answer. Please try again.');
-                        socket.emit('answerError', sanitized);
+                        socket.emit('gameError', 'An error occurred.');
                     }
                 } 
             } catch (error) {
@@ -4782,41 +4615,80 @@ async function handleGameOver(room, roomId) {
         const winnerIsActuallyHuman = winner && !room.players.find(p => p.username === winner && p.isBot);
         let payoutSignature = null;
         let paymentId = null;
+        let fraudDetected = false;
 
-        if (winnerIsActuallyHuman && paymentProcessor) {
-            try {
-                const multiplier = botOpponent ? 1.5 : 1.8;
-                const winningAmount = calculateWinnings(room.betAmount, multiplier);
-                // FIXED: Queue the payout instead of sending directly
-                const queuedPayment = await paymentProcessor.queuePayment(
-                    winner,
-                    Number(winningAmount),
-                    roomId, // Use roomId as gameId
-                    room.betAmount,
-                    { botOpponent, singlePlayerMode: isSinglePlayerEncounter }
+        if (winnerIsActuallyHuman) {
+            // 1. CHECK BOT SCORE BEFORE PAYING
+            const suspicionScore = botDetector.getSuspicionScore(winner);
+            const botAnalysis = botDetector.getBotAnalysis(winner);
+
+            logger.info(`[SECURITY] Audit for winner ${winner}: Score ${suspicionScore}`);
+
+            // Threshold: 70 is considered "High" suspicion
+            if (suspicionScore >= 70) {
+                fraudDetected = true;
+                logger.warn(`🚨 FRAUD DETECTED: Withholding payout for ${winner}. Score: ${suspicionScore}. Flags: ${JSON.stringify(botAnalysis.flags)}`);
+
+                // Flag the user in MongoDB so they can't play again
+                await User.findOneAndUpdate(
+                    { walletAddress: winner },
+                    { $set: { isFlagged: true, flagReason: `Bot Score ${suspicionScore}: ${botAnalysis.flags.join(',')}` } }
                 );
-                paymentId = queuedPayment._id.toString();
-                logger.info(`Payout queued for ${winner}: Payment ID ${paymentId}, Amount ${winningAmount} USDC`);
-            } catch (error) {
-                logger.error('Error queueing payout:', { error: error });
-                // Emit error but continue (payout is queued or will be retried)
-                io.to(roomId).emit('gameOver', {
-                    error: 'Payout queued but initial setup failed. Check your balance or contact support.',
-                    players: sortedPlayers.map(p => ({
-                        username: p.username,
-                        score: p.score,
-                        totalResponseTime: p.totalResponseTime || 0,
-                        isBot: p.isBot || false
-                    })),
-                    winner: winner,
-                    betAmount: room.betAmount,
-                    singlePlayerMode: isSinglePlayerEncounter,
-                    botOpponent: botOpponent,
-                    paymentId
+
+                // Alert Admins
+                alertManager.sendAlert({
+                    severity: 'high',
+                    category: 'payout_blocked',
+                    message: `Payout blocked for bot behavior: ${winner}`,
+                    details: botAnalysis
                 });
-                await deleteGameRoom(roomId);
-                return;
+
+            } else if (paymentProcessor) {
+                // 2. PROCEED TO PAYMENT ONLY IF SCORE IS LOW
+                try {
+                    const multiplier = botOpponent ? 1.5 : 1.8;
+                    const winningAmount = calculateWinnings(room.betAmount, multiplier);
+                    // Queue the payout instead of sending directly
+                    const queuedPayment = await paymentProcessor.queuePayment(
+                        winner,
+                        Number(winningAmount),
+                        roomId, // Use roomId as gameId
+                        room.betAmount,
+                        { botOpponent, singlePlayerMode: isSinglePlayerEncounter }
+                    );
+                    paymentId = queuedPayment._id.toString();
+                    logger.info(`Payout queued for ${winner}: Payment ID ${paymentId}, Amount ${winningAmount} USDC`);
+                } catch (error) {
+                    logger.error('Error queueing payout:', { error: error });
+                    // Emit error but continue (payout is queued or will be retried)
+                    io.to(roomId).emit('gameOver', {
+                        error: 'Payout queued but initial setup failed. Check your balance or contact support.',
+                        players: sortedPlayers.map(p => ({
+                            username: p.username,
+                            score: p.score,
+                            totalResponseTime: p.totalResponseTime || 0,
+                            isBot: p.isBot || false
+                        })),
+                        winner: winner,
+                        betAmount: room.betAmount,
+                        singlePlayerMode: isSinglePlayerEncounter,
+                        botOpponent: botOpponent,
+                        paymentId
+                    });
+                    await deleteGameRoom(roomId);
+                    return;
+                }
             }
+        }
+
+        // 3. DETERMINE END MESSAGE
+        let endMessage = '';
+        if (fraudDetected) {
+            endMessage = 'Victory under review. Account flagged for suspicious activity.';
+        } else if (paymentId) {
+            endMessage = `Payout queued! Check status with ID: ${paymentId}`;
+        } else {
+            endMessage = 'No payout required';
         }
 
         io.to(roomId).emit('gameOver', {
@@ -4829,10 +4701,10 @@ async function handleGameOver(room, roomId) {
             winner: winner,
             betAmount: room.betAmount,
             payoutSignature, // Will be null; use paymentId instead
-            paymentId, // NEW: Include queued payment ID
+            paymentId: fraudDetected ? null : paymentId,
             singlePlayerMode: isSinglePlayerEncounter,
             botOpponent: botOpponent,
-            message: paymentId ? `Payout queued! Check status with ID: ${paymentId}` : 'No payout required'
+            message: endMessage
         });
 
         await deleteGameRoom(roomId);

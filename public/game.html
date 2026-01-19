@@ -1035,31 +1035,17 @@
             }
             
             const selectedAnswer = parseInt(selectedOption.value);
-
-            // FIXED: Proper reCAPTCHA token generation with error handling
-            let recaptchaToken = null;
-            if (window.recaptchaEnabled) {
-                try {
-                    recaptchaToken = await getRecaptchaToken('submit_answer');
-                } catch (error) {
-                    logError('reCAPTCHA-answer-submission', error);
-                    alert('Verification required for answer submission. Please try again.');
-                    return;  // Block submission
-                }
-            }
             
             console.log('Submitting answer:', {
                 roomId: currentRoomId,
                 questionId: currentQuestionId,
                 answer: selectedAnswer,
-                hasRecaptcha: !!recaptchaToken
             });
             
             socket.emit('submitAnswer', { 
                 roomId: currentRoomId, 
                 questionId: currentQuestionId, 
-                answer: selectedAnswer,
-                recaptchaToken
+                answer: selectedAnswer
             });
             
             submitAnswerBtn.disabled = true;
