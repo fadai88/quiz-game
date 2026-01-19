@@ -391,6 +391,14 @@
             initializeFromSession();
         });
 
+        socket.on('loginSuccess', (data) => {
+            // This runs when game.html reconnects to the socket using the session cookie
+            if (data.serverTime) {
+                serverTimeOffset = data.serverTime - Date.now();
+                console.log('Clock synced in Game. Offset:', serverTimeOffset, 'ms');
+            }
+        });
+
         let connectedWallet = null;
         let currentRoomId = null;
         let currentBetAmount = null;
@@ -408,7 +416,7 @@
         let reconnectAttempts = 0;
         let hasGameToRestore = false;
         const MAX_RECONNECT_ATTEMPTS = 5;
-
+        let serverTimeOffset = 0;
 
         const joinGameBtn = document.getElementById('joinGameBtn');
         const waitingMessage = document.getElementById('waitingMessage');
@@ -1097,14 +1105,26 @@
             updatePlayerUI(players);
         });
 
-        socket.on('nextQuestion', ({ questionId, question, options, questionNumber, totalQuestions }) => {
-            currentQuestionId = questionId; // Store the question ID
+        socket.on('nextQuestion', ({ questionId, question, options, questionNumber, totalQuestions, questionEndsAt }) => {
+            currentQuestionId = questionId; 
             
             displayQuestion(question, options, questionNumber, totalQuestions);
             submitAnswerBtn.disabled = false;
             submitAnswerBtn.style.display = 'block';
             waitingMessage.textContent = '';
+                        
+            // 1. Calculate when the question ends in Client time
+            // Logic: (Server End Time) - (Clock Offset) = Client End Time
+            const clientEndTime = (questionEndsAt || (Date.now() + 10000)) - serverTimeOffset;
+            const now = Date.now();
             
+            // 2. Calculate remaining milliseconds
+            const msRemaining = Math.max(0, clientEndTime - now);
+            
+            // 3. Convert to seconds for the visual display (Round UP so 9.1s shows as 10s)
+            const secondsRemaining = Math.ceil(msRemaining / 1000);
+
+            // 4. Set the internal timeout to exact milliseconds
             if (questionTimer) {
                 clearTimeout(questionTimer);
             }
@@ -1112,10 +1132,12 @@
             questionTimer = setTimeout(() => {
                 submitAnswerBtn.disabled = true;
                 waitingMessage.textContent = 'Time\'s up!';
-            }, 10000); // Match server timeout
+            }, msRemaining); 
+
+            // 5. Start visual countdown with calculated seconds
+            startVisualCountdown(secondsRemaining);
             
-            // Start visual countdown for user experience
-            startVisualCountdown();
+            // --- NEW TIMER LOGIC END ---
         });
 
         socket.on('scoreUpdate', (players) => {
@@ -1484,23 +1506,30 @@
             `).join('');
         }
 
-        function startVisualCountdown() {
-            let timeRemaining = 10; // 10 seconds to match server
+        function startVisualCountdown(startTimeInSeconds) {
+            // Use the calculated time, or default to 10 if missing
+            let timeRemaining = startTimeInSeconds !== undefined ? startTimeInSeconds : 10;
             
             clearInterval(countdownInterval);
             
+            // 1. Render IMMEDIATELY (Fixes the 1-second interval delay)
+            countdownTimer.textContent = `Time remaining: ${timeRemaining} seconds`;
+            countdownTimer.style.display = 'block';
+            
             countdownInterval = setInterval(() => {
-                countdownTimer.textContent = `Time remaining: ${timeRemaining} seconds`;
+                // 2. Decrement
                 timeRemaining--;
                 
                 if (timeRemaining < 0) {
                     clearInterval(countdownInterval);
                     countdownTimer.textContent = "Time's up!";
+                    // Ensure button is disabled here too just in case
                     submitAnswerBtn.disabled = true;
+                } else {
+                    // 3. Update display
+                    countdownTimer.textContent = `Time remaining: ${timeRemaining} seconds`;
                 }
             }, 1000);
-            
-            countdownTimer.style.display = 'block';
         }
 
         function updatePlayerUI(players) {

@@ -2456,7 +2456,8 @@ io.on('connection', (socket) => {
                 socket.emit('loginSuccess', {
                     walletAddress: user.walletAddress,
                     virtualBalance: user.virtualBalance,
-                    verifyToken: verifyToken  // Send to client for HTTP authentication
+                    verifyToken: verifyToken,
+                    serverTime: Date.now()
                 });
             } catch (error) {
                 // Better error logging
@@ -2584,7 +2585,8 @@ io.on('connection', (socket) => {
             logger.info(`[RECONNECT] ✓ Successful for ${walletAddress} (session age: ${Math.round((Date.now() - sessionData.timestamp)/1000)}s)`);
             socket.emit('loginSuccess', {
                 walletAddress: user.walletAddress,
-                virtualBalance: user.virtualBalance || 0
+                virtualBalance: user.virtualBalance || 0,
+                serverTime: Date.now()
             });
 
         } catch (error) {
@@ -4424,7 +4426,11 @@ async function startNextQuestion(roomId) {
         return;
     }
 
+    // Define duration explicitly
+    const QUESTION_DURATION = 10000;
+
     room.questionStartTime = Date.now();
+    const questionEndsAt = room.questionStartTime + QUESTION_DURATION;
     room.answersReceived = 0;
     room.players.forEach(player => {
         player.answered = false;
@@ -4481,7 +4487,8 @@ async function startNextQuestion(roomId) {
         question: currentQuestion.question,
         options: shuffledOptions,
         questionNumber: room.currentQuestionIndex + 1,
-        totalQuestions: room.questions.length
+        totalQuestions: room.questions.length,
+        questionEndsAt: questionEndsAt
     });
 
     // Set up timeout BEFORE bot processing to ensure accurate timing
@@ -4532,7 +4539,7 @@ async function startNextQuestion(roomId) {
         }
 
         await completeQuestion(roomId);
-    }, 10000);
+    }, QUESTION_DURATION);
 
     // Handle bot answer asynchronously (doesn't block timeout)
     const botData = room.players.find(p => p.isBot);
