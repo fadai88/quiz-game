@@ -171,10 +171,21 @@ class BotDetector {
     updateSuspicionScore(username, stats) {
         const recent = stats.answers.slice(-20); // Last 20 answers
         
-        // ✅ FIXED: Lower threshold from 10 to 5 answers
         if (recent.length < 5) {
-            console.log(`Not enough data for ${username}: ${recent.length} answers (need 5+)`);
-            return;
+        // If we don't have enough data, check for "Superhuman" anomalies
+            const avgResponseTime = recent.reduce((sum, a) => sum + a.responseTime, 0) / recent.length;
+            const perfectAccuracy = recent.every(a => a.isCorrect);
+            
+            // Rule: If they answer consistently under 2.5s AND get everything right
+            // This is highly suspicious for a human reading 3-4 lines of text
+            if (avgResponseTime < 2500 && perfectAccuracy && recent.length >= 3) {
+                console.warn(`Low data anomaly for ${username}: Perfect accuracy & fast (${avgResponseTime.toFixed(0)}ms)`);
+                stats.suspicionScore = 75; // Flag for review, but allow gameplay to continue
+            } else {
+                // Not enough data and no obvious flags
+                console.log(`Not enough data for ${username}: ${recent.length} answers`);
+            }
+            return; 
         }
 
         const correctCount = recent.filter(a => a.isCorrect).length;

@@ -3501,10 +3501,10 @@ io.on('connection', (socket) => {
                 } else if (event === 'submitAnswer') {
                     const arrivalTime = Date.now();
 
-                    const { roomId, questionId, answer, recaptchaToken } = args[0];
+                    const { roomId, questionId, answer } = args[0];
                     try {
                         // 2. VALIDATE INPUT
-                        const { error } = submitAnswerSchema.validate({ roomId, questionId, answer, recaptchaToken });
+                        const { error } = submitAnswerSchema.validate({ roomId, questionId, answer });
                         if (error) {
                             const sanitized = sanitizeValidationError(error, 'submitAnswer');
                             socket.emit('answerError', sanitized);
@@ -3530,7 +3530,6 @@ io.on('connection', (socket) => {
                         // 5. ATOMIC UPDATE (Using arrivalTime)
                         try {
                             const updatedRoom = await atomicRoomUpdate(roomId, async (room) => {
-                                // ... (Keep existing room validation checks like "Game not initialized", "Invalid Question ID" etc.) ...
                                 
                                 // --- CUSTOM VALIDATION START ---
                                 if (!room.questions || room.questions.length === 0) throw new Error('Game not initialized');
@@ -3547,9 +3546,23 @@ io.on('connection', (socket) => {
                                 
                                 // Allow a small grace period (e.g. 10.5 seconds) for network latency
                                 if (serverResponseTime > 10500) { 
-                                    logger.warn(`Late answer: ${serverResponseTime}ms`);
-                                    // Optionally accept it as late or reject. 
-                                    // For now, let's accept it if it's close, or mark as timeout.
+                                    logger.warn(`Rejected late answer from ${authenticatedUsername}: ${serverResponseTime}ms`);
+                                    
+                                    // Mark as answered (timeout state)
+                                    player.answered = true;
+                                    player.lastAnswer = -1; 
+                                    player.lastResponseTime = serverResponseTime;
+                                    room.answersReceived += 1;
+
+                                    // ✅ CRITICAL FIX: Set metadata so the code below knows to emit "Timed Out"
+                                    room._submitMetadata = {
+                                        username: authenticatedUsername,
+                                        isCorrect: false,
+                                        serverResponseTime,
+                                        timedOut: true // Flag for the emit logic
+                                    };
+
+                                    return room; // Return room so Redis saves the state
                                 }
 
                                 // 7. REMOVED RECAPTCHA & FINGERPRINT CHECKS HERE FOR SPEED
@@ -3584,7 +3597,10 @@ io.on('connection', (socket) => {
                                 username: authenticatedUsername,
                                 isCorrect: metadata.isCorrect,
                                 questionId,
-                                selectedAnswer: answer
+                                selectedAnswer: answer,
+                                // Add these fields:
+                                timedOut: metadata.timedOut || false,
+                                message: metadata.timedOut ? 'Answer submitted too late' : null
                             });
 
                             // Emit to room
@@ -3592,7 +3608,7 @@ io.on('connection', (socket) => {
                                 username: authenticatedUsername,
                                 isBot: false,
                                 responseTime: metadata.serverResponseTime,
-                                timedOut: false
+                                timedOut: metadata.timedOut || false // Ensure valid boolean
                             });
 
                             // Feed the Bot Detector asynchronously (fire and forget - does NOT slow down the user)
