@@ -3542,6 +3542,12 @@ io.on('connection', (socket) => {
                                 // --- CUSTOM VALIDATION END ---
 
                                 // 6. CALCULATE TIME USING ARRIVAL TIME (The Fix)
+                                // Check if question is still active BEFORE calculating time
+                                if (!room.questionStartTime) {
+                                    // If null, the round already ended via timeout
+                                    logger.warn(`Rejected late answer from ${authenticatedUsername}: Round already ended`);
+                                    throw new Error('Question expired'); 
+                                }
                                 const serverResponseTime = arrivalTime - room.questionStartTime;
                                 
                                 // Allow a small grace period (e.g. 10.5 seconds) for network latency
@@ -4342,52 +4348,89 @@ async function startNextQuestion(roomId) {
 
     // Set up timeout BEFORE bot processing to ensure accurate timing
     room.questionTimeout = setTimeout(async () => {
-        room = await getGameRoom(roomId);
-        if (!room || room.isDeleted) {
-            logger.info(`Room ${roomId} not found or deleted during timeout`);
-            return;
-        }
+        try {
+            // STEP 1: Perform the check and update ATOMICALLY
+            // We do not read 'room' externally. We let atomicRoomUpdate give us the latest truth.
+            const updatedRoom = await atomicRoomUpdate(roomId, async (latestRoomState) => {
+                
+                // Safety check: if room deleted, stop
+                if (!latestRoomState || latestRoomState.isDeleted) return latestRoomState;
 
-        // Check again for human players
-        const remainingHumanPlayers = room.players.filter(p => !p.isBot);
-        if (remainingHumanPlayers.length === 0) {
-            logger.info(`No human players remaining in room ${roomId} during timeout. Stopping game.`);
-            if (room.questionTimeout) {
-                clearTimeout(room.questionTimeout);
-                room.questionTimeout = null;
+                // Check again for human players inside the transaction
+                const remainingHumanPlayers = latestRoomState.players.filter(p => !p.isBot);
+                if (remainingHumanPlayers.length === 0) {
+                    latestRoomState.isDeleted = true;
+                    latestRoomState._shouldStopGame = true; // Flag for post-transaction logic
+                    return latestRoomState;
+                }
+
+                // Identify who actually timed out
+                let timedOutCount = 0;
+                
+                // We attach a temporary list to the room object to trigger events later
+                // This won't be saved to Redis if we don't include it in the serialized fields, 
+                // but standard JS objects passed out of this function will keep it.
+                latestRoomState._timedOutPlayers = [];
+
+                latestRoomState.players.forEach(player => {
+                    // THE FIX: Check .answered on the LATEST state
+                    // If submitAnswer just finished 1ms ago, player.answered will be true here
+                    // and this block will be SKIPPED.
+                    if (!player.answered && !player.isBot) {
+                        player.answered = true;
+                        player.lastAnswer = -1; // Timeout value
+                        
+                        const timeoutResponseTime = Date.now() - latestRoomState.questionStartTime;
+                        player.lastResponseTime = timeoutResponseTime;
+                        
+                        latestRoomState.answersReceived += 1;
+                        latestRoomState._timedOutPlayers.push({
+                            username: player.username,
+                            responseTime: timeoutResponseTime
+                        });
+                        timedOutCount++;
+                    }
+                });
+
+                return latestRoomState;
+            });
+
+            // STEP 2: Handle Post-Transaction Logic (Notifications & Cleanup)
+            
+            // Check if game stopped
+            if (updatedRoom._shouldStopGame) {
+                logger.info(`No human players remaining in room ${roomId} during timeout. Stopping game.`);
+                if (room.questionTimeout) clearTimeout(room.questionTimeout); // cleanup local ref
+                await deleteGameRoom(roomId);
+                await logGameRoomsState();
+                return;
             }
-            room.isDeleted = true;
-            await updateGameRoom(roomId, room);
-            await redisClient.del(`room:${roomId}`);
-            await logGameRoomsState();
-            return;
-        }
 
-        let timedOut = false;
-        room.players.forEach(player => {
-            if (!player.answered && !player.isBot) {
-                player.answered = true;
-                player.lastAnswer = -1;
-                const timeoutResponseTime = Date.now() - room.questionStartTime;
-                player.lastResponseTime = timeoutResponseTime;
-                room.answersReceived += 1;
-                timedOut = true;
-
-                logger.info(`Player ${player.username} timed out on question ${currentQuestion.tempId} with responseTime: ${timeoutResponseTime}ms`);
-                io.to(roomId).emit('playerAnswered', {
-                    username: player.username,
-                    isBot: false,
-                    timedOut: true,
-                    responseTime: timeoutResponseTime
+            // Emit timeout events ONLY for players who actually timed out in the DB
+            if (updatedRoom._timedOutPlayers && updatedRoom._timedOutPlayers.length > 0) {
+                updatedRoom._timedOutPlayers.forEach(p => {
+                    logger.info(`Player ${p.username} timed out on question ${currentQuestion.tempId} with responseTime: ${p.responseTime}ms`);
+                    
+                    io.to(roomId).emit('playerAnswered', {
+                        username: p.username,
+                        isBot: false,
+                        timedOut: true,
+                        responseTime: p.responseTime
+                    });
                 });
             }
-        });
 
-        if (timedOut) {
-            await updateGameRoom(roomId, room);
+            // STEP 3: Proceed to completion
+            await completeQuestion(roomId);
+
+        } catch (error) {
+            // Handle specific errors like room not found (already deleted)
+            if (error.message.includes('not found')) {
+                logger.info(`Room ${roomId} not found during timeout execution (likely already closed)`);
+            } else {
+                logger.error(`Error in timeout handler for room ${roomId}:`, error);
+            }
         }
-
-        await completeQuestion(roomId);
     }, QUESTION_DURATION);
 
     // Handle bot answer asynchronously (doesn't block timeout)
