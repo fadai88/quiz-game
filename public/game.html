@@ -201,24 +201,9 @@
             <div id="question" class="non-copyable"></div>
             <div id="options"></div>
             <button id="submitAnswer" style="display:none;">Submit Answer</button>
-            <button onclick="showLeaderboard()">Show Leaderboard</button>
             <button id="inviteFriendsBtn">Invite Friends</button>
         </div>
-        <div id="leaderboardContainer">
-            <h2>Leaderboard</h2>
-            <table id="leaderboardTable">
-                <thead>
-                    <tr>
-                        <th>Rank</th>
-                        <th>Username</th>
-                        <th>Correct Answers</th>
-                        <th>Games Played</th>
-                        <th>Total Points</th>
-                    </tr>
-                </thead>
-                <tbody id="leaderboardBody"></tbody>
-            </table>
-        </div>
+    
         <div id="gameChoiceModal" class="modal">
             <div class="modal-content">
                 <h2>Game Mode Selection</h2>
@@ -425,8 +410,6 @@
         const optionsDiv = document.getElementById('options');
         const submitAnswerBtn = document.getElementById('submitAnswer');
         const countdownTimer = document.getElementById('countdownTimer');
-        const leaderboardContainer = document.getElementById('leaderboardContainer');
-        const leaderboardBody = document.getElementById('leaderboardBody');
 
         let countdownInterval;
         let virtualBalance = 0;
@@ -1634,11 +1617,6 @@
             document.body.classList.toggle('dark-theme');
         }
 
-        function showLeaderboard() {
-            socket.emit('getLeaderboard');
-            leaderboardContainer.style.display = 'block';
-        }
-
         async function getRecaptchaToken(action) {
             console.log('getRecaptchaToken called for:', action);
             
@@ -1859,25 +1837,6 @@
                 resetJoinUI();
             }
         }
-
-        socket.on('leaderboardData', (leaderboard) => {
-            leaderboardBody.innerHTML = '';
-            leaderboard.forEach((user, index) => {
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td>${index + 1}</td>
-                    <td>${user.username}</td>
-                    <td>${user.correctAnswers}</td>
-                    <td>${user.gamesPlayed}</td>
-                    <td>${user.totalPoints}</td>
-                `;
-                leaderboardBody.appendChild(row);
-            });
-        });
-
-        socket.on('leaderboardError', (message) => {
-            alert(`Error fetching leaderboard: ${message}`);
-        });
 
         document.getElementById('inviteFriendsBtn').addEventListener('click', () => {
             const roomId = currentRoomId;
