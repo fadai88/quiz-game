@@ -2560,7 +2560,34 @@ io.on('connection', (socket) => {
                     // 3. Track restored player in metrics
                     orphanedPlayerMetrics.totalRestored++;
 
-                    // 4. Notify client to restore game UI
+                    // 4. Build active question data if question is in progress
+                    let activeQuestion = null;
+                    let currentQuestion = null;
+
+                    if (room.gameStarted && room.currentQuestionIndex >= 0 && room.currentQuestionIndex < room.questions.length) {
+                        const q = room.questions[room.currentQuestionIndex];
+                        const QUESTION_DURATION = 10000;
+
+                        // Check if question is still active (not timed out)
+                        if (room.questionStartTime && (Date.now() - room.questionStartTime) < QUESTION_DURATION) {
+                            activeQuestion = {
+                                questionId: q.tempId,
+                                question: q.question,
+                                options: q.shuffledOptions,
+                                questionNumber: room.currentQuestionIndex + 1,
+                                totalQuestions: room.questions.length,
+                                questionEndsAt: room.questionStartTime + QUESTION_DURATION
+                            };
+                        } else {
+                            // Question ended but still in progress, send currentQuestion for status display
+                            currentQuestion = {
+                                questionNumber: room.currentQuestionIndex + 1,
+                                totalQuestions: room.questions.length
+                            };
+                        }
+                    }
+
+                    // 5. Notify client to restore game UI
                     socket.emit('gameStateRestore', {
                         roomId,
                         currentQuestionIndex: room.currentQuestionIndex,
@@ -2568,6 +2595,9 @@ io.on('connection', (socket) => {
                         players: room.players,
                         betAmount: room.betAmount,
                         roomMode: room.roomMode,
+                        botOpponent: room.hasBot,
+                        activeQuestion: activeQuestion,
+                        currentQuestion: currentQuestion,
                         playerData: {
                             score: player.score || 0,
                             totalResponseTime: player.totalResponseTime || 0
@@ -4233,31 +4263,15 @@ async function startSinglePlayerGame(roomId) {
 
 async function startNextQuestion(roomId) {
     let room = await getGameRoom(roomId);
-    if (!room) {
-        logger.info(`Room ${roomId} not found when trying to start next question`);
+    if (!room || room.isDeleted) {
+        logger.info(`Room ${roomId} not found or deleted when trying to start next question`);
         return;
     }
 
-    // Check if room is deleted
-    if (room.isDeleted) {
-        logger.info(`Room ${roomId} is marked as deleted, stopping game`);
-        if (room.questionTimeout) {
-            clearTimeout(room.questionTimeout);
-            room.questionTimeout = null;
-        }
-        await redisClient.del(`room:${roomId}`); // Ensure deletion
-        await logGameRoomsState();
-        return;
-    }
-
-    // Check if there are any human players
+    // 1. Validation: Ensure human players still present
     const humanPlayers = room.players.filter(p => !p.isBot);
     if (humanPlayers.length === 0) {
         logger.info(`No human players in room ${roomId}. Stopping game.`);
-        if (room.questionTimeout) {
-            clearTimeout(room.questionTimeout);
-            room.questionTimeout = null;
-        }
         room.isDeleted = true;
         await updateGameRoom(roomId, room);
         await redisClient.del(`room:${roomId}`);
@@ -4265,12 +4279,37 @@ async function startNextQuestion(roomId) {
         return;
     }
 
-    if (room.currentQuestionIndex >= room.questions.length) {
+    // 2. ATOMIC UPDATE: All calculations happen inside the lock
+    room = await atomicRoomUpdate(roomId, async (latest) => {
+        if (latest.isDeleted) return latest;
+
+        const nextIndex = latest.currentQuestionIndex + 1;
+
+        // Bounds check inside the transaction
+        if (nextIndex >= latest.questions.length) {
+            latest._shouldEndGame = true; // Temporary flag
+            return latest;
+        }
+
+        latest.currentQuestionIndex = nextIndex;
+        latest.questionStartTime = Date.now();
+        latest.answersReceived = 0;
+        latest.players.forEach(p => {
+            p.answered = false;
+            p.lastAnswer = null;
+            p.lastResponseTime = null;
+        });
+        return latest;
+    });
+
+    // 3. Handle Game End
+    if (room._shouldEndGame) {
         logger.info(`No more questions for room ${roomId}. Ending game.`);
         await handleGameOver(room, roomId);
         return;
     }
 
+    // 4. Access current question data
     const currentQuestion = room.questions[room.currentQuestionIndex];
     if (!currentQuestion || !currentQuestion.options || currentQuestion.correctAnswer === undefined) {
         logger.error(`Invalid question data for room ${roomId}, question index ${room.currentQuestionIndex}`);
@@ -4283,32 +4322,24 @@ async function startNextQuestion(roomId) {
 
     // Define duration explicitly
     const QUESTION_DURATION = 10000;
-
-    room.questionStartTime = Date.now();
     const questionEndsAt = room.questionStartTime + QUESTION_DURATION;
-    room.answersReceived = 0;
-    room.players.forEach(player => {
-        player.answered = false;
-        player.lastAnswer = null;
-        player.lastResponseTime = null;
-    });
 
     const shuffledOptions = currentQuestion.shuffledOptions;
     const shuffledCorrectAnswer = currentQuestion.shuffledCorrectAnswer;
 
-    // ✅ Validation with recovery
+    // Validation with recovery
     if (!shuffledOptions || !Array.isArray(shuffledOptions) || shuffledOptions.length === 0) {
-        logger.error(`❌ Missing shuffledOptions for question ${currentQuestion.tempId} in room ${roomId}`);
+        logger.error(`Missing shuffledOptions for question ${currentQuestion.tempId} in room ${roomId}`);
         console.error('Current question data:', JSON.stringify(currentQuestion, null, 2));
-        
+
         // Try recovery from room.questions array
         const originalQ = room.questions.find(q => q.tempId === currentQuestion.tempId);
         if (originalQ && originalQ.shuffledOptions && originalQ.shuffledOptions.length > 0) {
-            console.log('✅ Recovered shuffle data from room.questions array');
+            console.log('Recovered shuffle data from room.questions array');
             currentQuestion.shuffledOptions = originalQ.shuffledOptions;
             currentQuestion.shuffledCorrectAnswer = originalQ.shuffledCorrectAnswer;
         } else {
-            console.error('❌ CRITICAL: Cannot recover shuffle data. Aborting game.');
+            console.error('CRITICAL: Cannot recover shuffle data. Aborting game.');
             io.to(roomId).emit('gameError', 'Critical: shuffle data lost. Please restart the game.');
             room.isDeleted = true;
             await updateGameRoom(roomId, room);
@@ -4318,7 +4349,7 @@ async function startNextQuestion(roomId) {
     }
 
     if (shuffledCorrectAnswer === undefined || shuffledCorrectAnswer === -1) {
-        logger.error(`❌ Invalid shuffledCorrectAnswer for question ${currentQuestion.tempId}`);
+        logger.error(`Invalid shuffledCorrectAnswer for question ${currentQuestion.tempId}`);
         io.to(roomId).emit('gameError', 'Invalid question configuration');
         room.isDeleted = true;
         await updateGameRoom(roomId, room);
@@ -4326,7 +4357,7 @@ async function startNextQuestion(roomId) {
         return;
     }
 
-    // ✅ Update map with verified shuffle data (idempotent)
+    // Update map with verified shuffle data
     room.questionIdMap.set(currentQuestion.tempId, {
         ...currentQuestion,
         shuffledOptions,
@@ -4585,13 +4616,6 @@ async function completeQuestion(roomId) {
 
     room.questionStartTime = null;
     room.roundStartTime = null;
-    room.players.forEach(player => {
-        player.answered = false;
-        player.lastResponseTime = null;
-        player.lastAnswer = null;
-    });
-    room.currentQuestionIndex += 1;
-    room.answersReceived = 0;
 
     await updateGameRoom(roomId, room);
 
@@ -4601,7 +4625,8 @@ async function completeQuestion(roomId) {
         return;
     }
 
-    if (room.currentQuestionIndex < room.questions.length) {
+    // Look ahead: if there's another question, queue it
+    if (room.currentQuestionIndex + 1 < room.questions.length) {
         setTimeout(() => {
             startNextQuestion(roomId);
         }, 3000);
@@ -4853,7 +4878,7 @@ async function createGameRoom(roomId, betAmount, roomMode = 'waiting') {
         betAmount,
         questions: [],
         questionIdMap: {},
-        currentQuestionIndex: 0,
+        currentQuestionIndex: -1,
         answersReceived: 0,
         gameStarted: false,
         roomMode: roomMode,

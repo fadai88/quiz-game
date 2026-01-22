@@ -1075,12 +1075,12 @@
         });
 
         socket.on('nextQuestion', ({ questionId, question, options, questionNumber, totalQuestions, questionEndsAt }) => {
-            currentQuestionId = questionId; 
-            
+            currentQuestionId = questionId;
+            waitingMessage.innerHTML = ''; // CRITICAL: Always wipe the "Correct Answer" results here
+
             displayQuestion(question, options, questionNumber, totalQuestions);
             submitAnswerBtn.disabled = false;
             submitAnswerBtn.style.display = 'block';
-            waitingMessage.textContent = '';
                         
             // 1. Calculate when the question ends in Client time
             // Logic: (Server End Time) - (Clock Offset) = Client End Time
@@ -1329,8 +1329,34 @@
                 // Update players display
                 updatePlayerUI(data.players);
 
-                // Show current question status
-                if (data.currentQuestion) {
+                // Handle active question if present (player can still answer)
+                if (data.activeQuestion) {
+                    // Jump directly to the current question content
+                    displayQuestion(
+                        data.activeQuestion.question,
+                        data.activeQuestion.options,
+                        data.activeQuestion.questionNumber,
+                        data.activeQuestion.totalQuestions
+                    );
+                    currentQuestionId = data.activeQuestion.questionId;
+                    submitAnswerBtn.style.display = 'block';
+                    submitAnswerBtn.disabled = false;
+                    waitingMessage.innerHTML = ''; // Clear "Round Results" or "Joined" messages
+
+                    // Calculate remaining time synced with server
+                    const msRemaining = Math.max(0, (data.activeQuestion.questionEndsAt - serverTimeOffset) - Date.now());
+                    startVisualCountdown(Math.ceil(msRemaining / 1000));
+
+                    // Set up timeout for remaining time
+                    if (questionTimer) {
+                        clearTimeout(questionTimer);
+                    }
+                    questionTimer = setTimeout(() => {
+                        submitAnswerBtn.disabled = true;
+                        waitingMessage.textContent = 'Time\'s up!';
+                    }, msRemaining);
+                } else if (data.currentQuestion) {
+                    // Between questions or question already ended
                     questionDiv.innerHTML = `<h2>Question ${data.currentQuestion.questionNumber} of ${data.currentQuestion.totalQuestions}</h2>`;
                     waitingMessage.textContent = 'Reconnected! Waiting for next question...';
                 } else {
