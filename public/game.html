@@ -712,8 +712,8 @@
             
             // Proceed with balance/UI init
             try {
-                await updateBalance();
-                balanceUpdateInterval = setInterval(updateBalance, 30000);
+                await updateBalance();  // Fetch once on connection
+                // No polling needed - balance only changes during game actions
                 await initializeWallet();
             } catch (error) {
                 logError('session-init', error);
@@ -861,8 +861,8 @@
                 updateWalletStatus();
                 
                 // Update balance immediately after connecting
-                await updateBalance();
-                balanceUpdateInterval = setInterval(updateBalance, 30000);
+                await updateBalance();  // Fetch once on connection
+                // No polling needed - balance only changes during game actions
                 return connectedWallet;
             } catch (err) {
                 logError('wallet-connection', err);
@@ -994,6 +994,8 @@
             console.log('Successfully joined game:', data);
             joinGameBtn.style.display = 'none';
             waitingMessage.textContent = 'Waiting for another player...';
+            
+            // No polling to stop - balance only fetched when needed
         });
 
         socket.on('joinGameFailure', (error) => {
@@ -1552,6 +1554,8 @@
                 return;
             }
 
+            // No need to resume polling - balance was already fetched after game ended
+            
             currentRoomId = null;
             playersDiv.innerHTML = '';
             questionDiv.innerHTML = '';
