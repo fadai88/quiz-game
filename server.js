@@ -19,7 +19,6 @@ const cookieParser = require('cookie-parser');
 
 // Generate session secret keys (use environment variables in production)
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
-const SESSION_SECRET_2 = process.env.SESSION_SECRET_2 || crypto.randomBytes(32).toString('hex');
 
 if (!process.env.SESSION_SECRET && ENVIRONMENT === 'production') {
     console.error('❌ FATAL: SESSION_SECRET not set in production!');
@@ -675,8 +674,6 @@ const io = socketIo(server, {
 });
 io.use(socketLogger);
 
-// Enhanced rate-limiting: Per-socket, Redis-backed (install rate-limiter-flexible)
-let socketRateLimiter;
 // ============================================================================
 // ENHANCED PER-EVENT RATE LIMITERS
 // ============================================================================
@@ -747,75 +744,6 @@ async function initializeRateLimiter() {
         logger.error('❌ Failed to init rate-limiter:', { error: error });
     }
 }
-
-// Auth middleware: Validate socket.user on events (post-login)
-const authMiddleware = async (socket, next) => {
-    try {
-        // Check 1: User must be attached to socket
-        if (!socket.user || !socket.user.walletAddress) {
-            logger.auth(`Connection attempt without user: ${socket.id}`);
-            return next(new Error('Unauthorized: No valid session'));
-        }
-
-        // Check 2: Validate session in Redis
-        const walletAddress = socket.user.walletAddress;
-        const sessionKey = `session:${walletAddress}`;
-        
-        const session = await redisClient.get(sessionKey);
-        
-        if (!session) {
-            SecurityLogger.sessionExpired(walletAddress, sessionAge);
-            socket.emit('error', {
-                message: 'Session expired: Please login again',
-                code: 'SESSION_EXPIRED'
-            });
-            socket.disconnect(true);
-            return next(new Error('Session expired'));
-        }
-
-        // Check 3: Validate session age
-        try {
-            const sessionData = JSON.parse(session);
-            const sessionAge = Date.now() - sessionData.timestamp;
-            const MAX_SESSION_AGE = 24 * 60 * 60 * 1000; // 24 hours
-
-            if (sessionAge > MAX_SESSION_AGE) {
-                SecurityLogger.sessionTooOld(walletAddress, sessionAge, MAX_SESSION_AGE);
-                await redisClient.del(sessionKey);
-                socket.emit('error', {
-                    message: 'Session expired: Please login again',
-                    code: 'SESSION_EXPIRED'
-                });
-                socket.disconnect(true);
-                return next(new Error('Session expired'));
-            }
-        } catch (parseError) {
-            logger.security('auth_error', {
-                message: `Session parse error for ${walletAddress}`,
-                parseError
-            });
-            await redisClient.del(sessionKey);
-            socket.emit('error', {
-                message: 'Session corrupted: Please login again',
-                code: 'SESSION_EXPIRED'
-            });
-            socket.disconnect(true);
-            return next(new Error('Session corrupted'));
-        }
-
-        // ✅ All checks passed - allow connection
-        logger.auth('connection_authenticated', { walletAddress, sessionId: sessionToken?.substring(0, 8) });
-        next();
-        
-    } catch (error) {
-        logger.error('[AUTH] Connection middleware error:', { error: error });
-        socket.emit('error', {
-            message: 'Authentication error occurred',
-            code: 'AUTH_ERROR'
-        });
-        next(new Error('Authentication error'));
-    }
-};
 
 app.use(express.json());
 
@@ -2009,9 +1937,6 @@ async function rateLimitEvent(walletAddress, eventName, ip = null, socket = null
     }
 }
 
-// DEPRECATED: Old manual counter-based rate limiting (kept for backward compatibility)
-// New code should use the improved rateLimitEvent function above
-
 // FIXED: Add Redis rate limiter for failed reCAPTCHA (max 5 per IP per hour)
 async function rateLimitFailedRecaptcha(ip) {
     await safeRedisOp(
@@ -2027,20 +1952,6 @@ async function rateLimitFailedRecaptcha(ip) {
         null,
         `reCAPTCHA rate limit for ${ip}`
     );
-}
-
-// Enhanced: Socket-specific rate-limit
-async function rateLimitSocket(socket, points = 100, duration = 60) {
-    if (!socketRateLimiter) {
-        logger.warn(`⚠️  Socket rate limiting unavailable for ${socket.id}`);
-        return;
-    }
-    
-    try {
-        await socketRateLimiter.consume(socket.id, points);
-    } catch (rejRes) {
-        throw new Error(`Rate limited: ${rejRes.consumedPoints} points used of ${points}`);
-    }
 }
 
 function shuffleArray(array) {
@@ -2634,7 +2545,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // ADD this AFTER authMiddleware definition (around line 250):
     async function validateSocketSession(socket, eventName) {
         if (!socket.user || !socket.user.walletAddress) {
             logger.auth(`Unauthorized ${eventName} from socket ${socket.id}`);
@@ -2693,7 +2603,6 @@ io.on('connection', (socket) => {
     gameEvents.forEach(event => {
         socket.on(event, async (...args) => {
             try {
-                // await rateLimitSocket(socket);
                 const isValidSession = await validateSocketSession(socket, event);
                 if (!isValidSession) {
                     return; // Stop execution - validation function already sent error to client
@@ -5183,7 +5092,6 @@ async function atomicRoomUpdate(roomId, updateFn, maxRetries = 5) {
     throw error;
 }
 
-
 async function deleteGameRoom(roomId) {
     try {
         // Fetch room first to check logic requirements (like waiting rooms)
@@ -5286,18 +5194,6 @@ async function getMatchmakingPool(betAmount) {
     // Redis health auto-managed by ioredis
         return [];
     }
-}
-
-// REMOVED: sendWinnings function - replaced by PaymentProcessor.queuePayment
-
-async function findAssociatedTokenAddress(walletAddress, tokenMintAddress) {
-    return await getAssociatedTokenAddress(
-        tokenMintAddress,
-        walletAddress,
-        false,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-    );
 }
 
 app.get('/api/tokens.json', async (req, res) => {

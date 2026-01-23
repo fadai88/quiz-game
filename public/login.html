@@ -85,7 +85,6 @@
 <body>
     <header>
         <h1>Brainy Battle Quiz</h1>
-        <button onclick="toggleTheme()">Toggle Theme</button>
         <nav>
             <ul>
                 <li><a href="index.html">Home</a></li>
@@ -488,10 +487,6 @@
             window.location.href = 'login.html';
         });
 
-        function toggleTheme() {
-            document.body.classList.toggle('dark-theme');
-        }
-        
         function showError(message) {
             const loginMessage = document.getElementById('loginMessage');
             loginMessage.textContent = message;

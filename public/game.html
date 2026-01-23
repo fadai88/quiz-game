@@ -173,7 +173,6 @@
 <body>
     <header>
         <h1>Brainy Battle Quiz</h1>
-        <button onclick="toggleTheme()">Toggle Theme</button>
         <div id="walletStatus"></div>
         <nav>
             <ul>
@@ -1640,10 +1639,6 @@
                     notification.style.display = 'none';
                 }, 5000);
             }
-        }
-
-        function toggleTheme() {
-            document.body.classList.toggle('dark-theme');
         }
 
         async function getRecaptchaToken(action) {
