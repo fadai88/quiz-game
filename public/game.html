@@ -201,7 +201,6 @@
             <div id="question" class="non-copyable"></div>
             <div id="options"></div>
             <button id="submitAnswer" style="display:none;">Submit Answer</button>
-            <button id="inviteFriendsBtn">Invite Friends</button>
         </div>
     
         <div id="gameChoiceModal" class="modal">
@@ -1867,12 +1866,6 @@
                 resetJoinUI();
             }
         }
-
-        document.getElementById('inviteFriendsBtn').addEventListener('click', () => {
-            const roomId = currentRoomId;
-            const inviteLink = `${window.location.origin}/join?roomId=${roomId}`;
-            prompt("Share this link with your friends:", inviteLink);
-        });
 
         const joinSound = document.getElementById('joinSound');
         const notification = document.getElementById('notification');
