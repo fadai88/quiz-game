@@ -722,6 +722,30 @@ async function initializeRateLimiter() {
             blockDuration: 120,
             keyPrefix: 'event:joinBotGame'
         }));
+
+        eventLimiters.set('requestBotRoom', new RateLimiterRedis({
+            storeClient: redisClient,
+            points: 5,           // 5 bot room requests per minute
+            duration: 60,
+            blockDuration: 180,  // Block for 3 minutes
+            keyPrefix: 'event:requestBotRoom'
+        }));
+
+        eventLimiters.set('switchToBot', new RateLimiterRedis({
+            storeClient: redisClient,
+            points: 5,           // 5 switches per minute
+            duration: 60,
+            blockDuration: 120,  // Block for 2 minutes
+            keyPrefix: 'event:switchToBot'
+        }));
+
+        eventLimiters.set('requestBotGame', new RateLimiterRedis({
+            storeClient: redisClient,
+            points: 8,           // 8 game start requests per minute
+            duration: 60,
+            blockDuration: 120,  // Block for 2 minutes
+            keyPrefix: 'event:requestBotGame'
+        }));
         
         eventLimiters.set('playerReady', new RateLimiterRedis({
             storeClient: redisClient,
@@ -2611,635 +2635,652 @@ io.on('connection', (socket) => {
                 // Call original handler based on event type
                 if (event === 'joinGame') {
                     const data = args[0];
-                    const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                    await rateLimitEvent(data.walletAddress, 'joinGame', clientIP, socket);
-                    
-                    // ✅ Check if blocked
-                    if (isBlocked(data.walletAddress) || isBlocked(socket.handshake.address)) {
-                        logger.error(`🚨 [SECURITY] Blocked identifier attempted ${event}`);
-                        socket.emit('joinGameFailure', 'Access denied');
-                        return;
-                    }
-                    
-                    const { error } = transactionSchema.validate(data);
-                    if (error) {
-                        const identifier = data.walletAddress || socket.handshake.address;
-                        trackValidationFailure(identifier, 'joinGame', error.message);
-                        console.error('Validation error:', sanitizeForLog(error.message));
-                        socket.emit('joinGameFailure', 'Invalid input format');
-                        return;
-                    }
-                    const { walletAddress, betAmount } = data;
-
-                    logger.info('Join game request:', { walletAddress, betAmount });
-
-                    if (!walletAddress || typeof betAmount !== 'number' || betAmount <= 0) {
-                        throw new Error('Invalid join game request');
-                    }
-
-                    const roomId = generateRoomId();
-                    await createGameRoom(roomId, betAmount, 'waiting');
-
-                    // ✅ ATOMIC ROOM UPDATE to prevent race conditions
                     try {
-                        await atomicRoomUpdate(roomId, async (room) => {
-                            room.players.push({
-                                id: socket.id,
-                                username: walletAddress,
-                                score: 0,
-                                totalResponseTime: 0
-                            });
-                            return room;
-                        });
-                    } catch (error) {
-                        logger.error(`Failed to add player to room ${roomId}:`, error);
-                        socket.emit('joinGameFailure', 'Failed to join game room');
-                        return;
-                    }
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitEvent(data.walletAddress, 'joinGame', clientIP, socket);
 
-                    socket.join(roomId);
-                    socket.roomId = roomId;  // FIXED: Store roomId on socket for O(1) disconnect cleanup
-                    logger.info(`Player ${walletAddress} joined temporary room ${roomId}`);
-                    socket.emit('gameJoined', roomId);
-
-                    await logGameRoomsState();
-                } else if (event === 'playerReady') {
-                    const { roomId, preferredMode, recaptchaToken } = args[0];
-
-                    // ✅ NEW: Rate limit playerReady to prevent DoS
-                    const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                    await rateLimitEvent(socket.user.walletAddress, 'playerReady', clientIP, socket);
-
-                    const { error } = playerReadySchema.validate({ roomId, preferredMode, recaptchaToken });
-                    if (error) {
-                        const sanitized = sanitizeValidationError(error, 'playerReady');
-                        socket.emit('gameError', sanitized);
-                        return;
-                    }
-
-                    logger.info(`Player ${socket.id} ready in room ${roomId}, preferred mode: ${preferredMode || 'not specified'}`);
-
-                    // ===== VALIDATION: Read room and validate player (before any modifications) =====
-                    let initialRoom = await getGameRoom(roomId);
-                    if (!initialRoom) {
-                        logger.error(`Room ${roomId} not found when player ${socket.id} marked ready`);
-                        socket.emit('gameError', 'Room not found');
-                        return;
-                    }
-
-                    const player = initialRoom.players.find(p => p.id === socket.id);
-                    if (!player) {
-                        socket.emit('gameError', 'Player not found in room');
-                        return;
-                    }
-                    const username = player.username;
-
-                    if (initialRoom.roomMode === 'bot') {
-                        logger.info(`Room ${roomId} is set for bot play, not starting regular game`);
-                        return;
-                    }
-
-                    // Device fingerprint check
-                    const user = await User.findOne({ walletAddress: username });
-                    if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint) {
-                        SecurityLogger.deviceMismatch(username, user.deviceFingerprint, socket.user.fingerprint, { event: 'playerReady' });
-                        botDetector.trackEvent(username, 'fingerprint_mismatch', { event: 'playerReady' });
-                        if (!recaptchaToken || !(await verifyRecaptcha(recaptchaToken)).success) {
-                            socket.emit('gameError', 'Device verification failed. Please relogin.');
+                        // Check if blocked
+                        if (isBlocked(data.walletAddress) || isBlocked(socket.handshake.address)) {
+                            logger.error(`[SECURITY] Blocked identifier attempted ${event}`);
+                            socket.emit('joinGameFailure', 'Access denied');
                             return;
                         }
-                    }
 
-                    // High-win streak captcha check
-                    if (user && user.gamesPlayed > 5 && (user.wins / user.gamesPlayed) > 0.8) {
-                        if (!recaptchaToken || !(await verifyRecaptcha(recaptchaToken)).success) {
-                            socket.emit('gameError', 'Additional verification required due to high win rate.');
+                        const { error } = transactionSchema.validate(data);
+                        if (error) {
+                            const identifier = data.walletAddress || socket.handshake.address;
+                            trackValidationFailure(identifier, 'joinGame', error.message);
+                            console.error('Validation error:', sanitizeForLog(error.message));
+                            socket.emit('joinGameFailure', 'Invalid input format');
                             return;
                         }
-                    }
+                        const { walletAddress, betAmount } = data;
 
-                    // BotDetector integration
-                    botDetector.trackEvent(username, 'player_ready', { preferredMode, roomId });
+                        logger.info('Join game request:', { walletAddress, betAmount });
 
-                    // ===== ATOMIC OPERATIONS BASED ON GAME MODE =====
-
-                    if (preferredMode === 'human') {
-                        // ✅ ATOMIC: Set room mode to 'human'
-                        let updatedRoom;
-                        try {
-                            updatedRoom = await atomicRoomUpdate(roomId, async (room) => {
-                                room.roomMode = 'human';
-                                return room;
-                            });
-                        } catch (error) {
-                            logger.error(`Failed to set room mode for ${roomId}:`, error);
-                            socket.emit('gameError', 'Failed to update room');
-                            return;
+                        if (!walletAddress || typeof betAmount !== 'number' || betAmount <= 0) {
+                            throw new Error('Invalid join game request');
                         }
-                        logger.info(`Room ${roomId} marked for human vs human play`);
 
-                        // ===== MATCHMAKING LOGIC (if single player) =====
-                        if (updatedRoom.players.length === 1) {
-                            let matchFound = false;
+                        const roomId = generateRoomId();
+                        await createGameRoom(roomId, betAmount, 'waiting');
 
-                            // ✅ FIXED: O(1) lookup instead of O(N) scanKeys
-                            const otherRoomId = await getWaitingRoom(updatedRoom.betAmount);
-
-                            if (otherRoomId && otherRoomId !== roomId) {
-                                // Validate other room before attempting match
-                                const otherRoom = await getGameRoom(otherRoomId);
-                                if (
-                                    otherRoom &&
-                                    otherRoom.roomMode === 'human' &&
-                                    !otherRoom.gameStarted &&
-                                    otherRoom.betAmount === updatedRoom.betAmount &&
-                                    otherRoom.players.length === 1
-                                ) {
-                                    logger.info(`Found matching room ${otherRoomId} for player in room ${roomId} (O(1) lookup)`);
-
-                                    // ✅ ATOMIC: Add player to other room and start game
-                                    try {
-                                        const playerToMove = updatedRoom.players[0];
-                                        await atomicRoomUpdate(otherRoomId, async (otherRoom) => {
-                                            // Add player from current room
-                                            otherRoom.players.push(playerToMove);
-
-                                            // Start the game
-                                            otherRoom.gameStarted = true;
-
-                                            return otherRoom;
-                                        });
-
-                                        // POST-TRANSACTION: Socket operations and cleanup
-                                        socket.leave(roomId);
-                                        if (roomId === socket.roomId) socket.roomId = null;
-                                        socket.join(otherRoomId);
-                                        socket.roomId = otherRoomId;
-
-                                        socket.emit('matchFound', { newRoomId: otherRoomId });
-                                        io.to(otherRoomId).emit('playerJoined', playerToMove.username);
-
-                                        await startGame(otherRoomId);
-
-                                        // ✅ Clean up both rooms from waiting index
-                                        await removeWaitingRoom(updatedRoom.betAmount, roomId);
-                                        await removeWaitingRoom(updatedRoom.betAmount, otherRoomId);
-                                        await deleteGameRoom(roomId);
-                                        matchFound = true;
-
-                                    } catch (error) {
-                                        logger.error(`Failed to match rooms ${roomId} and ${otherRoomId}:`, error);
-                                        // Fall through to add current room to waiting list
-                                    }
-                                } else {
-                                    // Other room invalid/gone, remove from index and add current room
-                                    logger.info(`Waiting room ${otherRoomId} no longer valid, replacing with ${roomId}`);
-                                    await removeWaitingRoom(updatedRoom.betAmount, otherRoomId);
-                                    await addWaitingRoom(updatedRoom.betAmount, roomId);
-                                }
-                            }
-
-                            if (!matchFound && !otherRoomId) {
-                                // No waiting room found, add this one to index
-                                await addWaitingRoom(updatedRoom.betAmount, roomId);
-                                logger.info(`No match found for player in room ${roomId}, added to waiting index`);
-                            }
-                        }
-                    }
-
-                    // ===== CHECK IF ROOM NOW HAS 2 PLAYERS (for direct joins) =====
-                    // Re-read room to check current state
-                    const finalRoom = await getGameRoom(roomId);
-                    if (finalRoom && finalRoom.players.length === 2 && !finalRoom.gameStarted) {
-                        // ✅ ATOMIC: Start multiplayer game
+                        // ATOMIC ROOM UPDATE to prevent race conditions
                         try {
                             await atomicRoomUpdate(roomId, async (room) => {
-                                // Double-check conditions inside atomic block
-                                if (room.players.length === 2 && !room.gameStarted) {
-                                    logger.info(`Starting multiplayer game in room ${roomId} with 2 players`);
-                                    room.gameStarted = true;
-                                    room.roomMode = 'multiplayer';
-                                }
+                                room.players.push({
+                                    id: socket.id,
+                                    username: walletAddress,
+                                    score: 0,
+                                    totalResponseTime: 0
+                                });
                                 return room;
+                            });
+                        } catch (innerError) {
+                            logger.error(`Failed to add player to room ${roomId}:`, innerError);
+                            socket.emit('joinGameFailure', 'Failed to join game room');
+                            return;
+                        }
+
+                        socket.join(roomId);
+                        socket.roomId = roomId;  // FIXED: Store roomId on socket for O(1) disconnect cleanup
+                        logger.info(`Player ${walletAddress} joined temporary room ${roomId}`);
+                        socket.emit('gameJoined', roomId);
+
+                        await logGameRoomsState();
+                    } catch (error) {
+                        const sanitized = sanitizeError(error, 'joinGame', 'Failed to join game. Please try again.');
+                        socket.emit('joinGameFailure', sanitized);
+                    }
+                } else if (event === 'playerReady') {
+                    const { roomId, preferredMode, recaptchaToken } = args[0];
+                    try {
+                        // Rate limit playerReady to prevent DoS
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitEvent(socket.user.walletAddress, 'playerReady', clientIP, socket);
+
+                        const { error } = playerReadySchema.validate({ roomId, preferredMode, recaptchaToken });
+                        if (error) {
+                            const sanitized = sanitizeValidationError(error, 'playerReady');
+                            socket.emit('gameError', sanitized);
+                            return;
+                        }
+
+                        logger.info(`Player ${socket.id} ready in room ${roomId}, preferred mode: ${preferredMode || 'not specified'}`);
+
+                        // ===== VALIDATION: Read room and validate player (before any modifications) =====
+                        let initialRoom = await getGameRoom(roomId);
+                        if (!initialRoom) {
+                            logger.error(`Room ${roomId} not found when player ${socket.id} marked ready`);
+                            socket.emit('gameError', 'Room not found');
+                            return;
+                        }
+
+                        const player = initialRoom.players.find(p => p.id === socket.id);
+                        if (!player) {
+                            socket.emit('gameError', 'Player not found in room');
+                            return;
+                        }
+                        const username = player.username;
+
+                        if (initialRoom.roomMode === 'bot') {
+                            logger.info(`Room ${roomId} is set for bot play, not starting regular game`);
+                            return;
+                        }
+
+                        // Device fingerprint check
+                        const user = await User.findOne({ walletAddress: username });
+                        if (user && socket.user && user.deviceFingerprint !== socket.user.fingerprint) {
+                            SecurityLogger.deviceMismatch(username, user.deviceFingerprint, socket.user.fingerprint, { event: 'playerReady' });
+                            botDetector.trackEvent(username, 'fingerprint_mismatch', { event: 'playerReady' });
+                            if (!recaptchaToken || !(await verifyRecaptcha(recaptchaToken)).success) {
+                                socket.emit('gameError', 'Device verification failed. Please relogin.');
+                                return;
+                            }
+                        }
+
+                        // High-win streak captcha check
+                        if (user && user.gamesPlayed > 5 && (user.wins / user.gamesPlayed) > 0.8) {
+                            if (!recaptchaToken || !(await verifyRecaptcha(recaptchaToken)).success) {
+                                socket.emit('gameError', 'Additional verification required due to high win rate.');
+                                return;
+                            }
+                        }
+
+                        // BotDetector integration
+                        botDetector.trackEvent(username, 'player_ready', { preferredMode, roomId });
+
+                        // ===== ATOMIC OPERATIONS BASED ON GAME MODE =====
+
+                        if (preferredMode === 'human') {
+                            // ATOMIC: Set room mode to 'human'
+                            let updatedRoom;
+                            try {
+                                updatedRoom = await atomicRoomUpdate(roomId, async (room) => {
+                                    room.roomMode = 'human';
+                                    return room;
+                                });
+                            } catch (innerError) {
+                                logger.error(`Failed to set room mode for ${roomId}:`, innerError);
+                                socket.emit('gameError', 'Failed to update room');
+                                return;
+                            }
+                            logger.info(`Room ${roomId} marked for human vs human play`);
+
+                            // ===== MATCHMAKING LOGIC (if single player) =====
+                            if (updatedRoom.players.length === 1) {
+                                let matchFound = false;
+
+                                // FIXED: O(1) lookup instead of O(N) scanKeys
+                                const otherRoomId = await getWaitingRoom(updatedRoom.betAmount);
+
+                                if (otherRoomId && otherRoomId !== roomId) {
+                                    // Validate other room before attempting match
+                                    const otherRoom = await getGameRoom(otherRoomId);
+                                    if (
+                                        otherRoom &&
+                                        otherRoom.roomMode === 'human' &&
+                                        !otherRoom.gameStarted &&
+                                        otherRoom.betAmount === updatedRoom.betAmount &&
+                                        otherRoom.players.length === 1
+                                    ) {
+                                        logger.info(`Found matching room ${otherRoomId} for player in room ${roomId} (O(1) lookup)`);
+
+                                        // ATOMIC: Add player to other room and start game
+                                        try {
+                                            const playerToMove = updatedRoom.players[0];
+                                            await atomicRoomUpdate(otherRoomId, async (otherRoom) => {
+                                                // Add player from current room
+                                                otherRoom.players.push(playerToMove);
+
+                                                // Start the game
+                                                otherRoom.gameStarted = true;
+
+                                                return otherRoom;
+                                            });
+
+                                            // POST-TRANSACTION: Socket operations and cleanup
+                                            socket.leave(roomId);
+                                            if (roomId === socket.roomId) socket.roomId = null;
+                                            socket.join(otherRoomId);
+                                            socket.roomId = otherRoomId;
+
+                                            socket.emit('matchFound', { newRoomId: otherRoomId });
+                                            io.to(otherRoomId).emit('playerJoined', playerToMove.username);
+
+                                            await startGame(otherRoomId);
+
+                                            // Clean up both rooms from waiting index
+                                            await removeWaitingRoom(updatedRoom.betAmount, roomId);
+                                            await removeWaitingRoom(updatedRoom.betAmount, otherRoomId);
+                                            await deleteGameRoom(roomId);
+                                            matchFound = true;
+
+                                        } catch (innerError) {
+                                            logger.error(`Failed to match rooms ${roomId} and ${otherRoomId}:`, innerError);
+                                            // Fall through to add current room to waiting list
+                                        }
+                                    } else {
+                                        // Other room invalid/gone, remove from index and add current room
+                                        logger.info(`Waiting room ${otherRoomId} no longer valid, replacing with ${roomId}`);
+                                        await removeWaitingRoom(updatedRoom.betAmount, otherRoomId);
+                                        await addWaitingRoom(updatedRoom.betAmount, roomId);
+                                    }
+                                }
+
+                                if (!matchFound && !otherRoomId) {
+                                    // No waiting room found, add this one to index
+                                    await addWaitingRoom(updatedRoom.betAmount, roomId);
+                                    logger.info(`No match found for player in room ${roomId}, added to waiting index`);
+                                }
+                            }
+                        }
+
+                        // ===== CHECK IF ROOM NOW HAS 2 PLAYERS (for direct joins) =====
+                        // Re-read room to check current state
+                        const finalRoom = await getGameRoom(roomId);
+                        if (finalRoom && finalRoom.players.length === 2 && !finalRoom.gameStarted) {
+                            // ATOMIC: Start multiplayer game
+                            try {
+                                await atomicRoomUpdate(roomId, async (room) => {
+                                    // Double-check conditions inside atomic block
+                                    if (room.players.length === 2 && !room.gameStarted) {
+                                        logger.info(`Starting multiplayer game in room ${roomId} with 2 players`);
+                                        room.gameStarted = true;
+                                        room.roomMode = 'multiplayer';
+                                    }
+                                    return room;
+                                });
+
+                                await startGame(roomId);
+                            } catch (innerError) {
+                                logger.error(`Failed to start multiplayer game in ${roomId}:`, innerError);
+                            }
+                        } else if (finalRoom) {
+                            logger.info(`Room ${roomId} has ${finalRoom.players.length} players, waiting for more to join`);
+                        }
+
+                        await logGameRoomsState();
+                    } catch (error) {
+                        const sanitized = sanitizeError(error, 'playerReady', 'Failed to mark player as ready.');
+                        socket.emit('gameError', sanitized);
+                    }
+                } else if (event === 'joinHumanMatchmaking') {
+                    const data = args[0];
+                    try {
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitEvent(data.walletAddress, 'joinHumanMatchmaking', clientIP, socket);
+                        const { error } = transactionSchema.validate(data);
+                        if (error) {
+                            const sanitized = sanitizeValidationError(error, 'joinHumanMatchmaking');
+                            socket.emit('joinGameFailure', sanitized.error);
+                            return;
+                        }
+
+                        const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;
+                        logger.info('Human matchmaking request:', { walletAddress, betAmount, gameMode, nonce });
+
+                        // Strict reCAPTCHA enforcement
+                        let recaptchaResult;
+                        try {
+                            recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                        } catch (recaptchaError) {
+                            SecurityLogger.recaptchaFailed(walletAddress, recaptchaError.message, null, clientIP);
+                            trackRecaptchaFailure(walletAddress, { error: recaptchaError.message, event: 'joinHumanMatchmaking' });
+                            await rateLimitFailedRecaptcha(clientIP);
+                            socket.emit('joinGameFailure', 'Verification failed. Please try again.');
+                            return;
+                        }
+
+                        const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
+                        const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
+
+                        const transaction = await verifyAndValidateTransaction(
+                            transactionSignature,
+                            betAmount,
+                            walletAddress,
+                            config.TREASURY_WALLET.toString(),
+                            nonce,
+                            maxRetries,
+                            retryDelay
+                        );
+
+                        AuditLogger.transactionVerified(walletAddress, betAmount, transactionSignature, config.TREASURY_WALLET.toString(), nonce, clientIP);
+
+                        // ATOMIC: Clean up existing room using socket.roomId (no scan needed)
+                        if (socket.roomId) {
+                            const oldRoomId = socket.roomId;
+                            try {
+                                const result = await atomicRoomUpdate(oldRoomId, async (existingRoom) => {
+                                    const playerIndex = existingRoom.players.findIndex(p => p.username === walletAddress);
+                                    if (playerIndex === -1) {
+                                        throw new Error('Player not in room');
+                                    }
+
+                                    existingRoom.players.splice(playerIndex, 1);
+
+                                    // Store metadata
+                                    existingRoom._cleanupMetadata = {
+                                        isEmpty: existingRoom.players.length === 0
+                                    };
+
+                                    return existingRoom;
+                                });
+
+                                // POST-TRANSACTION: Socket operations
+                                socket.leave(oldRoomId);
+                                socket.roomId = null;
+                                logger.info(`Player ${walletAddress} left room ${oldRoomId} for matchmaking`);
+
+                                if (result._cleanupMetadata.isEmpty) {
+                                    await deleteGameRoom(oldRoomId);
+                                    logger.info(`Deleted empty room ${oldRoomId}`);
+                                }
+                            } catch (cleanupError) {
+                                if (cleanupError.message.includes('not found') || cleanupError.message === 'Player not in room') {
+                                    logger.info(`Player ${walletAddress} not in room ${oldRoomId}, continuing with matchmaking`);
+                                } else {
+                                    throw cleanupError;
+                                }
+                            }
+                        }
+
+                        // Step 1: Check for duplicates (read-only, safe)
+                        const pool = await getMatchmakingPool(betAmount);
+                        const existingPlayer = pool.find(p => p.walletAddress === walletAddress);
+                        if (existingPlayer) {
+                            socket.emit('matchmakingError', { message: 'You are already in matchmaking' });
+                            return;
+                        }
+
+                        // Step 2: ATOMIC get-and-remove in ONE operation
+                        const opponentJson = await redisClient.lpop(`matchmaking:human:${betAmount}`);
+
+                        if (opponentJson) {
+                            // SUCCESS: We atomically got an opponent
+                            // No other server could have gotten this same player
+                            const opponent = JSON.parse(opponentJson);
+                            const roomId = generateRoomId();
+                            logger.info(`ATOMIC MATCH: Creating game room ${roomId} for ${walletAddress} vs ${opponent.walletAddress}`);
+
+                            await createGameRoom(roomId, betAmount, 'multiplayer');
+
+                            // ATOMIC: Add both players to new room
+                            try {
+                                await atomicRoomUpdate(roomId, async (room) => {
+                                    room.players.push(
+                                        {
+                                            id: socket.id,
+                                            username: walletAddress,
+                                            score: 0,
+                                            totalResponseTime: 0
+                                        },
+                                        {
+                                            id: opponent.socketId,
+                                            username: opponent.walletAddress,
+                                            score: 0,
+                                            totalResponseTime: 0
+                                        }
+                                    );
+                                    return room;
+                                });
+                            } catch (roomError) {
+                                logger.error(`Failed to add players to matched room ${roomId}:`, roomError);
+                                socket.emit('matchmakingError', { message: 'Failed to create game room' });
+                                return;
+                            }
+
+                            socket.join(roomId);
+                            socket.roomId = roomId;
+                            const opponentSocket = io.sockets.sockets.get(opponent.socketId);
+                            if (opponentSocket) {
+                                opponentSocket.join(roomId);
+                                opponentSocket.roomId = roomId;
+                                opponentSocket.matchmakingPool = null;
+                            }
+
+                            io.to(roomId).emit('matchFound', {
+                                gameRoomId: roomId,
+                                players: [walletAddress, opponent.walletAddress]
                             });
 
                             await startGame(roomId);
-                        } catch (error) {
-                            logger.error(`Failed to start multiplayer game in ${roomId}:`, error);
-                        }
-                    } else if (finalRoom) {
-                        logger.info(`Room ${roomId} has ${finalRoom.players.length} players, waiting for more to join`);
-                    }
-
-                    await logGameRoomsState();
-                } else if (event === 'joinHumanMatchmaking') {
-                    const data = args[0];
-                    const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                    await rateLimitEvent(data.walletAddress, 'joinHumanMatchmaking', clientIP, socket);
-                    const { error } = transactionSchema.validate(data);
-                    if (error) {
-                        const sanitized = sanitizeValidationError(error, 'joinHumanMatchmaking');
-                        socket.emit('joinGameFailure', sanitized.error);
-                        return;
-                    }
-
-                    const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;  // NEW: Extract nonce
-                    logger.info('Human matchmaking request:', { walletAddress, betAmount, gameMode, nonce });
-
-                    // FIXED: Strict reCAPTCHA enforcement
-                    let recaptchaResult;
-                    try {
-                        recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                    } catch (error) {
-                        SecurityLogger.recaptchaFailed(walletAddress, error.message, null, clientIP);
-                        trackRecaptchaFailure(walletAddress, { error: error.message, event: 'joinHumanMatchmaking' });
-                        // FIXED: Increment failed attempts ONLY on reCAPTCHA failure
-                        // Redis operation wrapped in safeRedisOp
-                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                        await rateLimitFailedRecaptcha(clientIP);
-                        socket.emit('joinGameFailure', 'Verification failed. Please try again.');
-                        return;
-                    }
-
-                    const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
-                    const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
-
-                    const transaction = await verifyAndValidateTransaction(
-                        transactionSignature,
-                        betAmount,
-                        walletAddress,
-                        config.TREASURY_WALLET.toString(),
-                        nonce,  // NEW: Pass nonce
-                        maxRetries,
-                        retryDelay
-                    );
-
-                    AuditLogger.transactionVerified(walletAddress, betAmount, transactionSignature, config.TREASURY_WALLET.toString(), nonce, clientIP);
-
-                    // ✅ ATOMIC: Clean up existing room using socket.roomId (no scan needed)
-                    if (socket.roomId) {
-                        const oldRoomId = socket.roomId;
-                        try {
-                            const result = await atomicRoomUpdate(oldRoomId, async (existingRoom) => {
-                                const playerIndex = existingRoom.players.findIndex(p => p.username === walletAddress);
-                                if (playerIndex === -1) {
-                                    throw new Error('Player not in room');
-                                }
-
-                                existingRoom.players.splice(playerIndex, 1);
-
-                                // Store metadata
-                                existingRoom._cleanupMetadata = {
-                                    isEmpty: existingRoom.players.length === 0
-                                };
-
-                                return existingRoom;
+                        } else {
+                            // FAILURE: Queue was empty
+                            // Add current player to matchmaking pool
+                            logger.info(`No opponents available. Adding ${walletAddress} to matchmaking pool for ${betAmount}`);
+                            // FIXED: Verify pool add succeeds before setting socket property
+                            const poolAdded = await addToMatchmakingPool(betAmount, {
+                                socketId: socket.id,
+                                walletAddress,
+                                joinTime: Date.now(),
+                                transactionSignature
                             });
 
-                            // POST-TRANSACTION: Socket operations
-                            socket.leave(oldRoomId);
-                            socket.roomId = null;
-                            logger.info(`Player ${walletAddress} left room ${oldRoomId} for matchmaking`);
-
-                            if (result._cleanupMetadata.isEmpty) {
-                                await deleteGameRoom(oldRoomId);
-                                logger.info(`Deleted empty room ${oldRoomId}`);
-                            }
-                        } catch (error) {
-                            if (error.message.includes('not found') || error.message === 'Player not in room') {
-                                logger.info(`Player ${walletAddress} not in room ${oldRoomId}, continuing with matchmaking`);
+                            if (poolAdded) {
+                                socket.matchmakingPool = betAmount;
+                                socket.emit('matchmakingJoined', {
+                                    waitingRoomId: `matchmaking-${betAmount}`,
+                                    position: (await getMatchmakingPool(betAmount)).length
+                                });
                             } else {
-                                throw error;
+                                // Should not happen (addToMatchmakingPool throws on error), but defensive
+                                throw new Error('Failed to join matchmaking pool');
                             }
                         }
+
+                        await logMatchmakingState();
+                    } catch (error) {
+                        const sanitized = sanitizeError(error, 'joinHumanMatchmaking', 'Failed to join matchmaking queue.');
+                        socket.emit('joinGameFailure', sanitized);
                     }
+                } else if (event === 'joinBotGame') {
+                    const data = args[0];
+                    try {
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitEvent(data.walletAddress, 'joinBotGame', clientIP, socket);
+                        const { error } = transactionSchema.validate(data);
+                        if (error) {
+                            const sanitized = sanitizeValidationError(error, 'joinBotGame');
+                            socket.emit('joinGameFailure', sanitized.error);
+                            return;
+                        }
 
-                    // Step 1: Check for duplicates (read-only, safe)
-                    const pool = await getMatchmakingPool(betAmount);
-                    const existingPlayer = pool.find(p => p.walletAddress === walletAddress);
-                    if (existingPlayer) {
-                        socket.emit('matchmakingError', { message: 'You are already in matchmaking' });
-                        return;
-                    }
+                        const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;
+                        logger.info('Bot game request:', { walletAddress, betAmount, gameMode, nonce });
 
-                    // Step 2: ATOMIC get-and-remove in ONE operation
-                    // ✅ This is the critical fix!
-                    const opponentJson = await redisClient.lpop(`matchmaking:human:${betAmount}`);
+                        // Strict reCAPTCHA enforcement
+                        let recaptchaResult;
+                        try {
+                            recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                        } catch (recaptchaError) {
+                            SecurityLogger.recaptchaFailed(walletAddress, recaptchaError.message, null, clientIP);
+                            trackRecaptchaFailure(walletAddress, { error: recaptchaError.message, event: 'joinBotGame' });
+                            await rateLimitFailedRecaptcha(clientIP);
+                            socket.emit('joinGameFailure', 'Verification failed. Please try again.');
+                            return;
+                        }
 
-                    if (opponentJson) {
-                        // SUCCESS: We atomically got an opponent
-                        // No other server could have gotten this same player
-                        const opponent = JSON.parse(opponentJson);
+                        const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
+                        const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
+
+                        const transaction = await verifyAndValidateTransaction(
+                            transactionSignature,
+                            betAmount,
+                            walletAddress,
+                            config.TREASURY_WALLET.toString(),
+                            nonce,
+                            maxRetries,
+                            retryDelay
+                        );
+
+                        AuditLogger.transactionVerified(walletAddress, betAmount, transactionSignature, config.TREASURY_WALLET.toString(), nonce, clientIP);
+
+                        // ATOMIC: Clean up existing room using socket.roomId (no scan needed)
+                        if (socket.roomId) {
+                            const oldRoomId = socket.roomId;
+                            try {
+                                await atomicRoomUpdate(oldRoomId, async (existingRoom) => {
+                                    const playerIndex = existingRoom.players.findIndex(p => p.username === walletAddress);
+                                    if (playerIndex === -1) {
+                                        throw new Error('Player not in room');
+                                    }
+
+                                    logger.info(`Player ${walletAddress} already in room ${oldRoomId}, cleaning up`);
+                                    existingRoom.players.splice(playerIndex, 1);
+                                    existingRoom.isDeleted = true;
+
+                                    return existingRoom;
+                                });
+
+                                // POST-TRANSACTION: Socket operations
+                                socket.leave(oldRoomId);
+                                socket.roomId = null;
+                                await redisClient.del(`room:${oldRoomId}`);
+                                logger.info(`Deleted room ${oldRoomId} due to new bot game request`);
+                            } catch (cleanupError) {
+                                if (cleanupError.message.includes('not found') || cleanupError.message === 'Player not in room') {
+                                    logger.info(`Player ${walletAddress} not in old room ${oldRoomId}, continuing`);
+                                } else {
+                                    throw cleanupError;
+                                }
+                            }
+                        }
+
                         const roomId = generateRoomId();
-                        logger.info(`✅ ATOMIC MATCH: Creating game room ${roomId} for ${walletAddress} vs ${opponent.walletAddress}`);
+                        logger.info(`Creating bot game room ${roomId} for player ${walletAddress}`);
 
-                        await createGameRoom(roomId, betAmount, 'multiplayer');
+                        await createGameRoom(roomId, betAmount, 'bot');
 
-                        // ✅ ATOMIC: Add both players to new room
+                        // ATOMIC: Add player to new bot room
                         try {
                             await atomicRoomUpdate(roomId, async (room) => {
-                                room.players.push(
-                                    {
-                                        id: socket.id,
-                                        username: walletAddress,
-                                        score: 0,
-                                        totalResponseTime: 0
-                                    },
-                                    {
-                                        id: opponent.socketId,
-                                        username: opponent.walletAddress,
-                                        score: 0,
-                                        totalResponseTime: 0
-                                    }
-                                );
+                                room.players.push({
+                                    id: socket.id,
+                                    username: walletAddress,
+                                    score: 0,
+                                    totalResponseTime: 0
+                                });
                                 return room;
                             });
-                        } catch (error) {
-                            logger.error(`Failed to add players to matched room ${roomId}:`, error);
-                            socket.emit('matchmakingError', { message: 'Failed to create game room' });
+                        } catch (roomError) {
+                            logger.error(`Failed to add player to bot room ${roomId}:`, roomError);
+                            socket.emit('joinGameFailure', 'Failed to create bot game room');
                             return;
                         }
 
                         socket.join(roomId);
                         socket.roomId = roomId;
-                        const opponentSocket = io.sockets.sockets.get(opponent.socketId);
-                        if (opponentSocket) {
-                            opponentSocket.join(roomId);
-                            opponentSocket.roomId = roomId;
-                            opponentSocket.matchmakingPool = null;
-                        }
 
-                        io.to(roomId).emit('matchFound', {
+                        const botName = chooseBotName();
+                        socket.emit('botGameCreated', {
                             gameRoomId: roomId,
-                            players: [walletAddress, opponent.walletAddress]
+                            botName
                         });
 
-                        await startGame(roomId);
-                    } else {
-                        // FAILURE: Queue was empty
-                        // Add current player to matchmaking pool
-                        logger.info(`No opponents available. Adding ${walletAddress} to matchmaking pool for ${betAmount}`);
-                        // ✅ FIXED: Verify pool add succeeds before setting socket property
-                        const poolAdded = await addToMatchmakingPool(betAmount, {
-                            socketId: socket.id,
-                            walletAddress,
-                            joinTime: Date.now(),
-                            transactionSignature
-                        });
-
-                        if (poolAdded) {
-                            socket.matchmakingPool = betAmount;  // ✅ Only set if confirmed added
-                            socket.emit('matchmakingJoined', {
-                                waitingRoomId: `matchmaking-${betAmount}`,
-                                position: (await getMatchmakingPool(betAmount)).length
-                            });
-                        } else {
-                            // Should not happen (addToMatchmakingPool throws on error), but defensive
-                            throw new Error('Failed to join matchmaking pool');
-                        }
-                    }
-
-                    await logMatchmakingState();
-                } else if (event === 'joinBotGame') {
-                    const data = args[0];
-                    const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                    await rateLimitEvent(data.walletAddress, 'joinBotGame', clientIP, socket);
-                    const { error } = transactionSchema.validate(data);
-                    if (error) {
-                        const sanitized = sanitizeValidationError(error, 'joinBotGame');
-                        socket.emit('joinGameFailure', sanitized.error);
-                        return;
-                    }
-
-                    const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;  // NEW: Extract nonce
-                    logger.info('Bot game request:', { walletAddress, betAmount, gameMode, nonce });
-
-                    // FIXED: Strict reCAPTCHA enforcement
-                    let recaptchaResult;
-                    try {
-                        recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                        await startSinglePlayerGame(roomId);
+                        await logGameRoomsState();
                     } catch (error) {
-                        SecurityLogger.recaptchaFailed(walletAddress, error.message, null, clientIP);
-                        trackRecaptchaFailure(walletAddress, { error: error.message, event: 'joinBotGame' });
-                        // FIXED: Increment failed attempts ONLY on reCAPTCHA failure
-                        // Redis operation wrapped in safeRedisOp
-                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-                        await rateLimitFailedRecaptcha(clientIP);
-                        socket.emit('joinGameFailure', 'Verification failed. Please try again.');
-                        return;
+                        const sanitized = sanitizeError(error, 'joinBotGame', 'Failed to start bot game.');
+                        socket.emit('joinGameFailure', sanitized);
                     }
-
-                    const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
-                    const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
-
-                    const transaction = await verifyAndValidateTransaction(
-                        transactionSignature,
-                        betAmount,
-                        walletAddress,
-                        config.TREASURY_WALLET.toString(),
-                        nonce,  // NEW: Pass nonce
-                        maxRetries,
-                        retryDelay
-                    );
-
-                    AuditLogger.transactionVerified(walletAddress, betAmount, transactionSignature, config.TREASURY_WALLET.toString(), nonce, clientIP);
-
-                    // ✅ ATOMIC: Clean up existing room using socket.roomId (no scan needed)
-                    if (socket.roomId) {
-                        const oldRoomId = socket.roomId;
-                        try {
-                            await atomicRoomUpdate(oldRoomId, async (existingRoom) => {
-                                const playerIndex = existingRoom.players.findIndex(p => p.username === walletAddress);
-                                if (playerIndex === -1) {
-                                    throw new Error('Player not in room');
-                                }
-
-                                logger.info(`Player ${walletAddress} already in room ${oldRoomId}, cleaning up`);
-                                existingRoom.players.splice(playerIndex, 1);
-                                existingRoom.isDeleted = true;
-
-                                return existingRoom;
-                            });
-
-                            // POST-TRANSACTION: Socket operations
-                            socket.leave(oldRoomId);
-                            socket.roomId = null;
-                            await redisClient.del(`room:${oldRoomId}`);
-                            logger.info(`Deleted room ${oldRoomId} due to new bot game request`);
-                        } catch (error) {
-                            if (error.message.includes('not found') || error.message === 'Player not in room') {
-                                logger.info(`Player ${walletAddress} not in old room ${oldRoomId}, continuing`);
-                            } else {
-                                throw error;
-                            }
-                        }
-                    }
-
-                    const roomId = generateRoomId();
-                    logger.info(`Creating bot game room ${roomId} for player ${walletAddress}`);
-
-                    await createGameRoom(roomId, betAmount, 'bot');
-
-                    // ✅ ATOMIC: Add player to new bot room
-                    try {
-                        await atomicRoomUpdate(roomId, async (room) => {
-                            room.players.push({
-                                id: socket.id,
-                                username: walletAddress,
-                                score: 0,
-                                totalResponseTime: 0
-                            });
-                            return room;
-                        });
-                    } catch (error) {
-                        logger.error(`Failed to add player to bot room ${roomId}:`, error);
-                        socket.emit('joinGameFailure', 'Failed to create bot game room');
-                        return;
-                    }
-
-                    socket.join(roomId);
-                    socket.roomId = roomId;  // FIXED: Set roomId on socket
-
-                    const botName = chooseBotName();
-                    socket.emit('botGameCreated', {
-                        gameRoomId: roomId,
-                        botName
-                    });
-
-                    await startSinglePlayerGame(roomId);
-                    await logGameRoomsState();
                 } else if (event === 'switchToBot') {
                     const { roomId } = args[0];
-                    const { error } = switchToBotSchema.validate({ roomId });
-                    if (error) {
-                        const sanitized = sanitizeValidationError(error, 'switchToBot');
-                        socket.emit('matchmakingError', sanitized);
-                        return;
-                    }
-
-                    logger.info(`Player ${socket.id} wants to switch from matchmaking to bot game`);
-
-                    let playerFound = false;
-                    let playerData = null;
-                    let playerBetAmount = null;
-
-                    // FIXED: First, check if player is in a room (using socket.roomId, no scan)
-                    if (socket.roomId) {
-                        const oldRoomId = socket.roomId;
-                        try {
-                            // ✅ ATOMIC ROOM UPDATE for existing room
-                            const result = await atomicRoomUpdate(oldRoomId, async (existingRoom) => {
-                                const playerIndex = existingRoom.players.findIndex(p => p.id === socket.id);
-                                if (playerIndex === -1) {
-                                    throw new Error('Player not in room');
-                                }
-
-                                playerData = existingRoom.players[playerIndex];
-                                playerBetAmount = existingRoom.betAmount;
-                                playerFound = true;
-                                logger.info(`Found player ${playerData.username} in room ${oldRoomId} with bet ${playerBetAmount}`);
-
-                                existingRoom.players.splice(playerIndex, 1);
-
-                                // Store metadata
-                                existingRoom._switchMetadata = {
-                                    isEmpty: existingRoom.players.length === 0,
-                                    playerUsername: playerData.username
-                                };
-
-                                return existingRoom;
-                            });
-
-                            // POST-TRANSACTION: Socket operations
-                            socket.leave(oldRoomId);
-                            socket.roomId = null;
-
-                            const metadata = result._switchMetadata;
-                            if (metadata.isEmpty) {
-                                await deleteGameRoom(oldRoomId);
-                                logger.info(`Deleted empty room ${oldRoomId}`);
-                            } else {
-                                io.to(oldRoomId).emit('playerLeft', metadata.playerUsername);
-                            }
-                        } catch (error) {
-                            if (error.message.includes('not found') || error.message === 'Player not in room') {
-                                logger.info(`Player ${socket.id} not found in room ${oldRoomId}`);
-                            } else {
-                                throw error;
-                            }
-                        }
-                    }
-
-                    if (!playerFound && socket.matchmakingPool) {
-                        logger.info(`Player ${socket.id} found in matchmaking pool via socket reference`);
-                        const playerDataFromPool = await removeFromMatchmakingPool(socket.matchmakingPool, socket.id);
-                        if (playerDataFromPool) {
-                            playerData = playerDataFromPool;
-                            playerBetAmount = socket.matchmakingPool;
-                            playerFound = true;
-                            socket.matchmakingPool = null;  // ✅ Clear reference after removal
-                            logger.info(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
-                        }
-                    }
-
-                    // ✅ FIXED: Removed fallback scanKeys - force root cause fix
-                    if (!playerFound) {
-                        logger.error(`CRITICAL METRIC: socket.matchmakingPool missing for ${socket.id} - potential bug or race condition`);
-                        // TODO: Send to monitoring service (Sentry, Datadog, CloudWatch, etc.)
-                        // Example: await metrics.increment('matchmaking.missing_pool_ref', { socketId: socket.id });
-                        
-                        socket.emit('matchmakingError', { 
-                            message: 'Matchmaking state lost. Please try joining the queue again.' 
-                        });
-                        return;
-                    }
-
-                    if (!playerFound || !playerData) {
-                        logger.error(`Player ${socket.id} not found in any matchmaking pool or room`);
-                        socket.emit('matchmakingError', { message: 'Not found in matchmaking or game rooms' });
-                        return;
-                    }
-
-                    const playerIdentifier = playerData.username || playerData.walletAddress || socket.id;
-                    const newRoomId = generateRoomId();
-                    logger.info(`Creating bot game room ${newRoomId} for player ${playerIdentifier}`);
-
-                    // Create a new game room in Redis
-                    await createGameRoom(newRoomId, playerBetAmount, 'bot');
-
-                    // ✅ ATOMIC ROOM UPDATE for adding player to new room
                     try {
-                        await atomicRoomUpdate(newRoomId, async (room) => {
-                            // Add player to the room
-                            room.players.push({
-                                id: socket.id,
-                                username: playerIdentifier,
-                                score: 0,
-                                totalResponseTime: 0,
-                                answered: false,
-                                lastAnswer: null
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitEvent(socket.user.walletAddress, 'switchToBot', clientIP, socket);
+                        const { error } = switchToBotSchema.validate({ roomId });
+                        if (error) {
+                            const sanitized = sanitizeValidationError(error, 'switchToBot');
+                            socket.emit('matchmakingError', sanitized);
+                            return;
+                        }
+
+                        logger.info(`Player ${socket.id} wants to switch from matchmaking to bot game`);
+
+                        let playerFound = false;
+                        let playerData = null;
+                        let playerBetAmount = null;
+
+                        // First, check if player is in a room (using socket.roomId, no scan)
+                        if (socket.roomId) {
+                            const oldRoomId = socket.roomId;
+                            try {
+                                // ATOMIC ROOM UPDATE for existing room
+                                const result = await atomicRoomUpdate(oldRoomId, async (existingRoom) => {
+                                    const playerIndex = existingRoom.players.findIndex(p => p.id === socket.id);
+                                    if (playerIndex === -1) {
+                                        throw new Error('Player not in room');
+                                    }
+
+                                    playerData = existingRoom.players[playerIndex];
+                                    playerBetAmount = existingRoom.betAmount;
+                                    playerFound = true;
+                                    logger.info(`Found player ${playerData.username} in room ${oldRoomId} with bet ${playerBetAmount}`);
+
+                                    existingRoom.players.splice(playerIndex, 1);
+
+                                    // Store metadata
+                                    existingRoom._switchMetadata = {
+                                        isEmpty: existingRoom.players.length === 0,
+                                        playerUsername: playerData.username
+                                    };
+
+                                    return existingRoom;
+                                });
+
+                                // POST-TRANSACTION: Socket operations
+                                socket.leave(oldRoomId);
+                                socket.roomId = null;
+
+                                const metadata = result._switchMetadata;
+                                if (metadata.isEmpty) {
+                                    await deleteGameRoom(oldRoomId);
+                                    logger.info(`Deleted empty room ${oldRoomId}`);
+                                } else {
+                                    io.to(oldRoomId).emit('playerLeft', metadata.playerUsername);
+                                }
+                            } catch (roomError) {
+                                if (roomError.message.includes('not found') || roomError.message === 'Player not in room') {
+                                    logger.info(`Player ${socket.id} not found in room ${oldRoomId}`);
+                                } else {
+                                    throw roomError;
+                                }
+                            }
+                        }
+
+                        if (!playerFound && socket.matchmakingPool) {
+                            logger.info(`Player ${socket.id} found in matchmaking pool via socket reference`);
+                            const playerDataFromPool = await removeFromMatchmakingPool(socket.matchmakingPool, socket.id);
+                            if (playerDataFromPool) {
+                                playerData = playerDataFromPool;
+                                playerBetAmount = socket.matchmakingPool;
+                                playerFound = true;
+                                socket.matchmakingPool = null;
+                                logger.info(`Removed player ${playerData.walletAddress} from matchmaking pool for ${playerBetAmount}`);
+                            }
+                        }
+
+                        // Removed fallback scanKeys - force root cause fix
+                        if (!playerFound) {
+                            logger.error(`CRITICAL METRIC: socket.matchmakingPool missing for ${socket.id} - potential bug or race condition`);
+
+                            socket.emit('matchmakingError', {
+                                message: 'Matchmaking state lost. Please try joining the queue again.'
                             });
+                            return;
+                        }
 
-                            return room;
+                        if (!playerFound || !playerData) {
+                            logger.error(`Player ${socket.id} not found in any matchmaking pool or room`);
+                            socket.emit('matchmakingError', { message: 'Not found in matchmaking or game rooms' });
+                            return;
+                        }
+
+                        const playerIdentifier = playerData.username || playerData.walletAddress || socket.id;
+                        const newRoomId = generateRoomId();
+                        logger.info(`Creating bot game room ${newRoomId} for player ${playerIdentifier}`);
+
+                        // Create a new game room in Redis
+                        await createGameRoom(newRoomId, playerBetAmount, 'bot');
+
+                        // ATOMIC ROOM UPDATE for adding player to new room
+                        try {
+                            await atomicRoomUpdate(newRoomId, async (room) => {
+                                // Add player to the room
+                                room.players.push({
+                                    id: socket.id,
+                                    username: playerIdentifier,
+                                    score: 0,
+                                    totalResponseTime: 0,
+                                    answered: false,
+                                    lastAnswer: null
+                                });
+
+                                return room;
+                            });
+                        } catch (roomError) {
+                            logger.error(`Failed to add player to room ${newRoomId}:`, roomError);
+                            socket.emit('matchmakingError', { message: 'Failed to create bot game room' });
+                            return;
+                        }
+
+                        socket.join(newRoomId);
+                        socket.roomId = newRoomId;
+
+                        const botName = chooseBotName();
+                        socket.emit('botGameCreated', {
+                            gameRoomId: newRoomId,
+                            botName
                         });
+
+                        await startSinglePlayerGame(newRoomId);
+                        await logGameRoomsState();
+                        await logMatchmakingState();
                     } catch (error) {
-                        logger.error(`Failed to add player to room ${newRoomId}:`, error);
-                        socket.emit('matchmakingError', { message: 'Failed to create bot game room' });
-                        return;
+                        const sanitized = sanitizeError(error, 'switchToBot', 'Failed to switch to bot game.');
+                        socket.emit('matchmakingError', sanitized);
                     }
-
-                    socket.join(newRoomId);
-                    socket.roomId = newRoomId;  // FIXED: Set roomId on socket
-
-                    const botName = chooseBotName();
-                    socket.emit('botGameCreated', {
-                        gameRoomId: newRoomId,
-                        botName
-                    });
-
-                    await startSinglePlayerGame(newRoomId);
-                    await logGameRoomsState();
-                    await logMatchmakingState();
                 } else if (event === 'matchFound') {
                     const { newRoomId } = args[0];
                     try {
@@ -3337,6 +3378,8 @@ io.on('connection', (socket) => {
                 } else if (event === 'requestBotRoom') {
                     const { walletAddress, betAmount } = args[0];
                     try {
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitEvent(walletAddress, 'requestBotRoom', clientIP, socket);
                         const { error } = requestBotRoomSchema.validate({ walletAddress, betAmount });
                         if (error) {
                             const sanitized = sanitizeValidationError(error, 'requestBotRoom');
@@ -3379,6 +3422,8 @@ io.on('connection', (socket) => {
                 } else if (event === 'requestBotGame') {
                     const { roomId } = args[0];
                     try {
+                        const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+                        await rateLimitEvent(socket.user.walletAddress, 'requestBotGame', clientIP, socket);
                         const { error } = requestBotGameSchema.validate({ roomId });
                         if (error) {
                             const sanitized = sanitizeValidationError(error, 'requestBotGame');
