@@ -33,10 +33,10 @@
         // Check if wallet is already connected on page load
         window.addEventListener('load', () => {
             const savedWallet = localStorage.getItem('walletAddress');
-            if (savedWallet) {
+            const connectBtn = document.getElementById('connectWalletBtn');
+            if (savedWallet && connectBtn) {
                 wallet = savedWallet;
-                document.getElementById('connectWalletBtn').textContent = 
-                    `Connected: ${wallet.slice(0,4)}...${wallet.slice(-4)}`;
+                connectBtn.textContent = `Connected: ${wallet.slice(0,4)}...${wallet.slice(-4)}`;
             }
         });
 
@@ -51,16 +51,20 @@
                 wallet = resp.publicKey.toString();
                 // Save wallet address to localStorage
                 localStorage.setItem('walletAddress', wallet);
-                document.getElementById('connectWalletBtn').textContent = 
-                    `Connected: ${wallet.slice(0,4)}...${wallet.slice(-4)}`;
+                const connectBtn = document.getElementById('connectWalletBtn');
+                if (connectBtn) {
+                    connectBtn.textContent = `Connected: ${wallet.slice(0,4)}...${wallet.slice(-4)}`;
+                }
             } catch (err) {
                 console.error('Error connecting wallet:', err);
                 alert('Failed to connect wallet');
             }
         }
 
-        document.getElementById('connectWalletBtn')
-            .addEventListener('click', connectWallet);
+        const connectWalletBtn = document.getElementById('connectWalletBtn');
+        if (connectWalletBtn) {
+            connectWalletBtn.addEventListener('click', connectWallet);
+        }
     </script>
 </body>
 </html>
