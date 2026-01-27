@@ -135,7 +135,6 @@
                 <li><a href="game.html">Play Game</a></li>
             </ul>
         </nav>
-        <button onclick="toggleTheme()" id="themeToggle">Toggle Theme</button>
     </header>
     <main>
         <div id="leaderboardContainer">
@@ -264,12 +263,6 @@
                     refreshBtn.innerHTML = 'Refresh Leaderboard';
                 }, 1000);
             }
-        }
-        
-        // Theme toggle functionality
-        function toggleTheme() {
-            document.body.classList.toggle('dark-theme');
-            localStorage.setItem('theme', document.body.classList.contains('dark-theme') ? 'dark' : 'light');
         }
         
         // Set theme on load
