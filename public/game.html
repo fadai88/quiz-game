@@ -1095,14 +1095,11 @@
                 displaySeconds = 10;
             }
 
-            // 3. Functional Timeout: This handles the actual button disabling
+            // 3. Clear any existing timer
             if (questionTimer) clearTimeout(questionTimer);
-            questionTimer = setTimeout(() => {
-                submitAnswerBtn.disabled = true;
-                waitingMessage.textContent = 'Time\'s up!';
-            }, msRemaining); 
 
-            // 4. Visual Countdown: Start the synced ticker
+            // 4. Start visual countdown with dynamic tick timing
+            // This will handle both the display AND the button disabling
             startVisualCountdown(displaySeconds, msRemaining);
         });
 
@@ -1505,37 +1502,55 @@
             // Clear any existing intervals or timeouts to prevent "doubling up"
             clearInterval(countdownInterval);
             if (window.syncTimeout) clearTimeout(window.syncTimeout);
+            if (questionTimer) clearTimeout(questionTimer);
             
             // Render the starting number immediately
             countdownTimer.textContent = `Time remaining: ${timeRemaining} seconds`;
             countdownTimer.style.display = 'block';
             
-            // Calculate how many milliseconds until we hit the next whole second boundary
-            // (e.g., if 9800ms remains, we wait 800ms to tick from 10 to 9)
-            const msUntilNextSecond = actualMsRemaining % 1000;
-
-            window.syncTimeout = setTimeout(() => {
-                // Tick immediately at the boundary
+            // OPTION 2: Dynamic interval timing
+            // Calculate the time per tick to fit all numbers into actual remaining time
+            // Example: If we have 9800ms and need to show 10 numbers,
+            // each tick should be 9800/10 = 980ms instead of 1000ms
+            const tickInterval = actualMsRemaining / timeRemaining;
+            
+            // Helper function to handle countdown tick
+            const tickDown = () => {
                 timeRemaining--;
                 
                 if (timeRemaining <= 0) {
+                    // Countdown complete - show time's up and disable button
                     countdownTimer.textContent = "Time's up!";
+                    submitAnswerBtn.disabled = true;
+                    if (countdownInterval) clearInterval(countdownInterval);
+                    if (window.syncTimeout) clearTimeout(window.syncTimeout);
                 } else {
+                    // Update display with remaining time
                     countdownTimer.textContent = `Time remaining: ${timeRemaining} seconds`;
-                    
-                    // Now start the regular 1-second interval
-                    countdownInterval = setInterval(() => {
-                        timeRemaining--;
-                        
-                        if (timeRemaining <= 0) {
-                            clearInterval(countdownInterval);
-                            countdownTimer.textContent = "Time's up!";
-                        } else {
-                            countdownTimer.textContent = `Time remaining: ${timeRemaining} seconds`;
-                        }
-                    }, 1000);
                 }
-            }, msUntilNextSecond);
+            };
+            
+            // Start first tick at the calculated interval
+            window.syncTimeout = setTimeout(() => {
+                tickDown();
+                
+                // If there's still time remaining, continue with regular intervals
+                if (timeRemaining > 0) {
+                    countdownInterval = setInterval(tickDown, tickInterval);
+                }
+            }, tickInterval);
+            
+            // Safety net: Force time's up at the exact moment actual time expires
+            // This ensures button is disabled even if intervals drift slightly
+            questionTimer = setTimeout(() => {
+                if (timeRemaining > 0) {
+                    timeRemaining = 0;
+                    countdownTimer.textContent = "Time's up!";
+                    submitAnswerBtn.disabled = true;
+                    if (countdownInterval) clearInterval(countdownInterval);
+                    if (window.syncTimeout) clearTimeout(window.syncTimeout);
+                }
+            }, actualMsRemaining);
         }
 
         function updatePlayerUI(players) {
