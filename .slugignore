@@ -1,0 +1,9 @@
+# Ignore Solana/Rust files
+programs/
+migrations/
+target/
+tests/
+Anchor.toml
+Cargo.toml
+app/
+node_modules/
