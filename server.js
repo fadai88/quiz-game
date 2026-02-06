@@ -602,7 +602,7 @@ app.use((req, res, next) => {
         "default-src 'self'",
         
         // Scripts: Allow game libraries and reCAPTCHA
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.google.com https://www.gstatic.com https://bundle.run https://unpkg.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com",
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.google.com https://www.gstatic.com https://bundle.run https://unpkg.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://static.cloudflareinsights.com",
         
         // Styles: Allow inline styles for dynamic UI
         "style-src 'self' 'unsafe-inline'",
@@ -1091,7 +1091,7 @@ app.get('/game.html', (req, res) => {
     let gameHtml = fs.readFileSync(path.join(__dirname, 'public', 'game.html'), 'utf8');
     const recaptchaEnabled = process.env.ENABLE_RECAPTCHA === 'true';
     const recaptchaSiteKey = process.env.RECAPTCHA_SITE_KEY || '';
-    gameHtml = gameHtml.replace('YOUR_SITE_KEY', recaptchaSiteKey);
+    gameHtml = gameHtml.replace(/YOUR_SITE_KEY/g, recaptchaSiteKey);
     const recaptchaConfigScript = `<script>
         window.recaptchaEnabled = ${recaptchaEnabled};
         window.recaptchaSiteKey = "${recaptchaSiteKey}";
