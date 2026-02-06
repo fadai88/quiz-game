@@ -1158,12 +1158,21 @@ let paymentProcessor = null;
 async function initializeConfig() {
     try {
         console.log('🔐 Initializing config with AWS Secrets Manager...');
+        
+        // Validate required environment variables
+        if (!process.env.TREASURY_WALLET_ADDRESS) {
+            throw new Error('TREASURY_WALLET_ADDRESS environment variable is not set');
+        }
+        if (!process.env.SOLANA_RPC_URL) {
+            throw new Error('SOLANA_RPC_URL environment variable is not set');
+        }
+        
         const secretString = await getCachedTreasurySecretKey();
         const secretKey = JSON.parse(secretString);
         
         config = {
-            USDC_MINT: new PublicKey('Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr'),
-            TREASURY_WALLET: new PublicKey('GN6uUVKuijj15ULm3X954mQTKEzur9jxXdRRuLeMqmgH'),
+            USDC_MINT: new PublicKey(process.env.USDC_MINT_ADDRESS || 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
+            TREASURY_WALLET: new PublicKey(process.env.TREASURY_WALLET_ADDRESS),
             TREASURY_KEYPAIR: Keypair.fromSecretKey(Buffer.from(secretKey)),
             connection: new Connection(process.env.SOLANA_RPC_URL, 'confirmed'),
             rpcEndpoints: [process.env.SOLANA_RPC_URL],
@@ -1211,15 +1220,12 @@ async function initializeRedis() {
             // Production (Heroku, Railway, Render, etc.)
             console.log('📡 Using REDIS_URL from environment');
             
-            // Parse the URL and create client
-            redisClient = new Redis(process.env.REDIS_URL, {
-                // Heroku Redis requires TLS
-                tls: {
-                    rejectUnauthorized: false
-                },
-
+            // Check if URL uses TLS (rediss://) or not (redis://)
+            const useTLS = process.env.REDIS_URL.startsWith('rediss://');
+            
+            const redisOptions = {
                 keepAlive: 10000,      // Send keepalive packet every 10 seconds
-                family: 4,             // Force IPv4 (fixes some Heroku DNS resolution issues)
+                family: 4,             // Force IPv4
                 connectTimeout: 20000, // Increase timeout
                 
                 // Robust retry configuration
@@ -1230,9 +1236,21 @@ async function initializeRedis() {
                 maxRetriesPerRequest: 3,
                 retryDelayOnFailover: 100,
                 enableReadyCheck: true,
-                connectTimeout: 10000,
                 commandTimeout: 5000
-            });
+            };
+            
+            // Only add TLS if URL uses rediss:// (Heroku, Upstash, etc.)
+            if (useTLS) {
+                console.log('🔒 TLS enabled for Redis connection');
+                redisOptions.tls = {
+                    rejectUnauthorized: false
+                };
+            } else {
+                console.log('📡 Using non-TLS Redis (Railway internal)');
+            }
+            
+            // Parse the URL and create client
+            redisClient = new Redis(process.env.REDIS_URL, redisOptions);
             
         } else {
             // Local development (use individual env vars)
@@ -1266,7 +1284,7 @@ async function initializeRedis() {
         redisClient.on('ready', () => { 
             console.log('✅ Redis ready'); 
             if (process.env.REDIS_URL) {
-                console.log('   🔒 Connected via REDIS_URL (Heroku/Cloud)');
+                console.log('   🔒 Connected via REDIS_URL (Cloud)');
             } else if (process.env.REDIS_PASSWORD) {
                 console.log('   🔒 Using password authentication (local)');
             }
