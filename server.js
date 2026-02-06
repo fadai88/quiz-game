@@ -614,7 +614,7 @@ app.use((req, res, next) => {
         "font-src 'self' data:",
         
         // Connections: Allow WebSocket, Solana RPC, CDNs, and API endpoints
-        "connect-src 'self' wss: ws: https://devnet.helius-rpc.com https://api.anthropic.com https://unpkg.com https://cdn.jsdelivr.net https://bundle.run https://cdnjs.cloudflare.com https://www.google.com https://www.gstatic.com",
+        "connect-src 'self' wss: ws: https://courtnay-0wegdq-fast-mainnet.helius-rpc.com https://mainnet.helius-rpc.com https://api.anthropic.com https://unpkg.com https://cdn.jsdelivr.net https://bundle.run https://cdnjs.cloudflare.com https://www.google.com https://www.gstatic.com",
         
         // Frames: Allow Google reCAPTCHA frames
         "frame-src 'self' https://www.google.com https://recaptcha.google.com https://www.recaptcha.net",
