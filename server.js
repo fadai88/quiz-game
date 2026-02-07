@@ -769,6 +769,27 @@ async function initializeRateLimiter() {
     }
 }
 
+// ============================================================================
+// REFUND HELPER - Safety net for failed game creation after payment
+// ============================================================================
+// If a transaction is verified valid but the game fails to start (e.g., room
+// creation error), automatically credit the user's virtualBalance so they
+// can try again without paying.
+async function refundToVirtualBalance(walletAddress, amount, reason) {
+    try {
+        const refundAmount = fromAtomicUnits(amount);
+        await User.findOneAndUpdate(
+            { walletAddress },
+            { $inc: { virtualBalance: refundAmount } }
+        );
+        logger.info(`💰 REFUNDED ${formatUSDC(amount)} to ${walletAddress} (Virtual Balance). Reason: ${reason}`);
+        return true;
+    } catch (err) {
+        logger.error(`❌ CRITICAL: Failed to refund ${walletAddress}:`, err);
+        return false;
+    }
+}
+
 app.use(express.json());
 
 // ============================================================================
@@ -2005,8 +2026,8 @@ function shuffleArray(array) {
 }
 
 const BOT_LEVELS = {
-    MEDIUM: { correctRate: 0.4, responseTimeRange: [1500, 4000] },  // 70% correct, 1.5-4 seconds
-    HARD: { correctRate: 0.6, responseTimeRange: [1000, 3000] }     // 90% correct, 1-3 seconds
+    MEDIUM: { correctRate: 0.7, responseTimeRange: [1500, 4000] },  // 70% correct, 1.5-4 seconds
+    HARD: { correctRate: 0.9, responseTimeRange: [1000, 3000] }     // 90% correct, 1-3 seconds
 };
 
 // Bot player class
@@ -2885,6 +2906,8 @@ io.on('connection', (socket) => {
                     }
                 } else if (event === 'joinHumanMatchmaking') {
                     const data = args[0];
+                    let transactionVerified = false; // Track if payment was taken
+
                     try {
                         const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                         await rateLimitEvent(data.walletAddress, 'joinHumanMatchmaking', clientIP, socket);
@@ -2924,6 +2947,9 @@ io.on('connection', (socket) => {
                         );
 
                         AuditLogger.transactionVerified(walletAddress, betAmount, transactionSignature, config.TREASURY_WALLET.toString(), nonce, clientIP);
+
+                        // MARK: Transaction is confirmed valid. From here on, if we fail, we MUST refund.
+                        transactionVerified = true;
 
                         // ATOMIC: Clean up existing room using socket.roomId (no scan needed)
                         if (socket.roomId) {
@@ -3049,11 +3075,25 @@ io.on('connection', (socket) => {
 
                         await logMatchmakingState();
                     } catch (error) {
-                        const sanitized = sanitizeError(error, 'joinHumanMatchmaking', 'Failed to join matchmaking queue.');
-                        socket.emit('joinGameFailure', sanitized);
+                        // SAFETY NET: If transaction was verified but game creation failed, refund to virtual balance
+                        if (transactionVerified) {
+                            const { walletAddress, betAmount } = data;
+                            logger.error(`⚠️ Matchmaking failed AFTER payment for ${walletAddress}. Refunding to virtual balance.`);
+                            await refundToVirtualBalance(walletAddress, betAmount, 'Matchmaking error after payment');
+
+                            socket.emit('joinGameFailure', {
+                                error: 'Matchmaking error, but your funds were saved to your Virtual Balance. Please refresh and check balance.',
+                                code: 'REFUNDED_TO_BALANCE'
+                            });
+                        } else {
+                            const sanitized = sanitizeError(error, 'joinHumanMatchmaking', 'Failed to join matchmaking queue.');
+                            socket.emit('joinGameFailure', sanitized);
+                        }
                     }
                 } else if (event === 'joinBotGame') {
                     const data = args[0];
+                    let transactionVerified = false; // Track if payment was taken
+
                     try {
                         const clientIP = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
                         await rateLimitEvent(data.walletAddress, 'joinBotGame', clientIP, socket);
@@ -3093,6 +3133,9 @@ io.on('connection', (socket) => {
                         );
 
                         AuditLogger.transactionVerified(walletAddress, betAmount, transactionSignature, config.TREASURY_WALLET.toString(), nonce, clientIP);
+
+                        // MARK: Transaction is confirmed valid. From here on, if we fail, we MUST refund.
+                        transactionVerified = true;
 
                         // ATOMIC: Clean up existing room using socket.roomId (no scan needed)
                         if (socket.roomId) {
@@ -3159,8 +3202,20 @@ io.on('connection', (socket) => {
                         await startSinglePlayerGame(roomId);
                         await logGameRoomsState();
                     } catch (error) {
-                        const sanitized = sanitizeError(error, 'joinBotGame', 'Failed to start bot game.');
-                        socket.emit('joinGameFailure', sanitized);
+                        // SAFETY NET: If transaction was verified but game creation failed, refund to virtual balance
+                        if (transactionVerified) {
+                            const { walletAddress, betAmount } = data;
+                            logger.error(`⚠️ Game creation failed AFTER payment for ${walletAddress}. Refunding to virtual balance.`);
+                            await refundToVirtualBalance(walletAddress, betAmount, 'Game creation failure after payment');
+
+                            socket.emit('joinGameFailure', {
+                                error: 'Game creation failed, but your funds were saved to your Virtual Balance. Please refresh and check balance.',
+                                code: 'REFUNDED_TO_BALANCE'
+                            });
+                        } else {
+                            const sanitized = sanitizeError(error, 'joinBotGame', 'Failed to start bot game.');
+                            socket.emit('joinGameFailure', sanitized);
+                        }
                     }
                 } else if (event === 'switchToBot') {
                     const { roomId } = args[0];

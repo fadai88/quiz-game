@@ -1712,11 +1712,12 @@
             modal.style.display = 'flex';
 
             document.getElementById('waitForPlayerBtn').onclick = async function() {
-                if (isProcessingBet) {  // NEW: Guard against multi-click
+                if (isProcessingBet) {
                     console.log('Bet already in progress—ignoring click');
                     return;
                 }
-                isProcessingBet = true;  // NEW: Set flag
+                isProcessingBet = true;
+
                 try {
                     console.log('Player chose to play against human');
                     modal.style.display = 'none';
@@ -1727,36 +1728,41 @@
                     if (!currentBetAmount) {
                         throw new Error('No bet amount available. Please start a new game.');
                     }
-                    
+
                     validateBetAndWallet(currentBetAmount, connectedWallet);
-                    
-                    // NEW: Disable the button immediately to prevent double-clicks
+
                     this.disabled = true;
                     this.textContent = 'Processing...';
-                    waitingMessage.textContent = 'Preparing transaction for matchmaking...';
-                    
-                    // Generate nonce FIRST, before creating transaction
-                    const nonce = generateUUID();
-                    console.log('Generated nonce for human matchmaking:', nonce);
+                    waitingMessage.textContent = 'Verifying security...';
 
-                    const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount, nonce);  // Pass nonce here
-                    const signedTransaction = await window.solana.signTransaction(transaction);
-                    const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
-                    console.log('Transaction signature for human matchmaking:', txSignature);
-
-                    // FIXED: Proper token generation with try-catch
+                    // FIX: Get reCAPTCHA BEFORE transaction - if this fails, no money is lost
                     let recaptchaToken = null;
                     if (window.recaptchaEnabled) {
                         try {
                             recaptchaToken = await getRecaptchaToken('place_bet');
                         } catch (error) {
                             logError('reCAPTCHA-human-matchmaking:', error);
-                            alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
-                            waitingMessage.textContent = 'Verification failed. Please try again.';
+                            alert('Security verification failed. No funds were deducted. Please try again.');
                             throw error;
                         }
                     }
-                    
+
+                    waitingMessage.textContent = 'Please confirm transaction in wallet...';
+
+                    // Generate nonce FIRST, before creating transaction
+                    const nonce = generateUUID();
+                    console.log('Generated nonce for human matchmaking:', nonce);
+
+                    // Create and send transaction AFTER reCAPTCHA succeeds
+                    const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount, nonce);
+                    const signedTransaction = await window.solana.signTransaction(transaction);
+
+                    waitingMessage.textContent = 'Sending transaction...';
+                    const txSignature = await connection.sendRawTransaction(signedTransaction.serialize());
+                    console.log('Transaction signature for human matchmaking:', txSignature);
+
+                    waitingMessage.textContent = 'Joining matchmaking...';
+
                     socket.emit('joinHumanMatchmaking', {
                         walletAddress: connectedWallet,
                         betAmount: currentBetAmount,
@@ -1765,31 +1771,30 @@
                         recaptchaToken,
                         nonce
                     });
+
                     waitingMessage.textContent = 'Looking for another player...';
                     await updateBalance();
                 } catch (error) {
                     logError('human-matchmaking', error);
-                    if (error.message.includes('reCAPTCHA') || error.message.includes('Verification')) {
-                        alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
-                    } else {
-                        alert('Failed to join human matchmaking: ' + error.message);
+                    if (!error.message.includes('User rejected')) {
+                        alert('Error: ' + error.message);
                     }
                     waitingMessage.textContent = 'Error starting matchmaking. Please try again.';
                     resetUIAfterError();
                 } finally {
-                    isProcessingBet = false;  // NEW: Reset flag
-                    // NEW: Re-enable button only if not in error state (handled in resetUIAfterError)
+                    isProcessingBet = false;
                     this.disabled = false;
-                    this.textContent = 'Playing against human';  // Reset text
+                    this.textContent = 'Playing against human';
                 }
             };
 
             document.getElementById('playAgainstBotBtn').onclick = async function() {
-                if (isProcessingBet) {  // NEW: Guard against multi-click
+                if (isProcessingBet) {
                     console.log('Bet already in progress—ignoring click');
                     return;
                 }
-                isProcessingBet = true;  // NEW: Set flag
+                isProcessingBet = true;
+
                 try {
                     console.log('Player chose to play against bot');
                     modal.style.display = 'none';
@@ -1800,45 +1805,45 @@
                     if (!currentBetAmount) {
                         throw new Error('No bet amount available. Please start a new game.');
                     }
-                    
+
                     validateBetAndWallet(currentBetAmount, connectedWallet);
-                    
-                    // NEW: Disable the button immediately to prevent double-clicks
+
                     this.disabled = true;
                     this.textContent = 'Processing...';
-                    waitingMessage.textContent = 'Preparing transaction for bot game...';
-                    
-                    // Generate nonce FIRST, before creating transaction
-                    const nonce = generateUUID();
-                    console.log('Generated nonce for bot game:', nonce);
+                    waitingMessage.textContent = 'Verifying security...';
 
-                    const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount, nonce);  // Pass nonce here
-                    const signedTransaction = await window.solana.signTransaction(transaction);
-
-                    // NEW: Log the signature for debugging (remove in prod)
-                    const rawTx = signedTransaction.serialize();
-                    console.log('About to send tx (first 8 bytes for debug):', Array.from(rawTx.slice(0, 8)));
-
-                    const txSignature = await connection.sendRawTransaction(rawTx, {
-                        skipPreflight: false,
-                        preflightCommitment: 'confirmed'
-                    });
-                    console.log('Transaction signature for bot game:', txSignature);
-
-                    // FIXED: Proper token generation with try-catch
+                    // FIX: Get reCAPTCHA BEFORE transaction - if this fails, no money is lost
                     let recaptchaToken = null;
                     if (window.recaptchaEnabled) {
                         try {
                             recaptchaToken = await getRecaptchaToken('place_bet');
                         } catch (error) {
                             logError('reCAPTCHA-bot-game:', error);
-                            alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
-                            waitingMessage.textContent = 'Verification failed. Please try again.';
+                            alert('Security verification failed. No funds were deducted. Please try again.');
                             throw error;
                         }
                     }
-                    
-                    
+
+                    waitingMessage.textContent = 'Please confirm transaction in wallet...';
+
+                    // Generate nonce FIRST, before creating transaction
+                    const nonce = generateUUID();
+                    console.log('Generated nonce for bot game:', nonce);
+
+                    // Create and send transaction AFTER reCAPTCHA succeeds
+                    const transaction = await usdcManager.createTransferTransaction(connectedWallet, currentBetAmount, nonce);
+                    const signedTransaction = await window.solana.signTransaction(transaction);
+
+                    const rawTx = signedTransaction.serialize();
+                    waitingMessage.textContent = 'Sending transaction...';
+                    const txSignature = await connection.sendRawTransaction(rawTx, {
+                        skipPreflight: false,
+                        preflightCommitment: 'confirmed'
+                    });
+                    console.log('Transaction signature for bot game:', txSignature);
+
+                    waitingMessage.textContent = 'Creating game...';
+
                     socket.emit('joinBotGame', {
                         walletAddress: connectedWallet,
                         betAmount: currentBetAmount,
@@ -1847,22 +1852,20 @@
                         recaptchaToken,
                         nonce
                     });
+
                     waitingMessage.textContent = 'Creating a game with a bot opponent...';
                     await updateBalance();
                 } catch (error) {
                     logError('bot-game', error);
-                    if (error.message.includes('reCAPTCHA') || error.message.includes('Verification')) {
-                        alert('Verification required for bet placement. Please complete reCAPTCHA and try again.');
-                    } else {
-                        alert('Failed to start bot game: ' + error.message);
+                    if (!error.message.includes('User rejected')) {
+                        alert('Error: ' + error.message);
                     }
                     waitingMessage.textContent = 'Error starting bot game. Please try again.';
                     resetUIAfterError();
                 } finally {
-                    isProcessingBet = false;  // NEW: Reset flag
-                    // NEW: Re-enable button only if not in error state (handled in resetUIAfterError)
+                    isProcessingBet = false;
                     this.disabled = false;
-                    this.textContent = 'Play Against Bot';  // Reset text
+                    this.textContent = 'Play Against Bot';
                 }
             };
         }
