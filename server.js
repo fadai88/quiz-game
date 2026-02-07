@@ -778,14 +778,52 @@ async function initializeRateLimiter() {
 async function refundToVirtualBalance(walletAddress, amount, reason) {
     try {
         const refundAmount = fromAtomicUnits(amount);
-        await User.findOneAndUpdate(
+
+        const user = await User.findOneAndUpdate(
             { walletAddress },
-            { $inc: { virtualBalance: refundAmount } }
+            { $inc: { virtualBalance: refundAmount } },
+            { new: true, upsert: true }
         );
-        logger.info(`💰 REFUNDED ${formatUSDC(amount)} to ${walletAddress} (Virtual Balance). Reason: ${reason}`);
+
+        logger.info(`💰 REFUNDED ${formatUSDC(amount)} to ${walletAddress} (Virtual Balance). Reason: ${reason}`, {
+            newBalance: user.virtualBalance
+        });
+
+        // Track refund metrics
+        if (!global.refundMetrics) {
+            global.refundMetrics = {
+                total: 0,
+                totalAmount: 0,
+                byReason: {},
+                failed: 0
+            };
+        }
+        global.refundMetrics.total++;
+        global.refundMetrics.totalAmount += refundAmount;
+        global.refundMetrics.byReason[reason] = (global.refundMetrics.byReason[reason] || 0) + 1;
+
         return true;
     } catch (err) {
         logger.error(`❌ CRITICAL: Failed to refund ${walletAddress}:`, err);
+
+        // Track failed refund
+        if (global.refundMetrics) {
+            global.refundMetrics.failed++;
+        }
+
+        // Alert admin
+        alertManager.sendAlert({
+            severity: 'critical',
+            category: 'refund_failed',
+            message: `URGENT: Failed to refund ${fromAtomicUnits(amount)} USDC to ${walletAddress}`,
+            details: {
+                walletAddress,
+                amount,
+                reason,
+                error: err.message
+            }
+        });
+
         return false;
     }
 }
@@ -2921,18 +2959,8 @@ io.on('connection', (socket) => {
                         const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;
                         logger.info('Human matchmaking request:', { walletAddress, betAmount, gameMode, nonce });
 
-                        // Strict reCAPTCHA enforcement
-                        let recaptchaResult;
-                        try {
-                            recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                        } catch (recaptchaError) {
-                            SecurityLogger.recaptchaFailed(walletAddress, recaptchaError.message, null, clientIP);
-                            trackRecaptchaFailure(walletAddress, { error: recaptchaError.message, event: 'joinHumanMatchmaking' });
-                            await rateLimitFailedRecaptcha(clientIP);
-                            socket.emit('joinGameFailure', 'Verification failed. Please try again.');
-                            return;
-                        }
-
+                        // STEP 1: VERIFY TRANSACTION FIRST
+                        // This confirms money was actually taken on blockchain
                         const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
                         const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
 
@@ -2948,8 +2976,22 @@ io.on('connection', (socket) => {
 
                         AuditLogger.transactionVerified(walletAddress, betAmount, transactionSignature, config.TREASURY_WALLET.toString(), nonce, clientIP);
 
-                        // MARK: Transaction is confirmed valid. From here on, if we fail, we MUST refund.
+                        // CRITICAL: Set flag IMMEDIATELY after confirming payment
                         transactionVerified = true;
+                        logger.info(`✅ Transaction verified for ${walletAddress}. Point of no return - must refund if anything fails from here.`);
+
+                        // STEP 2: NOW CHECK RECAPTCHA
+                        // If this fails, we know money was taken, so catch block will refund
+                        let recaptchaResult;
+                        try {
+                            recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                        } catch (recaptchaError) {
+                            SecurityLogger.recaptchaFailed(walletAddress, recaptchaError.message, null, clientIP);
+                            trackRecaptchaFailure(walletAddress, { error: recaptchaError.message, event: 'joinHumanMatchmaking' });
+                            await rateLimitFailedRecaptcha(clientIP);
+                            // THROW (not return) to trigger refund in catch block
+                            throw new Error('RECAPTCHA_VALIDATION_FAILED');
+                        }
 
                         // ATOMIC: Clean up existing room using socket.roomId (no scan needed)
                         if (socket.roomId) {
@@ -3030,8 +3072,8 @@ io.on('connection', (socket) => {
                                 });
                             } catch (roomError) {
                                 logger.error(`Failed to add players to matched room ${roomId}:`, roomError);
-                                socket.emit('matchmakingError', { message: 'Failed to create game room' });
-                                return;
+                                // THROW (not return) to trigger refund in catch block
+                                throw new Error('ROOM_CREATION_FAILED');
                             }
 
                             socket.join(roomId);
@@ -3075,16 +3117,38 @@ io.on('connection', (socket) => {
 
                         await logMatchmakingState();
                     } catch (error) {
-                        // SAFETY NET: If transaction was verified but game creation failed, refund to virtual balance
+                        // SAFETY NET: If transaction was verified but matchmaking failed, refund to virtual balance
                         if (transactionVerified) {
                             const { walletAddress, betAmount } = data;
-                            logger.error(`⚠️ Matchmaking failed AFTER payment for ${walletAddress}. Refunding to virtual balance.`);
-                            await refundToVirtualBalance(walletAddress, betAmount, 'Matchmaking error after payment');
 
-                            socket.emit('joinGameFailure', {
-                                error: 'Matchmaking error, but your funds were saved to your Virtual Balance. Please refresh and check balance.',
-                                code: 'REFUNDED_TO_BALANCE'
+                            // Determine refund reason based on error
+                            let refundReason = 'Matchmaking error after payment';
+                            if (error.message === 'RECAPTCHA_VALIDATION_FAILED') {
+                                refundReason = 'Backend reCAPTCHA validation failed';
+                            } else if (error.message === 'ROOM_CREATION_FAILED') {
+                                refundReason = 'Room creation failed after payment';
+                            }
+
+                            logger.error(`⚠️ Matchmaking failed AFTER payment for ${walletAddress}. Refunding to virtual balance.`, {
+                                error: error.message,
+                                reason: refundReason
                             });
+
+                            const refundSuccess = await refundToVirtualBalance(walletAddress, betAmount, refundReason);
+
+                            if (refundSuccess) {
+                                socket.emit('joinGameFailure', {
+                                    error: 'Matchmaking error, but your funds were saved to your Virtual Balance. Please refresh and check balance.',
+                                    code: 'REFUNDED_TO_BALANCE',
+                                    refundReason: refundReason
+                                });
+                            } else {
+                                socket.emit('joinGameFailure', {
+                                    error: 'Matchmaking failed. Our team has been notified and will process your refund manually within 24 hours.',
+                                    code: 'REFUND_FAILED',
+                                    contactSupport: true
+                                });
+                            }
                         } else {
                             const sanitized = sanitizeError(error, 'joinHumanMatchmaking', 'Failed to join matchmaking queue.');
                             socket.emit('joinGameFailure', sanitized);
@@ -3107,18 +3171,8 @@ io.on('connection', (socket) => {
                         const { walletAddress, betAmount, transactionSignature, gameMode, recaptchaToken, nonce } = data;
                         logger.info('Bot game request:', { walletAddress, betAmount, gameMode, nonce });
 
-                        // Strict reCAPTCHA enforcement
-                        let recaptchaResult;
-                        try {
-                            recaptchaResult = await verifyRecaptcha(recaptchaToken);
-                        } catch (recaptchaError) {
-                            SecurityLogger.recaptchaFailed(walletAddress, recaptchaError.message, null, clientIP);
-                            trackRecaptchaFailure(walletAddress, { error: recaptchaError.message, event: 'joinBotGame' });
-                            await rateLimitFailedRecaptcha(clientIP);
-                            socket.emit('joinGameFailure', 'Verification failed. Please try again.');
-                            return;
-                        }
-
+                        // STEP 1: VERIFY TRANSACTION FIRST
+                        // This confirms money was actually taken on blockchain
                         const maxRetries = parseInt(process.env.TRANSACTION_RETRIES) || 3;
                         const retryDelay = parseInt(process.env.TRANSACTION_RETRY_DELAY) || 500;
 
@@ -3134,8 +3188,22 @@ io.on('connection', (socket) => {
 
                         AuditLogger.transactionVerified(walletAddress, betAmount, transactionSignature, config.TREASURY_WALLET.toString(), nonce, clientIP);
 
-                        // MARK: Transaction is confirmed valid. From here on, if we fail, we MUST refund.
+                        // CRITICAL: Set flag IMMEDIATELY after confirming payment
                         transactionVerified = true;
+                        logger.info(`✅ Transaction verified for ${walletAddress}. Point of no return - must refund if anything fails from here.`);
+
+                        // STEP 2: NOW CHECK RECAPTCHA
+                        // If this fails, we know money was taken, so catch block will refund
+                        let recaptchaResult;
+                        try {
+                            recaptchaResult = await verifyRecaptcha(recaptchaToken);
+                        } catch (recaptchaError) {
+                            SecurityLogger.recaptchaFailed(walletAddress, recaptchaError.message, null, clientIP);
+                            trackRecaptchaFailure(walletAddress, { error: recaptchaError.message, event: 'joinBotGame' });
+                            await rateLimitFailedRecaptcha(clientIP);
+                            // THROW (not return) to trigger refund in catch block
+                            throw new Error('RECAPTCHA_VALIDATION_FAILED');
+                        }
 
                         // ATOMIC: Clean up existing room using socket.roomId (no scan needed)
                         if (socket.roomId) {
@@ -3186,8 +3254,8 @@ io.on('connection', (socket) => {
                             });
                         } catch (roomError) {
                             logger.error(`Failed to add player to bot room ${roomId}:`, roomError);
-                            socket.emit('joinGameFailure', 'Failed to create bot game room');
-                            return;
+                            // THROW (not return) to trigger refund in catch block
+                            throw new Error('ROOM_CREATION_FAILED');
                         }
 
                         socket.join(roomId);
@@ -3205,14 +3273,38 @@ io.on('connection', (socket) => {
                         // SAFETY NET: If transaction was verified but game creation failed, refund to virtual balance
                         if (transactionVerified) {
                             const { walletAddress, betAmount } = data;
-                            logger.error(`⚠️ Game creation failed AFTER payment for ${walletAddress}. Refunding to virtual balance.`);
-                            await refundToVirtualBalance(walletAddress, betAmount, 'Game creation failure after payment');
 
-                            socket.emit('joinGameFailure', {
-                                error: 'Game creation failed, but your funds were saved to your Virtual Balance. Please refresh and check balance.',
-                                code: 'REFUNDED_TO_BALANCE'
+                            // Determine refund reason based on error
+                            let refundReason = 'Game creation failure after payment';
+                            if (error.message === 'RECAPTCHA_VALIDATION_FAILED') {
+                                refundReason = 'Backend reCAPTCHA validation failed';
+                            } else if (error.message === 'ROOM_CREATION_FAILED') {
+                                refundReason = 'Room creation failed after payment';
+                            }
+
+                            logger.error(`⚠️ Game creation failed AFTER payment for ${walletAddress}. Refunding to virtual balance.`, {
+                                error: error.message,
+                                reason: refundReason
                             });
+
+                            const refundSuccess = await refundToVirtualBalance(walletAddress, betAmount, refundReason);
+
+                            if (refundSuccess) {
+                                socket.emit('joinGameFailure', {
+                                    error: 'Game creation failed, but your funds were saved to your Virtual Balance. Please refresh and check balance.',
+                                    code: 'REFUNDED_TO_BALANCE',
+                                    refundReason: refundReason
+                                });
+                            } else {
+                                // Critical: Refund failed
+                                socket.emit('joinGameFailure', {
+                                    error: 'Game creation failed. Our team has been notified and will process your refund manually within 24 hours.',
+                                    code: 'REFUND_FAILED',
+                                    contactSupport: true
+                                });
+                            }
                         } else {
+                            // Payment wasn't verified, so standard error
                             const sanitized = sanitizeError(error, 'joinBotGame', 'Failed to start bot game.');
                             socket.emit('joinGameFailure', sanitized);
                         }
@@ -3972,32 +4064,40 @@ app.get('/login.html', (req, res) => {
     res.send(loginHtml);
 });
 
-app.get('/api/balance/:wallet', async (req, res) => {
+
+// Virtual balance endpoint - returns user's virtual/credit balance
+app.get('/api/virtual-balance/:wallet', async (req, res) => {
     try {
-        // ✅ SECURITY FIX: Validate wallet parameter to prevent NoSQL injection
         const { error, value } = walletParamSchema.validate(req.params, {
             abortEarly: false,
             stripUnknown: true
         });
-        
+
         if (error) {
             const errorDetails = error.details.map(d => d.message).join('; ');
-            trackValidationFailure(req.ip, 'balance', errorDetails);  // ← ADD THIS LINE
-            logger.warn(`[SECURITY] Validation failed for balance from ${req.ip}: ${errorDetails}`);
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Invalid wallet address' 
+            trackValidationFailure(req.ip, 'virtual_balance', errorDetails);
+            logger.warn(`[SECURITY] Validation failed for virtual balance from ${req.ip}: ${errorDetails}`);
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid wallet address'
             });
         }
-        
+
         const user = await User.findOne({ walletAddress: value.wallet });
         if (user) {
-            res.json({ balance: user.virtualBalance });
+            res.json({
+                balance: user.virtualBalance || 0
+            });
         } else {
-            res.status(404).json({ error: 'User not found' });
+            // Return 0 for non-existent users
+            res.json({ balance: 0 });
         }
     } catch (error) {
-        res.status(500).json({ error: 'Server error' });
+        logger.error('Error fetching virtual balance:', error);
+        res.status(500).json({
+            error: 'Server error',
+            balance: 0
+        });
     }
 });
 
