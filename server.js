@@ -437,11 +437,11 @@ if (ENVIRONMENT === 'production') {
 }
 
 const TransactionLog = mongoose.model('TransactionLog', new mongoose.Schema({
-    signature: { 
-        type: String, 
-        required: true, 
+    signature: {
+        type: String,
+        required: true,
         unique: true,  // ✅ Enforce at DB level
-        index: true 
+        index: true
     },
     walletAddress: String,
     betAmount: Number,
@@ -449,6 +449,23 @@ const TransactionLog = mongoose.model('TransactionLog', new mongoose.Schema({
     status: { type: String, enum: ['verified', 'replayed', 'failed'] }
 }));
 
+// GameSession schema - persistent record of game sessions for crash recovery
+const GameSessionSchema = new mongoose.Schema({
+    roomId: { type: String, required: true, unique: true, index: true },
+    betAmount: { type: Number, required: true },
+    gameMode: { type: String, enum: ['bot', 'human', 'multiplayer'], default: 'bot' },
+    players: [{
+        walletAddress: String,
+        socketId: String
+    }],
+    // Statuses: active, completed, refunded, error
+    status: { type: String, enum: ['active', 'completed', 'refunded', 'error'], default: 'active' },
+    startTime: { type: Date, default: Date.now },
+    endTime: Date,
+    refundReason: String
+});
+
+const GameSession = mongoose.model('GameSession', GameSessionSchema);
 
 // NEW: Reusable Joi custom validator for Solana public keys
 const solanaPublicKey = Joi.string().required().custom((value, helpers) => {
@@ -3085,6 +3102,31 @@ io.on('connection', (socket) => {
                                 opponentSocket.matchmakingPool = null;
                             }
 
+                            // Create persistent game session BEFORE starting game
+                            try {
+                                await GameSession.create({
+                                    roomId: roomId,
+                                    betAmount: betAmount,
+                                    gameMode: 'human',
+                                    players: [
+                                        { walletAddress: walletAddress, socketId: socket.id },
+                                        { walletAddress: opponent.walletAddress, socketId: opponent.socketId }
+                                    ],
+                                    status: 'active'
+                                });
+                                logger.info(`📝 Persistent session created for human game room ${roomId}`);
+                            } catch (dbError) {
+                                logger.error('CRITICAL: Database failed to record game session. Aborting to save funds.', dbError);
+                                // Refund both players
+                                await refundToVirtualBalance(walletAddress, betAmount, 'System Init Error - DB Failed');
+                                await refundToVirtualBalance(opponent.walletAddress, betAmount, 'System Init Error - DB Failed');
+                                socket.emit('gameError', { message: 'Server error. Your bet has been refunded to your virtual balance.' });
+                                if (opponentSocket) {
+                                    opponentSocket.emit('gameError', { message: 'Server error. Your bet has been refunded to your virtual balance.' });
+                                }
+                                throw new Error('GAME_SESSION_DB_FAILED');
+                            }
+
                             io.to(roomId).emit('matchFound', {
                                 gameRoomId: roomId,
                                 players: [walletAddress, opponent.walletAddress]
@@ -3262,6 +3304,24 @@ io.on('connection', (socket) => {
                         socket.roomId = roomId;
 
                         const botName = chooseBotName();
+
+                        // Create persistent game session BEFORE starting game
+                        try {
+                            await GameSession.create({
+                                roomId: roomId,
+                                betAmount: betAmount,
+                                gameMode: 'bot',
+                                players: [{ walletAddress: walletAddress, socketId: socket.id }],
+                                status: 'active'
+                            });
+                            logger.info(`📝 Persistent session created for bot game room ${roomId}`);
+                        } catch (dbError) {
+                            logger.error('CRITICAL: Database failed to record game session. Aborting to save funds.', dbError);
+                            await refundToVirtualBalance(walletAddress, betAmount, 'System Init Error - DB Failed');
+                            socket.emit('gameError', { message: 'Server error. Your bet has been refunded to your virtual balance.' });
+                            throw new Error('GAME_SESSION_DB_FAILED');
+                        }
+
                         socket.emit('botGameCreated', {
                             gameRoomId: roomId,
                             botName
@@ -3775,6 +3835,38 @@ io.on('connection', (socket) => {
 
                         } catch (error) {
                             await releaseIdempotencyLock(idempotencyKey); // Release lock on error
+
+                            // Check if this is a Redis/system failure
+                            if (error.message && (error.message.includes('Redis') || error.message.includes('Connection') || error.message.includes('ECONNREFUSED'))) {
+                                logger.error(`⚠️ Redis failure during submitAnswer for room ${roomId}:`, error);
+
+                                // Try to refund all players and mark session as refunded
+                                try {
+                                    const session = await GameSession.findOne({ roomId: roomId });
+                                    if (session && session.status === 'active') {
+                                        for (const player of session.players) {
+                                            if (player.walletAddress) {
+                                                await refundToVirtualBalance(
+                                                    player.walletAddress,
+                                                    session.betAmount,
+                                                    `Redis failure during game (Room ${roomId})`
+                                                );
+                                                logger.info(`✅ Emergency refund to ${player.walletAddress} due to Redis failure`);
+                                            }
+                                        }
+                                        session.status = 'refunded';
+                                        session.endTime = new Date();
+                                        session.refundReason = 'Redis connection failure during game';
+                                        await session.save();
+                                    }
+                                } catch (dbError) {
+                                    logger.error('Failed to process emergency refund:', dbError);
+                                }
+
+                                socket.emit('gameError', { message: 'System error. Game cancelled and refunded to your virtual balance.' });
+                                return;
+                            }
+
                             socket.emit('answerError', error.message || 'Error submitting answer');
                         }
 
@@ -4388,6 +4480,34 @@ async function startSinglePlayerGame(roomId) {
     }
 }
 
+// Helper to refund active players during system errors
+async function abortGameWithRefund(roomId, reason) {
+    try {
+        const room = await getGameRoom(roomId);
+        if (!room) return;
+
+        // 1. Refund Human Players
+        const humanPlayers = room.players.filter(p => !p.isBot);
+        for (const player of humanPlayers) {
+            await refundToVirtualBalance(player.username, room.betAmount, reason);
+        }
+
+        // 2. Mark MongoDB Session as Refunded (so Cron job ignores it)
+        await GameSession.findOneAndUpdate(
+            { roomId: roomId },
+            {
+                status: 'refunded',
+                endTime: new Date(),
+                refundReason: reason
+            }
+        );
+
+        logger.info(`💰 Refunded and aborted room ${roomId} due to: ${reason}`);
+    } catch (err) {
+        logger.error(`Failed to process abort refund for room ${roomId}:`, err);
+    }
+}
+
 async function startNextQuestion(roomId) {
     let room = await getGameRoom(roomId);
     if (!room || room.isDeleted) {
@@ -4440,10 +4560,13 @@ async function startNextQuestion(roomId) {
     const currentQuestion = room.questions[room.currentQuestionIndex];
     if (!currentQuestion || !currentQuestion.options || currentQuestion.correctAnswer === undefined) {
         logger.error(`Invalid question data for room ${roomId}, question index ${room.currentQuestionIndex}`);
-        io.to(roomId).emit('gameError', 'Invalid question data');
+
+        // FIX: Refund players before deleting
+        await abortGameWithRefund(roomId, 'System Error: Invalid Question Data');
+
+        io.to(roomId).emit('gameError', 'Game cancelled due to system error. Funds refunded.');
         room.isDeleted = true;
-        await updateGameRoom(roomId, room);
-        await redisClient.del(`room:${roomId}`);
+        await deleteGameRoom(roomId);
         return;
     }
 
@@ -4467,20 +4590,26 @@ async function startNextQuestion(roomId) {
             currentQuestion.shuffledCorrectAnswer = originalQ.shuffledCorrectAnswer;
         } else {
             console.error('CRITICAL: Cannot recover shuffle data. Aborting game.');
-            io.to(roomId).emit('gameError', 'Critical: shuffle data lost. Please restart the game.');
+
+            // FIX: Refund players before deleting
+            await abortGameWithRefund(roomId, 'System Error: Lost Shuffle Data');
+
+            io.to(roomId).emit('gameError', 'Critical system error. Game cancelled and funds refunded.');
             room.isDeleted = true;
-            await updateGameRoom(roomId, room);
-            await redisClient.del(`room:${roomId}`);
+            await deleteGameRoom(roomId);
             return;
         }
     }
 
     if (shuffledCorrectAnswer === undefined || shuffledCorrectAnswer === -1) {
         logger.error(`Invalid shuffledCorrectAnswer for question ${currentQuestion.tempId}`);
-        io.to(roomId).emit('gameError', 'Invalid question configuration');
+
+        // FIX: Refund players before deleting
+        await abortGameWithRefund(roomId, 'System Error: Invalid Answer Configuration');
+
+        io.to(roomId).emit('gameError', 'Game cancelled due to configuration error. Funds refunded.');
         room.isDeleted = true;
-        await updateGameRoom(roomId, room);
-        await redisClient.del(`room:${roomId}`);
+        await deleteGameRoom(roomId);
         return;
     }
 
@@ -4918,11 +5047,34 @@ async function handleGameOver(room, roomId) {
             message: endMessage
         });
 
+        // Mark game session as completed in MongoDB (for crash recovery tracking)
+        try {
+            await GameSession.findOneAndUpdate(
+                { roomId: roomId },
+                { status: 'completed', endTime: new Date() }
+            );
+            logger.info(`📝 Game session ${roomId} marked as completed`);
+        } catch (dbError) {
+            logger.error(`Failed to close session ${roomId} in DB:`, dbError);
+            // Don't throw - game is already over, just log the error
+        }
+
         await deleteGameRoom(roomId);
         await logGameRoomsState();
     } catch (error) {
         logger.error('Error handling game over:', { error: error });
         io.to(roomId).emit('gameError', 'An error occurred while ending the game.');
+
+        // Still try to mark session as error state
+        try {
+            await GameSession.findOneAndUpdate(
+                { roomId: roomId },
+                { status: 'error', endTime: new Date(), refundReason: error.message }
+            );
+        } catch (dbError) {
+            logger.error(`Failed to mark session ${roomId} as error:`, dbError);
+        }
+
         await deleteGameRoom(roomId);
     }
 }
@@ -4935,10 +5087,62 @@ async function startServer() {
     try {
         await initializeConfig();
         await initializeRedis();
-        
+
         server.listen(PORT, () => {
             logger.info(`🚀 Server is running on port ${PORT}`);
             logger.info(`🔐 Treasury wallet loaded from AWS Secrets Manager`);
+
+            // ============================================================================
+            // SAFETY NET CRON JOB - Recovers funds from stuck/crashed games
+            // ============================================================================
+            // Runs every 5 minutes to find games that started > 15 minutes ago
+            // but are still marked "active" (meaning server crashed or Redis died)
+            setInterval(async () => {
+                try {
+                    // Look for games older than 15 minutes that are still 'active'
+                    const cutoffTime = new Date(Date.now() - 15 * 60 * 1000);
+
+                    const stuckGames = await GameSession.find({
+                        status: 'active',
+                        startTime: { $lt: cutoffTime }
+                    });
+
+                    if (stuckGames.length > 0) {
+                        logger.warn(`⚠️ Safety Net: Found ${stuckGames.length} stuck games. Processing refunds...`);
+                    }
+
+                    for (const game of stuckGames) {
+                        logger.info(`🔄 Auto-refunding stuck session: ${game.roomId}`);
+
+                        for (const player of game.players) {
+                            // Skip if walletAddress is missing (e.g. bots)
+                            if (!player.walletAddress) continue;
+
+                            const success = await refundToVirtualBalance(
+                                player.walletAddress,
+                                game.betAmount,
+                                `System Crash Recovery (Room ${game.roomId})`
+                            );
+
+                            if (success) {
+                                logger.info(`✅ Refunded ${player.walletAddress} for crashed game ${game.roomId}`);
+                            }
+                        }
+
+                        // Mark as refunded so we don't pay again
+                        game.status = 'refunded';
+                        game.endTime = new Date();
+                        game.refundReason = 'Safety Net - Game exceeded 15 minute timeout';
+                        await game.save();
+
+                        logger.info(`📝 Marked stuck session ${game.roomId} as refunded`);
+                    }
+                } catch (error) {
+                    logger.error('❌ Safety Net Cron Error:', error);
+                }
+            }, 5 * 60 * 1000); // Run every 5 minutes
+
+            logger.info('🛡️ Safety Net cron job initialized (runs every 5 minutes)');
         });
     } catch (error) {
         logger.error('❌ Failed to start server:', { error: error });
@@ -5779,11 +5983,26 @@ async function updatePlayerStats(players, roomData) {
 
 async function gracefulShutdown(signal) {
     console.log(`\n📡 Received ${signal} signal, shutting down gracefully...`);
-    
+
     // Clear all intervals
     if (paymentProcessorInterval) clearInterval(paymentProcessorInterval);
     if (roomCleanupInterval) clearInterval(roomCleanupInterval);
-    
+
+    // --- Emergency Refund for Active Games ---
+    try {
+        console.log('💰 Processing emergency refunds for active games...');
+        const activeRoomIds = await getCleanActiveRooms();
+
+        for (const roomId of activeRoomIds) {
+            await abortGameWithRefund(roomId, `Server Restart/Shutdown (${signal})`);
+            // Notify players specifically about the maintenance
+            io.to(roomId).emit('gameError', 'Server restarting for maintenance. Game cancelled and funds refunded.');
+        }
+        console.log(`✅ Refunded ${activeRoomIds.length} active games.`);
+    } catch (err) {
+        console.error('⚠️ Error during shutdown refunds (Safety net will handle remaining):', err);
+    }
+
     // Close server
     if (server) {
         console.log('🔌 Closing HTTP server...');
