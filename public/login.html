@@ -84,7 +84,7 @@
 </head>
 <body>
     <header>
-        <h1>Brainy Battle Quiz</h1>
+        <h1>Proof of Smart</h1>
         <nav>
             <ul>
                 <li><a href="index.html">Home</a></li>
@@ -330,7 +330,7 @@
                     console.log('Connected to wallet:', publicKey);
                     
                     // Sign message to verify wallet ownership
-                    const message = `Login to Brainy Battle Quiz: ${Date.now()}`;
+                    const message = `Login to Proof of Smart: ${Date.now()}`;
                     const encodedMessage = new TextEncoder().encode(message);
                     console.log('Requesting signature for message:', message);
                     const signedData = await window.solana.signMessage(encodedMessage, 'utf8');
