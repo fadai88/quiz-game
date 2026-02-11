@@ -118,6 +118,22 @@ body::before {
     position: relative;
     z-index: 10;
     border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #333333; /* Dark text for readability on white background */
+}
+
+/* Ensure all text inside container is dark and readable */
+.container p,
+.container div,
+.container span,
+.container label {
+    color: #333333;
+}
+
+.container h3,
+.container h4,
+.container h5,
+.container h6 {
+    color: #1a1a1a;
 }
 
 .container::before {
@@ -229,6 +245,15 @@ button:disabled {
     backdrop-filter: blur(10px);
     position: relative;
     z-index: 10;
+    color: #333333; /* Dark text for readability */
+}
+
+/* Ensure all text inside form-container is dark and readable */
+.form-container p,
+.form-container div,
+.form-container span,
+.form-container label {
+    color: #333333;
 }
 
 table {
@@ -384,6 +409,32 @@ label:hover {
 .dark-theme .container {
     background: rgba(45, 45, 45, 0.95);
     color: var(--text-color);
+}
+
+.dark-theme .container p,
+.dark-theme .container div,
+.dark-theme .container span,
+.dark-theme .container label {
+    color: #eaeaea;
+}
+
+.dark-theme .container h3,
+.dark-theme .container h4,
+.dark-theme .container h5,
+.dark-theme .container h6 {
+    color: #ffffff;
+}
+
+.dark-theme .form-container {
+    background: rgba(45, 45, 45, 0.95);
+    color: var(--text-color);
+}
+
+.dark-theme .form-container p,
+.dark-theme .form-container div,
+.dark-theme .form-container span,
+.dark-theme .form-container label {
+    color: #eaeaea;
 }
 
 .dark-theme table {
