@@ -1312,8 +1312,15 @@
 
         socket.on('joinGameSuccess', (data) => {
             console.log('Successfully joined game:', data);
-            joinGameBtn.style.display = 'none';
+            
+            // Show success state briefly before hiding
+            joinGameBtn.textContent = 'Joined Successfully ✓';
             waitingMessage.textContent = 'Waiting for another player...';
+            
+            // Hide the button after a brief delay so user sees the success
+            setTimeout(() => {
+                joinGameBtn.style.display = 'none';
+            }, 1500);
             
             // No polling to stop - balance only fetched when needed
         });
@@ -2165,6 +2172,10 @@
                         nonce
                     });
 
+                    // Update Join Game button to show success
+                    joinGameBtn.textContent = 'Transaction Sent ✓';
+                    joinGameBtn.disabled = true;
+                    
                     waitingMessage.textContent = 'Looking for another player...';
                     await updateBalance();
                 } catch (error) {
@@ -2246,6 +2257,10 @@
                         nonce
                     });
 
+                    // Update Join Game button to show success
+                    joinGameBtn.textContent = 'Transaction Sent ✓';
+                    joinGameBtn.disabled = true;
+                    
                     waitingMessage.textContent = 'Creating a game with a bot opponent...';
                     await updateBalance();
                 } catch (error) {
